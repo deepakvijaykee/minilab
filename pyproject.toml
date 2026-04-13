@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minilab"
+version = "0.1.0"
+description = "A modular library for training language models from scratch: autoregressive transformers, text diffusion, and alignment."
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "regex>=2023.0",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+data = ["datasets>=2.14"]
+logging = ["aim>=3.17"]
+flash = ["flash-attn>=2.3"]
+dev = ["pytest", "ruff"]
