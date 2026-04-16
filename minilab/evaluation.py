@@ -7,8 +7,8 @@ import torch
 
 @torch.no_grad()
 def perplexity(model, dataloader):
+    assert not model.training, "perplexity expects model.eval() at the call boundary"
     device = next(model.parameters()).device
-    model.eval()
     total_nll = 0.0
     total_tokens = 0
     for batch in dataloader:
@@ -60,13 +60,34 @@ def _bleu_single(hypothesis, references, max_n):
 
 
 def accuracy_reward(predicted, expected):
-    return 1.0 if predicted.strip() == expected.strip() else 0.0
-
-
-def extract_number(text):
-    numbers = re.findall(r"-?\d+\.?\d*", text)
-    return numbers[-1] if numbers else None
+    predicted = _canonical_number(predicted)
+    expected = _canonical_number(expected)
+    return 1.0 if predicted is not None and predicted == expected else 0.0
 
 
 def format_reward(text, pattern):
     return 1.0 if re.search(pattern, text) else 0.0
+
+
+def _canonical_number(text):
+    if text is None:
+        return None
+    matches = re.findall(r"(?<!\d)-?\d[\d,]*(?:\.\d+)?", text)
+    if not matches:
+        return None
+    return _normalize_number(matches[-1])
+
+
+def _normalize_number(raw):
+    value = raw.replace(",", "")
+    negative = value.startswith("-")
+    if negative:
+        value = value[1:]
+    if "." in value:
+        integer, fractional = value.split(".", 1)
+        integer = integer.lstrip("0") or "0"
+        fractional = fractional.rstrip("0")
+        value = integer if not fractional else f"{integer}.{fractional}"
+    else:
+        value = value.lstrip("0") or "0"
+    return f"-{value}" if negative and value != "0" else value

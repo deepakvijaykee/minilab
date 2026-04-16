@@ -50,7 +50,7 @@ class DiffusionBlock(nn.Module):
         self.norm2 = AdaLN(dim)
         self.ffn = SwiGLU(dim, ffn_hidden)
 
-    def forward(self, x, t_emb):
-        x = x + self.attn(self.norm1(x, t_emb), is_causal=False)
+    def forward(self, x, t_emb, freqs_cis=None):
+        x = x + self.attn(self.norm1(x, t_emb), freqs_cis=freqs_cis, is_causal=False)
         x = x + self.ffn(self.norm2(x, t_emb))
         return x

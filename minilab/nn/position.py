@@ -12,6 +12,7 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(self, dim, max_seq_len, base=10000.0):
         super().__init__()
+        assert dim % 2 == 0, f"RoPE requires even dim, got {dim}"
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         self._build_cache(max_seq_len)
@@ -54,7 +55,7 @@ class ALiBi(nn.Module):
         return torch.tensor(base + extra[0::2][: n - closest_pow2])
 
     def _build_cache(self, seq_len):
-        pos = torch.arange(seq_len)
+        pos = torch.arange(seq_len, device=self.slopes.device)
         distance = pos[:, None] - pos[None, :]
         bias = -self.slopes[:, None, None] * distance[None].abs().float()
         bias = bias.masked_fill(distance[None] < 0, float("-inf"))

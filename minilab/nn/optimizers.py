@@ -24,7 +24,7 @@ class Muon(Optimizer):
                 buf = state["buf"]
                 buf.mul_(mu).add_(g)
                 update = g + mu * buf
-                if p.dim() >= 2:
+                if p.dim() >= 2 and ns_iters > 0:
                     update = _newton_schulz(update, ns_iters)
                 p.add_(update, alpha=-lr)
 

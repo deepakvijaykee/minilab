@@ -10,7 +10,7 @@ from minilab.models.sedd import SEDD, SEDDConfig
 from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
-from minilab.trainer import DiffusionTrainer, TrainConfig
+from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature
 
 VARIANTS = [
     ("MDLM", MDLM, MDLMConfig),
@@ -36,6 +36,7 @@ eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=1
 fwd = ForwardProcess(mask_id)
 tc = TrainConfig(max_steps=args.max_steps, batch_size=args.batch_size, lr=3e-4,
                  log_every=args.max_steps, eval_every=0, save_every=0)
+sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples, "mode": "diffusion"}, args.seq_len)
 
 results = []
 for name, cls, cfg_cls in VARIANTS:
@@ -44,7 +45,7 @@ for name, cls, cfg_cls in VARIANTS:
                   num_heads=args.num_heads, max_seq_len=args.seq_len, mask_token_id=mask_id)
     model = cls(cfg)
     print(f"  {model.num_parameters():,} params")
-    trainer = DiffusionTrainer(model, fwd, train_ds, tc, eval_dataset=eval_ds)
+    trainer = DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, eval_dataset=eval_ds)
     trainer.train()
     eval_loss = trainer.evaluate()
     results.append((name, model.num_parameters(), eval_loss))

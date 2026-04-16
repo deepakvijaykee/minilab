@@ -23,6 +23,7 @@ args = p.parse_args()
 
 tok = load_tokenizer(args.tokenizer)
 model = GPT.load(args.checkpoint)
+model.eval()
 print(f"Loaded {args.checkpoint} ({model.num_parameters():,} params)\n")
 
 prompt_ids = torch.tensor([tok.encode(args.prompt)])

@@ -1,4 +1,4 @@
-"""SEDD: Score Entropy Discrete Diffusion.
+"""SEDD: Score Entropy Discrete Diffusion (absorbing noise).
 Learns probability ratios (scores) instead of probabilities.
 Score entropy loss avoids computing the normalizing constant.
 Lou et al., ICML 2024 Best Paper."""
@@ -11,7 +11,7 @@ import torch.nn as nn
 from minilab.base import BaseModel
 from minilab.config import BaseConfig
 from minilab.nn.diffusion import DiffusionBlock, SinusoidalTimeEmbedding
-from minilab.registry import register_model
+from minilab.registry import get_position, register_model
 
 
 @dataclass
@@ -32,8 +32,12 @@ class SEDD(BaseModel):
 
     def __init__(self, config):
         super().__init__(config)
+        assert config.dim % config.num_heads == 0, "dim must be divisible by num_heads"
+        head_dim = config.dim // config.num_heads
+        assert head_dim % 2 == 0, "RoPE requires even head dimension"
         self.tok_emb = nn.Embedding(config.vocab_size, config.dim)
         self.time_emb = SinusoidalTimeEmbedding(config.dim)
+        self.pos_enc = get_position("rope")(head_dim, config.max_seq_len)
         self.blocks = nn.ModuleList([
             DiffusionBlock(config.dim, config.num_heads, int(config.dim * config.ffn_mult), config.dropout)
             for _ in range(config.num_layers)
@@ -45,18 +49,34 @@ class SEDD(BaseModel):
         self.apply(self._init_weights)
 
     def forward(self, z_t, t):
-        x = self.tok_emb(z_t)
+        x = self._cast_hidden(self.tok_emb(z_t))
         t_emb = self.time_emb(t)
+        freqs_cis = self.pos_enc(z_t.size(1))
         for block in self.blocks:
             if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, t_emb, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(block, x, t_emb, freqs_cis, use_reentrant=False)
             else:
-                x = block(x, t_emb)
+                x = block(x, t_emb, freqs_cis=freqs_cis)
         x = self.ln_f(x)
         return self.score_head(x)
 
     def compute_loss(self, scores, x_0, mask, t, fwd):
-        """Score entropy: L = sum_y exp(s_y) - s_{x_0} per masked position."""
-        s = scores[mask]
+        """Score entropy on masked positions.
+
+        The partition sum is over non-[MASK] tokens only: [MASK] is the absorbing
+        reference state and its score is implicitly fixed at 0, so including it in
+        sum exp(s_y) both misstates the objective and adds a numerically unstable
+        extra exponential term. This matches the sampler, which also drops [MASK].
+
+        The partition is reduced in float64 because exp() of moderately large
+        scores overflows bf16/fp32 (exp(90) ≈ 1e39 > fp32 max); bf16/fp32 during
+        autocast is fine for the network, but the objective itself must be
+        evaluated at a precision that can hold the unbounded score range."""
+        s = scores[mask].double()
         targets = x_0[mask]
-        return (s.exp().sum(dim=-1) - s.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).mean()
+        target_scores = s.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        vocab_ids = torch.arange(s.size(-1), device=s.device)
+        s_no_mask = s.masked_fill(vocab_ids == self.mask_token_id, float("-inf"))
+        loss = (s_no_mask.exp().sum(dim=-1) - target_scores).mean()
+        assert torch.isfinite(loss), f"SEDD score-entropy loss is non-finite (max score={scores[mask].max().item():.2f})"
+        return loss

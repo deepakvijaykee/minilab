@@ -14,7 +14,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * rms).to(x.dtype) * self.weight
+        return (x * rms).to(x.dtype) * self.weight.to(x.dtype)
 
 
 @register_norm("layernorm")

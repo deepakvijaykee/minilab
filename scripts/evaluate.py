@@ -21,6 +21,7 @@ args = p.parse_args()
 
 tok = load_tokenizer(args.tokenizer)
 model = GPT.load(args.checkpoint)
+model.eval()
 print(f"Loaded {args.checkpoint} ({model.num_parameters():,} params)")
 
 eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=2000)

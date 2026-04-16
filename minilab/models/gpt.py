@@ -103,7 +103,7 @@ class GPT(BaseModel):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        x = self.tok_emb(idx)
+        x = self._cast_hidden(self.tok_emb(idx))
 
         freqs_cis, attn_bias, is_causal = None, None, True
         if self.pos_enc.kind == "rotary":
@@ -112,7 +112,7 @@ class GPT(BaseModel):
             attn_bias = self.pos_enc(T).unsqueeze(0)
             is_causal = False
         elif self.pos_enc.kind == "additive":
-            x = x + self.pos_enc(T)
+            x = x + self._cast_hidden(self.pos_enc(T))
 
         x = self.drop(x)
 

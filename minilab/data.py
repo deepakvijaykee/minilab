@@ -47,8 +47,9 @@ class SFTDataset(Dataset):
             p = tokenizer.encode(ex["prompt"])
             r = tokenizer.encode(ex["response"])
             assert len(p) > 0, "SFT example has empty prompt"
-            full = (p + r)[:seq_len]
-            prompt_len = min(len(p), seq_len)
+            assert len(r) > 0, "SFT example has empty response"
+            prompt_len = min(len(p), seq_len - 1)
+            full = (p[:prompt_len] + r)[:seq_len]
 
             input_ids = full + [0] * (seq_len - len(full))
             labels = [-100] * seq_len
@@ -93,13 +94,17 @@ class PreferenceDataset(Dataset):
 
 
 class PromptDataset(Dataset):
-    """Answers stored in self.answers. Batch includes idx for reward lookup."""
+    """Takes pre-tokenized examples ({"ids": list[int], "answer": str}) so the caller
+    owns any task-specific truncation (e.g. preserving a format-instruction suffix)."""
 
-    def __init__(self, examples, tokenizer, seq_len):
+    def __init__(self, examples, seq_len):
         self.answers = [ex["answer"] for ex in examples]
         self.data = []
+        self.prompt_lens = []
         for ex in examples:
-            ids = tokenizer.encode(ex["prompt"])[:seq_len]
+            ids = ex["ids"]
+            assert len(ids) <= seq_len, f"prompt len {len(ids)} exceeds seq_len {seq_len}"
+            self.prompt_lens.append(len(ids))
             ids = ids + [0] * (seq_len - len(ids))
             self.data.append(torch.tensor(ids, dtype=torch.long))
 
@@ -107,7 +112,11 @@ class PromptDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return {"prompt_ids": self.data[idx], "idx": torch.tensor(idx, dtype=torch.long)}
+        return {
+            "prompt_ids": self.data[idx],
+            "prompt_len": torch.tensor(self.prompt_lens[idx], dtype=torch.long),
+            "idx": torch.tensor(idx, dtype=torch.long),
+        }
 
 
 def load_tinystories(tokenizer, seq_len, split="train", max_examples=10000, mode="lm"):
@@ -177,16 +186,24 @@ def load_wikitext(tokenizer, seq_len, max_examples=50000, mode="lm"):
     return DiffusionDataset(tokens, seq_len)
 
 
-def load_gsm8k(tokenizer, seq_len, max_examples=2000):
-    """Extracts numeric answer after #### in the solution field."""
+def load_gsm8k(tokenizer, seq_len, max_examples=2000, split="train"):
     from datasets import load_dataset
-    ds = load_dataset("openai/gsm8k", "main", split="train")
+    from minilab.tasks.gsm8k import DELIMITER, prompt_parts
+    ds = load_dataset("openai/gsm8k", "main", split=split)
+    n = len(ds) if max_examples == 0 else min(max_examples, len(ds))
     examples = []
-    for row in ds.select(range(min(max_examples, len(ds)))):
-        # Answer is after "####" in the solution
-        answer = row["answer"].split("####")[-1].strip()
-        examples.append({"prompt": row["question"], "answer": answer})
-    return PromptDataset(examples, tokenizer, seq_len)
+    for row in ds.select(range(n)):
+        answer = row["answer"].split(DELIMITER)[-1].strip()
+        body, suffix = prompt_parts(row["question"])
+        body_ids = tokenizer.encode(body)
+        suffix_ids = tokenizer.encode(suffix)
+        assert len(suffix_ids) < seq_len, f"suffix alone ({len(suffix_ids)} tok) exceeds seq_len {seq_len}"
+        # Truncate the question body so the format-instruction suffix is always kept —
+        # the GSM8K reward strictly requires '####', so losing the suffix silently
+        # breaks the task contract.
+        body_ids = body_ids[: seq_len - len(suffix_ids)]
+        examples.append({"ids": body_ids + suffix_ids, "answer": answer})
+    return PromptDataset(examples, seq_len)
 
 
 def load_openwebtext(tokenizer, seq_len, max_examples=50000, mode="lm"):
