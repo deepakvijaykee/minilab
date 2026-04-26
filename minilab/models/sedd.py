@@ -9,32 +9,26 @@ import torch
 import torch.nn as nn
 
 from minilab.base import BaseModel
-from minilab.config import BaseConfig
+from minilab.checks import require
+from minilab.models.diffusion_base import DiffusionModelConfig, validate_clean_tokens
 from minilab.nn.diffusion import DiffusionBlock, SinusoidalTimeEmbedding
 from minilab.registry import get_position, register_model
 
 
 @dataclass
-class SEDDConfig(BaseConfig):
-    vocab_size: int = 50257
-    dim: int = 512
-    num_layers: int = 6
-    num_heads: int = 8
-    max_seq_len: int = 1024
-    dropout: float = 0.0
-    ffn_mult: float = 4.0
-    mask_token_id: int = 0
+class SEDDConfig(DiffusionModelConfig):
+    """Configuration for score-entropy discrete diffusion."""
 
 
 @register_model("sedd")
 class SEDD(BaseModel):
     config_class = SEDDConfig
+    forward_process_type = "absorbing"
+    reverse_parameterization = "sedd_log_scores"
 
     def __init__(self, config):
         super().__init__(config)
-        assert config.dim % config.num_heads == 0, "dim must be divisible by num_heads"
         head_dim = config.dim // config.num_heads
-        assert head_dim % 2 == 0, "RoPE requires even head dimension"
         self.tok_emb = nn.Embedding(config.vocab_size, config.dim)
         self.time_emb = SinusoidalTimeEmbedding(config.dim)
         self.pos_enc = get_position("rope")(head_dim, config.max_seq_len)
@@ -47,6 +41,9 @@ class SEDD(BaseModel):
         self.tok_emb.weight = self.score_head.weight
         self.mask_token_id = config.mask_token_id
         self.apply(self._init_weights)
+
+    def muon_auxiliary_modules(self):
+        return (self.tok_emb, self.score_head)
 
     def forward(self, z_t, t):
         x = self._cast_hidden(self.tok_emb(z_t))
@@ -61,22 +58,39 @@ class SEDD(BaseModel):
         return self.score_head(x)
 
     def compute_loss(self, scores, x_0, mask, t, fwd):
-        """Score entropy on masked positions.
+        """Absorbing-graph score entropy from Lou et al. 2024.
 
-        The partition sum is over non-[MASK] tokens only: [MASK] is the absorbing
-        reference state and its score is implicitly fixed at 0, so including it in
-        sum exp(s_y) both misstates the objective and adds a numerically unstable
-        extra exponential term. This matches the sampler, which also drops [MASK].
+        The network emits log score ratios. For masked positions the absorbing
+        graph reduces the loss to the non-mask partition term, the clean-token
+        score weighted by 1/expm1(sigma), and the matching constant term.
+        """
+        validate_clean_tokens(x_0, self.config, "SEDD loss")
+        require(fwd.process_type == self.forward_process_type, "SEDD loss requires the absorbing forward process")
+        if not mask.any():
+            return scores.sum() * 0.0
 
-        The partition is reduced in float64 because exp() of moderately large
-        scores overflows bf16/fp32 (exp(90) ≈ 1e39 > fp32 max); bf16/fp32 during
-        autocast is fine for the network, but the objective itself must be
-        evaluated at a precision that can hold the unbounded score range."""
-        s = scores[mask].double()
+        log_score = scores.double()
+        sigma = fwd.get_sigma(t.to(scores.device)).double().view(-1, 1)
+        dsigma = fwd.get_sigma_derivative(t.to(scores.device)).double().view(-1, 1)
+
+        entropy = torch.zeros_like(x_0, dtype=log_score.dtype)
+        masked_scores = log_score[mask]
         targets = x_0[mask]
-        target_scores = s.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        vocab_ids = torch.arange(s.size(-1), device=s.device)
-        s_no_mask = s.masked_fill(vocab_ids == self.mask_token_id, float("-inf"))
-        loss = (s_no_mask.exp().sum(dim=-1) - target_scores).mean()
-        assert torch.isfinite(loss), f"SEDD score-entropy loss is non-finite (max score={scores[mask].max().item():.2f})"
+        target_scores = masked_scores.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+        vocab_ids = torch.arange(log_score.size(-1), device=scores.device)
+        non_mask_scores = masked_scores.masked_fill(vocab_ids == self.mask_token_id, float("-inf"))
+        pos_term = non_mask_scores.exp().sum(dim=-1)
+
+        ratio = 1.0 / torch.expm1(sigma.expand_as(x_0)[mask]).clamp(min=1e-12)
+        neg_term = ratio * target_scores
+        const = ratio * (ratio.log() - 1.0)
+        entropy[mask] = pos_term - neg_term + const
+
+        loss = (dsigma * entropy).sum(dim=-1).mean()
+        require(
+            torch.isfinite(loss),
+            f"SEDD score-entropy loss is non-finite (max score={scores[mask].max().item():.2f})",
+            FloatingPointError,
+        )
         return loss

@@ -5,11 +5,13 @@ Key difference from BPE:
   - WordPiece merges pair that maximizes LIKELIHOOD: score(a,b) = freq(ab) / (freq(a) * freq(b))
   - Encoding uses greedy longest-match (no merge rules needed)
   - ## prefix marks continuation of a word
+  - Whitespace is a word boundary, not a reversible byte-level symbol
 
 Used by: BERT, DistilBERT, Electra
 """
 
 from minilab.base import BaseTokenizer
+from minilab.checks import require
 from minilab.registry import register_tokenizer
 
 
@@ -25,6 +27,7 @@ class WordPieceTokenizer(BaseTokenizer):
 
     def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
         words = text.split()
+        require(words, "WordPiece training text must contain at least one word")
         word_freqs: dict[str, int] = {}
         for w in words:
             word_freqs[w] = word_freqs.get(w, 0) + 1
@@ -35,6 +38,9 @@ class WordPieceTokenizer(BaseTokenizer):
             vocab.add(word[0])
             for c in word[1:]:
                 vocab.add(self.PREFIX + c)
+        require(vocab_size >= len(vocab), (
+            f"WordPiece vocab_size ({vocab_size}) must cover the {len(vocab)} initial tokens"
+        ))
 
         # Iteratively merge pair with highest likelihood: score(a,b) = freq(ab) / (freq(a) * freq(b))
         while len(vocab) < vocab_size:
@@ -114,4 +120,5 @@ class WordPieceTokenizer(BaseTokenizer):
 
     def _set_state(self, state):
         self.token_to_id = state["token_to_id"]
+        require(self.UNK in self.token_to_id, f"WordPiece tokenizer state is missing {self.UNK}")
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}

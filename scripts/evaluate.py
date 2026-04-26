@@ -11,6 +11,7 @@ from minilab.models.gpt import GPT
 from minilab.data import load_tinystories
 from minilab.evaluation import perplexity, distinct_n, self_bleu
 from minilab.generation import generate
+from minilab.trainer import validate_checkpoint_tokenizer
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
@@ -20,9 +21,11 @@ p.add_argument("--num-samples", type=int, default=50)
 args = p.parse_args()
 
 tok = load_tokenizer(args.tokenizer)
-model = GPT.load(args.checkpoint)
+validate_checkpoint_tokenizer(args.checkpoint, tok)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = GPT.load(args.checkpoint, device=device)
 model.eval()
-print(f"Loaded {args.checkpoint} ({model.num_parameters():,} params)")
+print(f"Loaded {args.checkpoint} on {device} ({model.num_parameters():,} params)")
 
 eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=2000)
 ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))

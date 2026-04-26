@@ -10,7 +10,7 @@ from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT, GPTConfig
 from minilab.data import load_alpaca
 from minilab.alignment import SFTTrainer
-from minilab.trainer import TrainConfig, run_signature
+from minilab.trainer import TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.generation import generate
 
 p = argparse.ArgumentParser()
@@ -28,14 +28,18 @@ p.add_argument("--batch-size", type=int, default=16)
 p.add_argument("--lr", type=float, default=1e-4)
 p.add_argument("--max-examples", type=int, default=10000)
 p.add_argument("--resume-from", default="")
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 
 if args.resume_from:
+    validate_checkpoint_tokenizer(args.resume_from, tok)
     model = GPT.load(args.resume_from)
     print(f"Resuming from {args.resume_from} ({model.num_parameters():,} params)")
 elif args.checkpoint:
+    validate_checkpoint_tokenizer(args.checkpoint, tok)
     model = GPT.load(args.checkpoint)
     print(f"Loaded {args.checkpoint} ({model.num_parameters():,} params)")
 else:
@@ -49,9 +53,11 @@ print(f"Alpaca: {len(ds)} examples")
 
 tc = TrainConfig(max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
                  log_every=100, eval_every=0, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
-                 resume_from=args.resume_from)
+                 resume_from=args.resume_from, seed=args.seed)
 sig = run_signature(tok, {"name": "alpaca", "split": "train", "max_examples": args.max_examples}, args.seq_len)
-SFTTrainer(model, ds, tc, signature=sig).train()
+trainer = SFTTrainer(model, ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok))
+trainer.train()
+model = trainer.model
 
 print("\n--- After SFT ---")
 model.eval()

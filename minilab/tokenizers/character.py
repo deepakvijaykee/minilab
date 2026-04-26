@@ -1,6 +1,7 @@
 """Character-level tokenizer: one token per unique character."""
 
 from minilab.base import BaseTokenizer
+from minilab.checks import require
 from minilab.registry import register_tokenizer
 
 
@@ -13,6 +14,7 @@ class CharacterTokenizer(BaseTokenizer):
         self.id_to_char: dict[int, str] = {}
 
     def train(self, text: str, vocab_size: int = 0) -> None:
+        require(text, "Character tokenizer training text must be non-empty")
         chars = sorted(set(text))
         self.char_to_id = {c: i for i, c in enumerate(chars)}
         self.id_to_char = {i: c for c, i in self.char_to_id.items()}

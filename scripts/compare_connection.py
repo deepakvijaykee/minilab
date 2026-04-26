@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT, GPTConfig
 from minilab.data import load_tinystories
-from minilab.trainer import LMTrainer, TrainConfig, run_signature
+from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
 from minilab.evaluation import perplexity
 
 VARIANTS = [
@@ -26,23 +26,26 @@ p.add_argument("--seq-len", type=int, default=128)
 p.add_argument("--max-steps", type=int, default=2000)
 p.add_argument("--batch-size", type=int, default=16)
 p.add_argument("--max-examples", type=int, default=10000)
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 train_ds = load_tinystories(tok, args.seq_len, max_examples=args.max_examples)
 eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=1000)
 tc = TrainConfig(max_steps=args.max_steps, batch_size=args.batch_size, lr=3e-4,
-                 log_every=args.max_steps, eval_every=0, save_every=0)
+                 log_every=args.max_steps, eval_every=0, save_every=0, seed=args.seed)
 sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples}, args.seq_len)
 
 results = []
 for name, overrides in VARIANTS:
     print(f"\n=== {name} ===")
+    set_seed(args.seed)
     cfg = GPTConfig(vocab_size=tok.vocab_size, dim=args.dim, num_layers=args.num_layers,
                     num_heads=args.num_heads, max_seq_len=args.seq_len, **overrides)
     model = GPT(cfg)
     print(f"  {model.num_parameters():,} params")
-    trainer = LMTrainer(model, train_ds, tc, signature=sig, eval_dataset=eval_ds)
+    trainer = LMTrainer(model, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
     trainer.train()
     eval_loss = trainer.evaluate()
     model.eval()

@@ -1,22 +1,27 @@
+from minilab.checks import require
+
+
 _REGISTRIES: dict[str, dict[str, type]] = {}
 
 
 def register(kind, name):
     def decorator(cls):
-        _REGISTRIES.setdefault(kind, {})[name] = cls
+        registry = _REGISTRIES.setdefault(kind, {})
+        require(name not in registry, f"{kind} '{name}' is already registered")
+        registry[name] = cls
         return cls
     return decorator
 
 
 def get(kind, name):
-    assert kind in _REGISTRIES, f"Unknown registry kind: '{kind}'"
+    require(kind in _REGISTRIES, f"Unknown registry kind: '{kind}'")
     registry = _REGISTRIES[kind]
-    assert name in registry, f"Unknown {kind}: '{name}'. Available: {sorted(registry.keys())}"
+    require(name in registry, f"Unknown {kind}: '{name}'. Available: {sorted(registry.keys())}")
     return registry[name]
 
 
 def list_available(kind):
-    assert kind in _REGISTRIES, f"Unknown registry kind: '{kind}'"
+    require(kind in _REGISTRIES, f"Unknown registry kind: '{kind}'")
     return sorted(_REGISTRIES[kind].keys())
 
 

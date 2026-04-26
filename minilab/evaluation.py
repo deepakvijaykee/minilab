@@ -3,21 +3,30 @@ import re
 from collections import Counter
 
 import torch
+import torch.nn.functional as F
+
+from minilab.checks import require
 
 
 @torch.no_grad()
 def perplexity(model, dataloader):
-    assert not model.training, "perplexity expects model.eval() at the call boundary"
+    require(not model.training, "perplexity expects model.eval() at the call boundary")
     device = next(model.parameters()).device
     total_nll = 0.0
     total_tokens = 0
     for batch in dataloader:
         ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
-        _, loss = model(ids, labels)
+        logits, _ = model(ids)
         n = (labels != -100).sum().item()
-        total_nll += loss.item() * n
+        total_nll += F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=-100,
+            reduction="sum",
+        ).item()
         total_tokens += n
+    require(total_tokens > 0, "perplexity received no valid target tokens")
     return math.exp(total_nll / total_tokens)
 
 
@@ -42,6 +51,8 @@ def self_bleu(texts, n=4):
 
 def _bleu_single(hypothesis, references, max_n):
     hyp_tokens = hypothesis.split()
+    if not hyp_tokens or not references:
+        return 0.0
     precisions = []
     for n in range(1, max_n + 1):
         hyp_ngrams = Counter(tuple(hyp_tokens[i : i + n]) for i in range(len(hyp_tokens) - n + 1))
@@ -56,7 +67,10 @@ def _bleu_single(hypothesis, references, max_n):
         precisions.append(clipped / total if total > 0 else 0.0)
     if any(p == 0 for p in precisions):
         return 0.0
-    return math.exp(sum(math.log(p) for p in precisions) / len(precisions))
+    ref_lens = [len(ref.split()) for ref in references]
+    closest_ref_len = min(ref_lens, key=lambda ref_len: (abs(ref_len - len(hyp_tokens)), ref_len))
+    brevity_penalty = 1.0 if len(hyp_tokens) > closest_ref_len else math.exp(1 - closest_ref_len / len(hyp_tokens))
+    return brevity_penalty * math.exp(sum(math.log(p) for p in precisions) / len(precisions))
 
 
 def accuracy_reward(predicted, expected):

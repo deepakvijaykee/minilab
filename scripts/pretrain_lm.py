@@ -2,6 +2,7 @@
 
     python scripts/pretrain_lm.py --tokenizer tokenizer.json
     python scripts/pretrain_lm.py --tokenizer tokenizer.json --attention iha --connection mhc
+    python scripts/pretrain_lm.py --tokenizer tokenizer.json --attention gqa --num-kv-heads 4
 """
 
 import argparse
@@ -10,7 +11,7 @@ from torch.utils.data import DataLoader
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT, GPTConfig
 from minilab.data import load_tinystories
-from minilab.trainer import LMTrainer, TrainConfig, run_signature
+from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.generation import generate
 from minilab.evaluation import perplexity
 
@@ -20,6 +21,7 @@ p.add_argument("--save-dir", default="checkpoints/lm")
 p.add_argument("--dim", type=int, default=256)
 p.add_argument("--num-layers", type=int, default=6)
 p.add_argument("--num-heads", type=int, default=8)
+p.add_argument("--num-kv-heads", type=int, default=None, help="KV heads for GQA; defaults to num_heads")
 p.add_argument("--seq-len", type=int, default=256)
 p.add_argument("--attention", default="mha")
 p.add_argument("--position", default="rope")
@@ -32,7 +34,9 @@ p.add_argument("--lr", type=float, default=3e-4)
 p.add_argument("--max-examples", type=int, default=50000)
 p.add_argument("--grad-checkpoint", action="store_true")
 p.add_argument("--resume-from", default="")
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 train_ds = load_tinystories(tok, args.seq_len, max_examples=args.max_examples)
@@ -40,12 +44,13 @@ eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=2
 print(f"Data: train={len(train_ds)} eval={len(eval_ds)}")
 
 if args.resume_from:
+    validate_checkpoint_tokenizer(args.resume_from, tok)
     model = GPT.load(args.resume_from)
     print(f"Resuming from {args.resume_from}")
 else:
     config = GPTConfig(
         vocab_size=tok.vocab_size, dim=args.dim, num_layers=args.num_layers,
-        num_heads=args.num_heads, max_seq_len=args.seq_len,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, max_seq_len=args.seq_len,
         attention=args.attention, position=args.position, connection=args.connection,
     )
     model = GPT(config)
@@ -56,10 +61,12 @@ print(f"GPT: {model.num_parameters():,} params")
 tc = TrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
     log_every=100, eval_every=500, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
-    resume_from=args.resume_from,
+    resume_from=args.resume_from, seed=args.seed,
 )
 sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples}, args.seq_len)
-LMTrainer(model, train_ds, tc, signature=sig, eval_dataset=eval_ds).train()
+trainer = LMTrainer(model, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
+trainer.train()
+model = trainer.model
 
 model.eval()
 ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))

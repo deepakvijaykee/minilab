@@ -4,13 +4,12 @@
 """
 
 import argparse
-from pathlib import Path
 import torch
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT
 from minilab.data import load_hh_rlhf
-from minilab.alignment import DPOTrainer
-from minilab.trainer import TrainConfig, run_signature
+from minilab.alignment import DPOTrainConfig, DPOTrainer, resolve_reference_path
+from minilab.trainer import run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.generation import generate
 
 p = argparse.ArgumentParser()
@@ -26,34 +25,31 @@ p.add_argument("--lr", type=float, default=1e-5)
 p.add_argument("--beta", type=float, default=0.1)
 p.add_argument("--max-examples", type=int, default=5000)
 p.add_argument("--resume-from", default="")
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 
-# Resolve the frozen reference path: on resume, restore from the saved pointer so the
-# DPO KL anchor cannot silently drift to the resumed policy.
-ref_path = args.checkpoint
-if args.resume_from:
-    saved = Path(args.resume_from) / "ref_path.txt"
-    if saved.exists():
-        ref_path = saved.read_text().strip()
-assert ref_path, "DPO requires a frozen reference. Pass --checkpoint or resume from a run that saved ref_path.txt."
-
+ref_path = resolve_reference_path(args.checkpoint, args.resume_from, "DPO")
 model_path = args.resume_from or args.checkpoint
+validate_checkpoint_tokenizer(model_path, tok)
+validate_checkpoint_tokenizer(ref_path, tok)
 model = GPT.load(model_path)
-ref_model = GPT.load(ref_path)
 print(f"Trainable: {model_path} ({model.num_parameters():,} params)")
 print(f"Frozen reference: {ref_path}")
 
 ds = load_hh_rlhf(tok, args.seq_len, max_examples=args.max_examples)
 print(f"HH-RLHF: {len(ds)} preference pairs")
 
-tc = TrainConfig(max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
-                 dpo_beta=args.beta, log_every=50, eval_every=0,
-                 save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
-                 resume_from=args.resume_from)
+tc = DPOTrainConfig(max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
+                    dpo_beta=args.beta, log_every=50, eval_every=0,
+                    save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
+                    resume_from=args.resume_from, seed=args.seed)
 sig = run_signature(tok, {"name": "hh-rlhf", "split": "train", "max_examples": args.max_examples}, args.seq_len)
-DPOTrainer(model, ds, tc, ref_model=ref_model, ref_model_path=ref_path, signature=sig).train()
+trainer = DPOTrainer(model, ds, tc, ref_model_path=ref_path, signature=sig, tokenizer_sig=tokenizer_signature(tok))
+trainer.train()
+model = trainer.model
 
 print("\n--- After DPO ---")
 model.eval()

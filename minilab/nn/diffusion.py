@@ -4,8 +4,8 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from minilab.checks import require
 from minilab.nn.attention import MultiHeadAttention
 from minilab.nn.ffn import SwiGLU
 
@@ -14,6 +14,8 @@ class SinusoidalTimeEmbedding(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
+        require(dim > 0, "SinusoidalTimeEmbedding dim must be > 0")
+        require(dim % 2 == 0, "SinusoidalTimeEmbedding requires even dim")
         self.dim = dim
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * 4),
@@ -33,6 +35,7 @@ class AdaLN(nn.Module):
 
     def __init__(self, dim):
         super().__init__()
+        require(dim > 0, "AdaLN dim must be > 0")
         self.norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.proj = nn.Linear(dim, 2 * dim)
 
@@ -45,6 +48,10 @@ class DiffusionBlock(nn.Module):
 
     def __init__(self, dim, num_heads, ffn_hidden, dropout=0.0):
         super().__init__()
+        require(dim > 0, "DiffusionBlock dim must be > 0")
+        require(num_heads > 0, "DiffusionBlock num_heads must be > 0")
+        require(ffn_hidden > 0, "DiffusionBlock ffn_hidden must be > 0")
+        require(0.0 <= dropout < 1.0, "DiffusionBlock dropout must be in [0, 1)")
         self.norm1 = AdaLN(dim)
         self.attn = MultiHeadAttention(dim, num_heads, dropout)
         self.norm2 = AdaLN(dim)

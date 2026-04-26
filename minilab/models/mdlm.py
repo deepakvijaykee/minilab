@@ -10,32 +10,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from minilab.base import BaseModel
-from minilab.config import BaseConfig
+from minilab.checks import require
+from minilab.models.diffusion_base import DiffusionModelConfig, validate_clean_tokens
 from minilab.nn.diffusion import DiffusionBlock, SinusoidalTimeEmbedding
 from minilab.registry import get_position, register_model
 
 
 @dataclass
-class MDLMConfig(BaseConfig):
-    vocab_size: int = 50257
-    dim: int = 512
-    num_layers: int = 6
-    num_heads: int = 8
-    max_seq_len: int = 1024
-    dropout: float = 0.0
-    ffn_mult: float = 4.0
-    mask_token_id: int = 0
+class MDLMConfig(DiffusionModelConfig):
+    """Configuration for masked diffusion language modeling."""
 
 
 @register_model("mdlm")
 class MDLM(BaseModel):
     config_class = MDLMConfig
+    forward_process_type = "absorbing"
+    reverse_parameterization = "clean_logits"
+    requires_terminal_mask_prior = True
 
     def __init__(self, config):
         super().__init__(config)
-        assert config.dim % config.num_heads == 0, "dim must be divisible by num_heads"
         head_dim = config.dim // config.num_heads
-        assert head_dim % 2 == 0, "RoPE requires even head dimension"
         self.tok_emb = nn.Embedding(config.vocab_size, config.dim)
         self.time_emb = SinusoidalTimeEmbedding(config.dim)
         self.pos_enc = get_position("rope")(head_dim, config.max_seq_len)
@@ -48,6 +43,9 @@ class MDLM(BaseModel):
         self.tok_emb.weight = self.lm_head.weight
         self.mask_token_id = config.mask_token_id
         self.apply(self._init_weights)
+
+    def muon_auxiliary_modules(self):
+        return (self.tok_emb, self.lm_head)
 
     def forward(self, z_t, t):
         x = self._cast_hidden(self.tok_emb(z_t))
@@ -74,6 +72,8 @@ class MDLM(BaseModel):
         The earlier implementation was unweighted masked CE, which ignores the
         schedule-derived weighting and is no longer the ELBO objective. We normalize
         by sequence length so the loss magnitude is comparable across seq_len."""
+        validate_clean_tokens(x_0, self.config, "MDLM loss")
+        require(fwd.process_type == self.forward_process_type, "MDLM loss requires the absorbing forward process")
         log_probs = F.log_softmax(logits, dim=-1)
         log_p_x0 = log_probs.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)
         per_ex_loglik = (log_p_x0 * mask.float()).sum(dim=-1)

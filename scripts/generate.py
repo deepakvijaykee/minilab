@@ -9,6 +9,7 @@ import torch
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT
 from minilab.generation import generate
+from minilab.trainer import validate_checkpoint_tokenizer
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
@@ -22,9 +23,11 @@ p.add_argument("--num-samples", type=int, default=3)
 args = p.parse_args()
 
 tok = load_tokenizer(args.tokenizer)
-model = GPT.load(args.checkpoint)
+validate_checkpoint_tokenizer(args.checkpoint, tok)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = GPT.load(args.checkpoint, device=device)
 model.eval()
-print(f"Loaded {args.checkpoint} ({model.num_parameters():,} params)\n")
+print(f"Loaded {args.checkpoint} on {device} ({model.num_parameters():,} params)\n")
 
 prompt_ids = torch.tensor([tok.encode(args.prompt)])
 for i in range(args.num_samples):

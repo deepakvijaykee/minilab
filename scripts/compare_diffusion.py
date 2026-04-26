@@ -10,12 +10,12 @@ from minilab.models.sedd import SEDD, SEDDConfig
 from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
-from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature
+from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
 
 VARIANTS = [
-    ("MDLM", MDLM, MDLMConfig),
-    ("SEDD", SEDD, SEDDConfig),
-    ("D3PM", D3PM, D3PMConfig),
+    ("MDLM", MDLM, MDLMConfig, "cosine"),
+    ("SEDD", SEDD, SEDDConfig, "log_linear"),
+    ("D3PM", D3PM, D3PMConfig, "cosine"),
 ]
 
 p = argparse.ArgumentParser()
@@ -27,30 +27,33 @@ p.add_argument("--seq-len", type=int, default=128)
 p.add_argument("--max-steps", type=int, default=2000)
 p.add_argument("--batch-size", type=int, default=16)
 p.add_argument("--max-examples", type=int, default=10000)
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size
 train_ds = load_tinystories(tok, args.seq_len, max_examples=args.max_examples, mode="diffusion")
 eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=1000, mode="diffusion")
-fwd = ForwardProcess(mask_id)
 tc = TrainConfig(max_steps=args.max_steps, batch_size=args.batch_size, lr=3e-4,
-                 log_every=args.max_steps, eval_every=0, save_every=0)
+                 log_every=args.max_steps, eval_every=0, save_every=0, seed=args.seed)
 sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples, "mode": "diffusion"}, args.seq_len)
 
 results = []
-for name, cls, cfg_cls in VARIANTS:
-    print(f"\n=== {name} ===")
+for name, cls, cfg_cls, schedule in VARIANTS:
+    print(f"\n=== {name} (schedule={schedule}) ===")
+    set_seed(args.seed)
     cfg = cfg_cls(vocab_size=tok.vocab_size + 1, dim=args.dim, num_layers=args.num_layers,
                   num_heads=args.num_heads, max_seq_len=args.seq_len, mask_token_id=mask_id)
     model = cls(cfg)
+    fwd = ForwardProcess(mask_id, schedule=schedule)
     print(f"  {model.num_parameters():,} params")
-    trainer = DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, eval_dataset=eval_ds)
+    trainer = DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
     trainer.train()
     eval_loss = trainer.evaluate()
-    results.append((name, model.num_parameters(), eval_loss))
+    results.append((name, schedule, model.num_parameters(), eval_loss))
 
-print(f"\n{'Model':<10} {'Params':>10} {'Eval Loss':>12}")
-print("-" * 35)
-for name, params, loss in results:
-    print(f"{name:<10} {params:>10,} {loss:>12.4f}")
+print(f"\n{'Model':<10} {'Schedule':<12} {'Params':>10} {'Eval Loss':>12}")
+print("-" * 48)
+for name, schedule, params, loss in results:
+    print(f"{name:<10} {schedule:<12} {params:>10,} {loss:>12.4f}")

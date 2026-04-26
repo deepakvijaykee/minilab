@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
+from minilab.checks import require
 from minilab.registry import register_position
 
 
@@ -12,7 +13,10 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(self, dim, max_seq_len, base=10000.0):
         super().__init__()
-        assert dim % 2 == 0, f"RoPE requires even dim, got {dim}"
+        require(dim > 0, "RoPE dim must be > 0")
+        require(dim % 2 == 0, f"RoPE requires even dim, got {dim}")
+        require(max_seq_len > 0, "RoPE max_seq_len must be > 0")
+        require(base > 0, "RoPE base must be > 0")
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         self._build_cache(max_seq_len)
@@ -36,6 +40,8 @@ class ALiBi(nn.Module):
 
     def __init__(self, num_heads, max_seq_len):
         super().__init__()
+        require(num_heads > 0, "ALiBi num_heads must be > 0")
+        require(max_seq_len > 0, "ALiBi max_seq_len must be > 0")
         slopes = self._get_slopes(num_heads)
         self.register_buffer("slopes", slopes)
         self._build_cache(max_seq_len)
@@ -73,9 +79,14 @@ class LearnedPosition(nn.Module):
 
     def __init__(self, dim, max_seq_len):
         super().__init__()
+        require(dim > 0, "learned position dim must be > 0")
+        require(max_seq_len > 0, "learned position max_seq_len must be > 0")
         self.emb = nn.Embedding(max_seq_len, dim)
 
     def forward(self, seq_len):
+        require(seq_len <= self.emb.num_embeddings, (
+            f"learned position encoding supports at most {self.emb.num_embeddings} tokens, got {seq_len}"
+        ))
         return self.emb.weight[:seq_len]
 
 
@@ -85,6 +96,9 @@ class SinusoidalPosition(nn.Module):
 
     def __init__(self, dim, max_seq_len):
         super().__init__()
+        require(dim > 0, "sinusoidal position dim must be > 0")
+        require(dim % 2 == 0, f"sinusoidal position requires even dim, got {dim}")
+        require(max_seq_len > 0, "sinusoidal position max_seq_len must be > 0")
         pe = torch.zeros(max_seq_len, dim)
         pos = torch.arange(max_seq_len).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
@@ -93,4 +107,7 @@ class SinusoidalPosition(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, seq_len):
+        require(seq_len <= self.pe.size(0), (
+            f"sinusoidal position encoding supports at most {self.pe.size(0)} tokens, got {seq_len}"
+        ))
         return self.pe[:seq_len]

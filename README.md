@@ -2,7 +2,7 @@
 
 A modular library for training language models from scratch: autoregressive transformers, text diffusion, and alignment.
 
-Built for learning and experimentation. Every component is swappable via a registry. No HuggingFace transformers/tokenizers dependency, all of models, tokenizers, trainers all written from scratch.
+Built for learning and experimentation. GPT components, tokenizers, schedulers, samplers, and trainers are registered extension points; diffusion models share a compact fixed transformer backbone so each objective can keep its reverse-process contract explicit. No HuggingFace transformers/tokenizers dependency, all of models, tokenizers, trainers all written from scratch.
 
 ## Install
 
@@ -35,9 +35,9 @@ python scripts/dpo.py --tokenizer tokenizer.json --checkpoint checkpoints/sft/st
 python scripts/grpo.py --tokenizer tokenizer.json --checkpoint checkpoints/sft/step_3000
 ```
 
-## Swappable components
+## Extension Points
 
-Every architectural choice is a registry entry. Swap via config strings:
+GPT architectural choices are registry entries. Swap via config strings:
 
 ```python
 from minilab.models.gpt import GPT, GPTConfig
@@ -59,6 +59,14 @@ from minilab.models.gpt import gpt_preset
 model = GPT(gpt_preset("gpt-small", vocab_size=4096))
 ```
 
+For diffusion experiments, add new algorithms by registering a model with a
+`forward_process_type` and `reverse_parameterization`, then pair it with a sampler
+that validates the parameterization it consumes. Schedulers are registry entries;
+continuous-time objectives also require the schedule to register a continuous
+`alpha(t)` function and its exact derivative. The current MDLM, SEDD, and D3PM
+implementations keep their transformer block fixed to make objective differences
+easy to inspect.
+
 ## What's in the library
 
 ### Tokenizers (from scratch, no dependencies)
@@ -66,7 +74,7 @@ model = GPT(gpt_preset("gpt-small", vocab_size=4096))
 | Algorithm | Used by | File |
 |-----------|---------|------|
 | BPE | GPT, Llama, Mistral | `tokenizers/bpe.py` |
-| WordPiece | BERT, Electra | `tokenizers/wordpiece.py` |
+| WordPiece | BERT, Electra; whitespace-normalizing, not reversible | `tokenizers/wordpiece.py` |
 | Unigram | T5, XLNet, ALBERT | `tokenizers/unigram.py` |
 | Character | text8 experiments | `tokenizers/character.py` |
 
@@ -78,7 +86,7 @@ model = GPT(gpt_preset("gpt-small", vocab_size=4096))
 | Position | RoPE, ALiBi, learned, sinusoidal |
 | Normalization | RMSNorm, LayerNorm |
 | Feed-forward | SwiGLU, GELU, MoE (sparse mixture of experts with load balancing) |
-| Connections | Residual, HC (hyper-connections), mHC (manifold-constrained) |
+| Connections | Residual, dynamic HC, mHC with Sinkhorn-constrained residual maps |
 
 ### Models
 
@@ -86,8 +94,8 @@ model = GPT(gpt_preset("gpt-small", vocab_size=4096))
 |-------|------|-------|
 | GPT | Autoregressive | Configurable with all components above |
 | MDLM | Masked diffusion | Sahoo et al., NeurIPS 2024 |
-| SEDD | Score entropy diffusion | Lou et al., ICML 2024 |
-| D3PM | Discrete denoising diffusion | Austin et al., NeurIPS 2021 |
+| SEDD | Score entropy diffusion with absorbing graph | Lou et al., ICML 2024 |
+| D3PM | Absorbing discrete denoising diffusion | Austin et al., NeurIPS 2021 |
 
 ### Training
 
@@ -120,7 +128,8 @@ Features: AdamW/Lion/Muon optimizers, cosine/linear/constant/WSD LR schedules, m
 - Autoregressive: top-k, top-p, temperature, repetition penalty, greedy
 - Diffusion ancestral: iterative unmasking from full mask
 - Diffusion DDPM cache: cached predictions for ~4x fewer forward passes
-- Infilling: regenerate masked spans while keeping context (unique to diffusion)
+- SEDD analytical and D3PM x0-parameterized samplers preserve each model's reverse-process contract
+- Infilling: regenerate masked spans while keeping context, dispatched by diffusion parameterization
 
 ### Evaluation
 
@@ -159,7 +168,7 @@ minilab/
 │   ├── norm.py          # RMSNorm, LayerNorm
 │   ├── ffn.py           # SwiGLU, GELU
 │   ├── moe.py           # Sparse MoE with load balancing
-│   ├── connections.py   # Residual, HC, mHC (Sinkhorn-constrained)
+│   ├── connections.py   # Residual, dynamic HC, mHC (Sinkhorn-constrained)
 │   ├── diffusion.py     # AdaLN, DiffusionBlock, SinusoidalTimeEmbedding
 │   └── optimizers.py    # Muon, Lion
 ├── tokenizers/
@@ -173,7 +182,7 @@ minilab/
 │   ├── sedd.py          # Score Entropy Discrete Diffusion
 │   └── d3pm.py          # Discrete Denoising Diffusion
 ├── data.py              # Datasets + loaders (TinyStories, Alpaca, HH, GSM8K, text8, WikiText)
-├── diffusion.py         # ForwardProcess + noise schedules (cosine, linear, log-linear)
+├── diffusion.py         # ForwardProcess + noise schedules (cosine, linear, geometric, log-linear)
 ├── trainer.py           # Trainer, LMTrainer, DiffusionTrainer
 ├── alignment.py         # SFTTrainer, DPOTrainer, GRPOTrainer
 ├── generation.py        # AR sampling, diffusion sampling (ancestral, DDPM cache), infilling

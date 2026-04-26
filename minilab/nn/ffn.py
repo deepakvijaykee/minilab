@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
+from minilab.checks import require
 from minilab.registry import register_ffn
 
 
@@ -9,6 +10,8 @@ class SwiGLU(nn.Module):
 
     def __init__(self, dim, hidden_dim):
         super().__init__()
+        require(dim > 0, "SwiGLU dim must be > 0")
+        require(hidden_dim > 0, "SwiGLU hidden_dim must be > 0")
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(dim, hidden_dim, bias=False)
         self.w3 = nn.Linear(hidden_dim, dim, bias=False)
@@ -22,6 +25,8 @@ class GELUFFN(nn.Module):
 
     def __init__(self, dim, hidden_dim):
         super().__init__()
+        require(dim > 0, "GELUFFN dim must be > 0")
+        require(hidden_dim > 0, "GELUFFN hidden_dim must be > 0")
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
 

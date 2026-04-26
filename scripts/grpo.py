@@ -4,13 +4,12 @@
 """
 
 import argparse
-from pathlib import Path
 import torch
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT
 from minilab.data import load_gsm8k
-from minilab.alignment import GRPOTrainer
-from minilab.trainer import TrainConfig, run_signature
+from minilab.alignment import GRPOTrainConfig, GRPOTrainer, resolve_reference_path
+from minilab.trainer import run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.tasks.gsm8k import extract_answer, reward as gsm8k_reward
 from minilab.generation import generate
 
@@ -30,20 +29,17 @@ p.add_argument("--max-new-tokens", type=int, default=128)
 p.add_argument("--max-examples", type=int, default=2000)
 p.add_argument("--eval-examples", type=int, default=0, help="0 = full GSM8K test split (paper metric); set >0 to subsample for faster debugging")
 p.add_argument("--resume-from", default="")
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 
-ref_path = args.checkpoint
-if args.resume_from:
-    saved = Path(args.resume_from) / "ref_path.txt"
-    if saved.exists():
-        ref_path = saved.read_text().strip()
-assert ref_path, "GRPO requires a frozen reference (KL anchor). Pass --checkpoint or resume from a run that saved ref_path.txt."
-
+ref_path = resolve_reference_path(args.checkpoint, args.resume_from, "GRPO")
 model_path = args.resume_from or args.checkpoint
+validate_checkpoint_tokenizer(model_path, tok)
+validate_checkpoint_tokenizer(ref_path, tok)
 model = GPT.load(model_path)
-ref_model = GPT.load(ref_path)
 print(f"Trainable: {model_path} ({model.num_parameters():,} params)")
 print(f"Frozen reference: {ref_path}")
 
@@ -52,23 +48,25 @@ eval_ds = load_gsm8k(tok, args.seq_len, max_examples=args.eval_examples, split="
 print(f"GSM8K: train={len(train_ds)} test={len(eval_ds)}")
 
 
-def math_reward(batch, completions):
+def math_reward(batch, completions, completion_mask):
     rewards = [
-        gsm8k_reward(tok.decode(completions[b].tolist()), train_ds.answers[batch["idx"][b].item()])
+        gsm8k_reward(tok.decode(completions[b][completion_mask[b]].tolist()), train_ds.answers[batch["idx"][b].item()])
         for b in range(completions.size(0))
     ]
     return torch.tensor(rewards)
 
 
-tc = TrainConfig(
+tc = GRPOTrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
     grpo_num_generations=args.num_generations, grpo_max_new_tokens=args.max_new_tokens,
     grpo_inner_epochs=args.inner_epochs,
     log_every=50, eval_every=0, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
-    resume_from=args.resume_from,
+    resume_from=args.resume_from, seed=args.seed,
 )
 sig = run_signature(tok, {"name": "gsm8k", "split": "train", "max_examples": args.max_examples}, args.seq_len)
-GRPOTrainer(model, math_reward, train_ds, tc, ref_model=ref_model, ref_model_path=ref_path, signature=sig).train()
+trainer = GRPOTrainer(model, math_reward, train_ds, tc, ref_model_path=ref_path, signature=sig, tokenizer_sig=tokenizer_signature(tok))
+trainer.train()
+model = trainer.model
 
 # Evaluate on the held-out test split — the training-set loop below was an optimistic
 # debugging signal, not a paper-safe number.

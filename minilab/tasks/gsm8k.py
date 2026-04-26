@@ -4,6 +4,7 @@ policy's training prompt and the reward function."""
 
 import re
 
+from minilab.checks import require
 from minilab.evaluation import accuracy_reward
 
 DELIMITER = "####"
@@ -31,6 +32,14 @@ def extract_answer(text):
     after = text.split(DELIMITER)[-1]
     match = re.search(_NUMBER, after)
     return match.group() if match else None
+
+
+def parse_gold_answer(answer_text):
+    """Parse the dataset answer format used by GSM8K rows."""
+    require(DELIMITER in answer_text, "GSM8K answer is missing the '####' delimiter")
+    answer = extract_answer(answer_text)
+    require(answer is not None, "GSM8K answer delimiter is not followed by a number")
+    return answer
 
 
 def reward(completion_text, expected):

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from minilab.checks import require
 from minilab.registry import register_attention
 
 
@@ -27,16 +28,23 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, dim, num_heads, dropout=0.0):
         super().__init__()
-        assert dim % num_heads == 0
+        require(dim > 0, "dim must be > 0")
+        require(num_heads > 0, "num_heads must be > 0")
+        require(dim % num_heads == 0, "dim must be divisible by num_heads")
+        require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.dropout = dropout
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         B, T, C = x.shape
-        q, k, v = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim).unbind(2)
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim)
+        k = self.k_proj(x).reshape(B, T, self.num_heads, self.head_dim)
+        v = self.v_proj(x).reshape(B, T, self.num_heads, self.head_dim)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         if freqs_cis is not None:
@@ -55,23 +63,28 @@ class GroupedQueryAttention(nn.Module):
 
     def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0):
         super().__init__()
-        assert dim % num_heads == 0
-        assert num_heads % num_kv_heads == 0
+        require(dim > 0, "dim must be > 0")
+        require(num_heads > 0, "num_heads must be > 0")
+        require(num_kv_heads > 0, "num_kv_heads must be > 0")
+        require(dim % num_heads == 0, "dim must be divisible by num_heads")
+        require(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
+        require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.kv_group_size = num_heads // num_kv_heads
         self.dropout = dropout
         self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.kv_proj = nn.Linear(dim, 2 * num_kv_heads * self.head_dim, bias=False)
+        kv_dim = num_kv_heads * self.head_dim
+        self.k_proj = nn.Linear(dim, kv_dim, bias=False)
+        self.v_proj = nn.Linear(dim, kv_dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         B, T, C = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(x).reshape(B, T, 2, self.num_kv_heads, self.head_dim)
-        k, v = kv.unbind(2)
-        k, v = k.transpose(1, 2), v.transpose(1, 2)
+        k = self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
@@ -93,18 +106,25 @@ class InterleavedHeadAttention(nn.Module):
 
     def __init__(self, dim, num_heads, dropout=0.0):
         super().__init__()
-        assert dim % num_heads == 0
+        require(dim > 0, "dim must be > 0")
+        require(num_heads > 0, "num_heads must be > 0")
+        require(dim % num_heads == 0, "dim must be divisible by num_heads")
+        require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.dropout = dropout
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
         self.q_mix = nn.Parameter(torch.eye(num_heads))
         self.k_mix = nn.Parameter(torch.eye(num_heads))
         self.out = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         B, T, C = x.shape
-        q, k, v = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim).unbind(2)
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim)
+        k = self.k_proj(x).reshape(B, T, self.num_heads, self.head_dim)
+        v = self.v_proj(x).reshape(B, T, self.num_heads, self.head_dim)
 
         q = torch.einsum("bthd,gh->btgd", q, self.q_mix)
         k = torch.einsum("bthd,gh->btgd", k, self.k_mix)

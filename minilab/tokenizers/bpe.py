@@ -14,6 +14,7 @@ Used by: GPT-2/3/4, Llama, Mistral, RoBERTa
 """
 
 from minilab.base import BaseTokenizer
+from minilab.checks import require
 from minilab.registry import register_tokenizer
 
 
@@ -25,9 +26,10 @@ class BPETokenizer(BaseTokenizer):
         self.vocab: dict[int, bytes] = {}  # id -> bytes
 
     def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
-        assert vocab_size >= 256, "BPE vocab must be >= 256 (byte-level base)"
+        require(vocab_size >= 256, "BPE vocab must be >= 256 (byte-level base)")
         num_merges = vocab_size - 256
 
+        self.merges = {}
         self.vocab = {i: bytes([i]) for i in range(256)}
         ids = list(text.encode("utf-8"))
 

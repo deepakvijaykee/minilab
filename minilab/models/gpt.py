@@ -5,7 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from minilab.base import BaseModel
+from minilab.checks import require
 from minilab.config import BaseConfig
+from minilab.nn.connections import expand_residual_stream, reduce_residual_stream
 from minilab.registry import get_attention, get_connection, get_ffn, get_norm, get_position, register_model
 
 
@@ -31,6 +33,25 @@ class GPTConfig(BaseConfig):
     def __post_init__(self):
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
+        require(self.vocab_size > 0, "vocab_size must be > 0")
+        require(self.dim > 0, "dim must be > 0")
+        require(self.num_layers > 0, "num_layers must be > 0")
+        require(self.num_heads > 0, "num_heads must be > 0")
+        require(self.num_kv_heads > 0, "num_kv_heads must be > 0")
+        require(self.max_seq_len > 0, "max_seq_len must be > 0")
+        require(self.dim % self.num_heads == 0, "dim must be divisible by num_heads")
+        require(0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)")
+        require(self.ffn_mult > 0, "ffn_mult must be > 0")
+        require(self.connection_expansion > 0, "connection_expansion must be > 0")
+        if self.attention == "gqa":
+            require(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
+        if self.position == "rope":
+            require((self.dim // self.num_heads) % 2 == 0, "RoPE requires even head dimension")
+        if self.position == "sinusoidal":
+            require(self.dim % 2 == 0, "sinusoidal position requires even dim")
+        if self.ffn == "moe":
+            require(self.num_experts > 0, "num_experts must be > 0")
+            require(1 <= self.top_k_experts <= self.num_experts, "top_k_experts must be in [1, num_experts]")
 
 
 PRESETS = {
@@ -42,12 +63,12 @@ PRESETS = {
 
 
 def gpt_preset(name, vocab_size, **overrides):
-    assert name in PRESETS, f"Unknown preset: {name}. Available: {list(PRESETS.keys())}"
+    require(name in PRESETS, f"Unknown preset: {name}. Available: {list(PRESETS.keys())}")
     return GPTConfig(vocab_size=vocab_size, **{**PRESETS[name], **overrides})
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, block_id):
         super().__init__()
         self.attn_norm = get_norm(config.norm)(config.dim)
         self.ffn_norm = get_norm(config.norm)(config.dim)
@@ -70,8 +91,8 @@ class TransformerBlock(nn.Module):
             self.attn_conn = conn_cls(config.dim)
             self.ffn_conn = conn_cls(config.dim)
         else:
-            self.attn_conn = conn_cls(config.dim, config.connection_expansion)
-            self.ffn_conn = conn_cls(config.dim, config.connection_expansion)
+            self.attn_conn = conn_cls(config.dim, config.connection_expansion, layer_id=2 * block_id)
+            self.ffn_conn = conn_cls(config.dim, config.connection_expansion, layer_id=2 * block_id + 1)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         x = self.attn_conn(x, lambda h: self.drop(self.attn(self.attn_norm(h), freqs_cis, attn_bias, is_causal)))
@@ -87,7 +108,7 @@ class GPT(BaseModel):
         super().__init__(config)
         self.tok_emb = nn.Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
+        self.blocks = nn.ModuleList([TransformerBlock(config, i) for i in range(config.num_layers)])
         self.ln_f = get_norm(config.norm)(config.dim)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
@@ -100,6 +121,19 @@ class GPT(BaseModel):
             self.pos_enc = get_position(config.position)(config.dim, config.max_seq_len)
 
         self.apply(self._init_weights)
+        if config.connection in ("hc", "mhc"):
+            for block in self.blocks:
+                block.attn_conn.reset_dynamic_parameters()
+                block.ffn_conn.reset_dynamic_parameters()
+
+    def muon_auxiliary_modules(self):
+        modules = [self.tok_emb, self.lm_head]
+        if self.config.position == "learned":
+            modules.append(self.pos_enc)
+        if self.config.connection != "residual":
+            for block in self.blocks:
+                modules.extend((block.attn_conn, block.ffn_conn))
+        return tuple(modules)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -117,8 +151,7 @@ class GPT(BaseModel):
         x = self.drop(x)
 
         if self.config.connection != "residual":
-            n = self.config.connection_expansion
-            x = x.unsqueeze(2).expand(-1, -1, n, -1).contiguous()
+            x = expand_residual_stream(x, self.config.connection_expansion)
 
         for block in self.blocks:
             if self._gradient_checkpointing and self.training:
@@ -127,7 +160,7 @@ class GPT(BaseModel):
                 x = block(x, freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=is_causal)
 
         if self.config.connection != "residual":
-            x = x.mean(dim=2)
+            x = reduce_residual_stream(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

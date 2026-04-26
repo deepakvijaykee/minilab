@@ -10,9 +10,17 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from minilab.base import BaseModel, unwrap_model
+from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.nn.optimizers import Lion, Muon
 from minilab.registry import register_trainer
+
+
+_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+_OPTIMIZERS = {"adamw", "lion", "muon"}
+_LR_SCHEDULES = {"cosine", "linear", "constant", "wsd"}
+_DECAYING_LR_SCHEDULES = {"cosine", "linear", "wsd"}
 
 
 @dataclass
@@ -20,6 +28,7 @@ class TrainConfig(BaseConfig):
     max_steps: int = 10000
     batch_size: int = 32
     lr: float = 3e-4
+    muon_lr: float = 0.02
     weight_decay: float = 0.1
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
@@ -35,13 +44,24 @@ class TrainConfig(BaseConfig):
     save_every: int = 1000
     save_dir: str = "checkpoints"
     eval_steps: int = 50
-    dpo_beta: float = 0.1
-    grpo_num_generations: int = 4
-    grpo_max_new_tokens: int = 128
-    grpo_clip_ratio: float = 0.2
-    grpo_kl_coef: float = 0.1
-    grpo_inner_epochs: int = 4
     resume_from: str = ""
+
+    def __post_init__(self):
+        require(self.max_steps > 0, "max_steps must be > 0")
+        require(self.batch_size > 0, "batch_size must be > 0")
+        require(self.lr >= 0, "lr must be >= 0")
+        require(self.muon_lr >= 0, "muon_lr must be >= 0")
+        require(self.weight_decay >= 0, "weight_decay must be >= 0")
+        require(self.warmup_steps >= 0, "warmup_steps must be >= 0")
+        require(self.max_grad_norm > 0, "max_grad_norm must be > 0")
+        require(self.grad_accum_steps > 0, "grad_accum_steps must be > 0")
+        require(self.dtype in _DTYPES, f"Unknown dtype: '{self.dtype}'. Available: {sorted(_DTYPES)}")
+        require(self.optimizer in _OPTIMIZERS, f"Unknown optimizer: '{self.optimizer}'. Available: {sorted(_OPTIMIZERS)}")
+        require(self.lr_schedule in _LR_SCHEDULES, f"Unknown lr_schedule: '{self.lr_schedule}'. Available: {sorted(_LR_SCHEDULES)}")
+        require(self.log_every > 0, "log_every must be > 0")
+        require(self.eval_every >= 0, "eval_every must be >= 0")
+        require(self.save_every >= 0, "save_every must be >= 0")
+        require(self.eval_steps > 0, "eval_steps must be > 0")
 
 
 def set_seed(seed):
@@ -51,17 +71,30 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def _decay_progress(update, warmup, total):
+    if warmup == 0:
+        progress = 0.0 if total == 1 else (update - 1) / (total - 1)
+    else:
+        progress = (update - warmup) / (total - warmup)
+    return min(1.0, max(0.0, progress))
+
+
 # Fields on TrainConfig whose value must match at resume time: changing them
 # silently redefines the training trajectory. Anything else (log_every, save_every,
-# aim_repo, save_dir, resume_from, compile, dtype) is free to differ.
-# `max_steps` is intentionally excluded: extending the training horizon on resume is a
-# normal workflow. The LR profile relative to max_steps does shift when it changes, but
-# that is a property of the cosine schedule being parameterized by max_steps, not a
-# correctness issue we can guard against without blocking all extension resumes.
+# aim_repo, save_dir, resume_from, compile) is free to differ.
+# `max_steps` is intentionally excluded: callers may stop earlier or later within
+# the saved scheduler horizon. Decaying schedules reject horizon extension on
+# resume because continuing past the saved horizon would train at the schedule
+# endpoint.
 _RESUME_CRITICAL_CONFIG_FIELDS = (
     "batch_size", "lr", "weight_decay", "warmup_steps",
-    "grad_accum_steps", "optimizer", "lr_schedule", "seed",
+    "max_grad_norm", "grad_accum_steps", "dtype", "optimizer", "lr_schedule", "seed",
+    "muon_lr",
 )
+
+def tokenizer_signature(tokenizer):
+    payload = json.dumps(tokenizer._get_state(), sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def run_signature(tokenizer, dataset_desc, seq_len):
@@ -71,11 +104,25 @@ def run_signature(tokenizer, dataset_desc, seq_len):
     different experiment. `dataset_desc` is a caller-provided dict like
     {"name": "tinystories", "split": "train", "max_examples": 50000}."""
     payload = json.dumps({
-        "tokenizer": tokenizer._get_state(),
+        "tokenizer": tokenizer_signature(tokenizer),
         "dataset": dataset_desc,
         "seq_len": seq_len,
     }, sort_keys=True).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def validate_checkpoint_tokenizer(checkpoint, tokenizer):
+    meta_path = Path(checkpoint) / "run_meta.json"
+    require(meta_path.exists(), f"Missing run_meta.json at {meta_path}; cannot validate tokenizer identity")
+    saved_meta = json.loads(meta_path.read_text())
+    require("tokenizer_signature" in saved_meta, (
+        f"Missing tokenizer_signature in {meta_path}; checkpoint cannot be safely used with an external tokenizer"
+    ))
+    current = tokenizer_signature(tokenizer)
+    require(saved_meta["tokenizer_signature"] == current, (
+        f"Tokenizer mismatch for checkpoint {checkpoint}: "
+        f"saved={saved_meta['tokenizer_signature'][:12]}... current={current[:12]}..."
+    ))
 
 
 class Trainer:
@@ -84,23 +131,58 @@ class Trainer:
     # Generic base fields live in _RESUME_CRITICAL_CONFIG_FIELDS above.
     _extra_critical_fields: tuple = ()
 
-    def __init__(self, model, train_dataset, config, *, signature, eval_dataset=None):
+    def __init__(self, model, train_dataset, config, *, signature, tokenizer_sig="", eval_dataset=None):
         """`signature` is a caller-owned hash of resume-critical inputs not captured
         by TrainConfig (tokenizer identity, dataset identity, seq_len). Build it with
         run_signature(...). On resume it is asserted equal to the saved value."""
         self.config = config
         self.signature = signature
+        self.tokenizer_signature = tokenizer_sig
+        # Trainer owns training-loop RNG. Callers that construct fresh models set
+        # this same seed before model construction so initialization is reproducible.
         set_seed(config.seed)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = model.to(self.device)
 
+        if config.resume_from:
+            self.model = self._load_model_for_resume(self.model)
+
         if config.compile:
             self.model = torch.compile(self.model)
 
-        DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-        assert config.dtype in DTYPES, f"Unknown dtype: '{config.dtype}'. Available: {sorted(DTYPES)}"
-        self.dtype = DTYPES[config.dtype]
-        self.scaler = torch.amp.GradScaler(enabled=config.dtype == "float16")
+        self.dtype = _DTYPES[config.dtype]
+        self.scaler = torch.amp.GradScaler(self.device, enabled=config.dtype == "float16")
+        self._resume_scheduler_total_steps = None
+        if config.resume_from:
+            # Validate resume-critical inputs BEFORE loading optimizer/scheduler
+            # state. A mismatch means the checkpoint belongs to a different
+            # experiment and continuing would silently redefine the run.
+            meta_path = Path(config.resume_from) / "run_meta.json"
+            require(meta_path.exists(), f"Missing run_meta.json at {meta_path}; cannot validate resume")
+            saved_meta = json.loads(meta_path.read_text())
+            required_meta = {"signature", "scheduler_total_steps", "config"}
+            missing_meta = required_meta - set(saved_meta)
+            require(not missing_meta, f"Missing resume metadata fields: {sorted(missing_meta)}")
+            require(saved_meta["signature"] == signature, (
+                f"Resume signature mismatch: checkpoint was built with a different "
+                f"tokenizer/dataset/seq_len. Saved={saved_meta['signature'][:12]}... "
+                f"Current={signature[:12]}..."
+            ))
+            self._resume_scheduler_total_steps = saved_meta["scheduler_total_steps"]
+            require(self._resume_scheduler_total_steps > 0, "scheduler_total_steps must be > 0")
+            saved_cfg = saved_meta["config"]
+            critical = _RESUME_CRITICAL_CONFIG_FIELDS + type(self)._extra_critical_fields
+            missing_critical = [k for k in critical if k not in saved_cfg]
+            require(not missing_critical, f"Resume metadata missing critical config fields: {missing_critical}")
+            current_values = config.to_dict()
+            mismatches = []
+            for k in critical:
+                saved_value = saved_cfg[k]
+                current_value = current_values[k]
+                if saved_value != current_value:
+                    mismatches.append((k, saved_value, current_value))
+            require(not mismatches, f"Resume config mismatch on critical fields: {mismatches}")
+            self._validate_resume_scheduler_horizon()
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
         # Dedicated generator for the shuffle RNG so resume can restore batch order
@@ -109,9 +191,14 @@ class Trainer:
         self.loader_generator.manual_seed(config.seed)
         self.train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=False,
                                        generator=self.loader_generator)
-        self.eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, drop_last=False) if eval_dataset else None
+        self.eval_loader = (
+            DataLoader(eval_dataset, batch_size=config.batch_size, drop_last=False)
+            if eval_dataset is not None
+            else None
+        )
         self.step = 0
         self.batches_consumed = 0
+        self._last_checkpoint_step = None
         # Snapshot of loader_generator state taken immediately before the current
         # epoch's iter() call. That is the state that must be restored on resume so
         # the new iter() produces the same shuffle for the epoch we're in the middle of.
@@ -119,34 +206,23 @@ class Trainer:
         self.aim_run = None
 
         if config.resume_from:
-            # Validate resume-critical inputs BEFORE loading anything — a mismatch
-            # means the checkpoint belongs to a different experiment and silently
-            # continuing would produce results that look like the old run but aren't.
-            meta_path = Path(config.resume_from) / "run_meta.json"
-            assert meta_path.exists(), f"Missing run_meta.json at {meta_path}; cannot validate resume"
-            saved_meta = json.loads(meta_path.read_text())
-            assert saved_meta["signature"] == signature, (
-                f"Resume signature mismatch: checkpoint was built with a different "
-                f"tokenizer/dataset/seq_len. Saved={saved_meta['signature'][:12]}... "
-                f"Current={signature[:12]}..."
-            )
-            saved_cfg = saved_meta["config"]
-            critical = _RESUME_CRITICAL_CONFIG_FIELDS + type(self)._extra_critical_fields
-            mismatches = [(k, saved_cfg[k], getattr(config, k))
-                          for k in critical if saved_cfg[k] != getattr(config, k)]
-            assert not mismatches, f"Resume config mismatch on critical fields: {mismatches}"
             state = torch.load(Path(config.resume_from) / "trainer_state.pt", map_location=self.device, weights_only=False)
+            required_state = {
+                "step", "optimizer", "scheduler", "scaler", "python_rng", "numpy_rng",
+                "torch_rng", "cuda_rng", "loader_rng_epoch_start", "batches_consumed",
+            }
+            missing_state = required_state - set(state)
+            require(not missing_state, f"Missing trainer state fields: {sorted(missing_state)}")
             self.optimizer.load_state_dict(state["optimizer"])
             self.scheduler.load_state_dict(state["scheduler"])
-            if "scaler" in state:
-                self.scaler.load_state_dict(state["scaler"])
+            self.scaler.load_state_dict(state["scaler"])
             self.step = state["step"]
             # Faithful continuation: restore RNG states + loader generator + fast-forward
             # the iterator so the next batch is the one that would have come next.
             random.setstate(state["python_rng"])
             np.random.set_state(state["numpy_rng"])
             torch.set_rng_state(state["torch_rng"].cpu())
-            if state.get("cuda_rng") is not None and torch.cuda.is_available():
+            if state["cuda_rng"] is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda_rng"]])
             self.loader_rng_epoch_start = state["loader_rng_epoch_start"].cpu()
             self.batches_consumed = state["batches_consumed"]
@@ -164,6 +240,18 @@ class Trainer:
             self.aim_run = Run(repo=config.aim_repo)
             self.aim_run["config"] = config.to_dict()
 
+    def _load_model_for_resume(self, model):
+        model = unwrap_model(model)
+        require(isinstance(model, BaseModel), (
+            "Trainer resume requires a BaseModel instance so checkpoint weights "
+            "and model-family metadata can be restored together"
+        ))
+        gradient_checkpointing = model._gradient_checkpointing
+        loaded = type(model).load(self.config.resume_from, device=self.device)
+        if gradient_checkpointing:
+            loaded.gradient_checkpointing_enable()
+        return loaded
+
     def _build_optimizer(self):
         decay = [p for p in self.model.parameters() if p.dim() >= 2]
         no_decay = [p for p in self.model.parameters() if p.dim() < 2]
@@ -174,43 +262,45 @@ class Trainer:
         if self.config.optimizer == "lion":
             return Lion(groups, lr=self.config.lr, weight_decay=self.config.weight_decay)
         if self.config.optimizer == "muon":
-            # NS orthogonalization on hidden-layer matrices only; skip for vocab-sized embeddings
-            embed_keys = {"tok_emb", "lm_head", "score_head"}
-            hidden = [p for n, p in self.model.named_parameters() if p.dim() >= 2 and not any(k in n for k in embed_keys)]
-            embeds = [p for n, p in self.model.named_parameters() if p.dim() >= 2 and any(k in n for k in embed_keys)]
-            biases = [p for p in self.model.parameters() if p.dim() < 2]
+            model = unwrap_model(self.model)
+            require(isinstance(model, BaseModel), (
+                "Muon optimizer requires a BaseModel so optimizer parameter roles "
+                "are declared by the model instead of inferred by the trainer"
+            ))
+            hidden, aux_matrices, biases = model.muon_parameter_groups()
             return Muon([
-                {"params": hidden},
-                {"params": embeds, "ns_iters": 0},
-                {"params": biases, "ns_iters": 0},
-            ], lr=self.config.lr)
+                {"params": hidden, "use_muon": True, "lr": self.config.muon_lr, "weight_decay": self.config.weight_decay},
+                {"params": aux_matrices, "use_muon": False, "lr": self.config.lr, "weight_decay": self.config.weight_decay},
+                {"params": biases, "use_muon": False, "lr": self.config.lr, "weight_decay": 0.0},
+            ], lr=self.config.muon_lr)
         raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
 
     def _build_scheduler(self):
         warmup = self.config.warmup_steps
-        total = self.config.max_steps
+        total = self._scheduler_total_steps()
         schedule = self.config.lr_schedule
-        assert total > warmup, f"max_steps ({total}) must exceed warmup_steps ({warmup})"
+        require(warmup >= 0, f"warmup_steps ({warmup}) must be >= 0")
+        require(total > 0, f"scheduler total steps ({total}) must be > 0")
+        require(total > warmup, f"scheduler total steps ({total}) must exceed warmup_steps ({warmup})")
 
         def lr_fn(step):
-            # LambdaLR is constructed with last_epoch=0, and we call scheduler.step()
-            # AFTER each optimizer.step(). Without this +1 shift, optimizer step k
-            # would use lr_fn(k-1); in particular the very first update uses lr_fn(0)
-            # which is 0 during warmup — a no-op first step and the entire profile
-            # is shifted by one. Treat `step` as the 1-indexed optimizer step about
-            # to run, so warmup_steps=W gives LRs (1/W, 2/W, ..., 1.0) over the
-            # first W updates.
-            step = step + 1
-            if step < warmup:
-                return step / warmup
-            progress = (step - warmup) / (total - warmup)
+            # LambdaLR is initialized before the first optimizer update, and we
+            # call scheduler.step() only after an optimizer update actually runs.
+            # Treat this callback's 0-indexed value as the 1-indexed update whose
+            # LR is about to be used.
+            update = step + 1
+            if warmup > 0 and update <= warmup:
+                return update / warmup
             if schedule == "cosine":
+                progress = _decay_progress(update, warmup, total)
                 return 0.5 * (1.0 + math.cos(math.pi * progress))
             if schedule == "linear":
+                progress = _decay_progress(update, warmup, total)
                 return 1.0 - progress
             if schedule == "constant":
                 return 1.0
             if schedule == "wsd":
+                progress = _decay_progress(update, warmup, total)
                 if progress < 0.8:
                     return 1.0
                 return 0.5 * (1.0 + math.cos(math.pi * (progress - 0.8) / 0.2))
@@ -218,13 +308,26 @@ class Trainer:
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_fn)
 
+    def _scheduler_total_steps(self):
+        if self._resume_scheduler_total_steps is not None:
+            return self._resume_scheduler_total_steps
+        return self._configured_scheduler_total_steps()
+
+    def _configured_scheduler_total_steps(self):
+        return self.config.max_steps
+
+    def _validate_resume_scheduler_horizon(self):
+        configured_total = self._configured_scheduler_total_steps()
+        if self.config.lr_schedule in _DECAYING_LR_SCHEDULES:
+            require(configured_total <= self._resume_scheduler_total_steps, (
+                f"Cannot extend {self.config.lr_schedule} scheduler on resume: "
+                f"configured scheduler total steps ({configured_total}) exceeds saved horizon "
+                f"({self._resume_scheduler_total_steps}). Start a new run for a longer decay."
+            ))
+
     def _next_batch(self):
         batch = next(self.train_iter, None)
-        if batch is None:
-            # Defensive fallback: normally the eager rollover below advances to the
-            # next epoch the moment the current one exhausts, so this branch only
-            # fires the first time through if the loader was empty, which we assert.
-            assert False, "train_loader produced no batches"
+        require(batch is not None, "train_loader produced no batches")
         self.batches_consumed += 1
         # Eager rollover: if we just consumed the last batch of the epoch, snapshot
         # the next epoch's RNG start and rebuild the iterator now. This keeps the
@@ -239,6 +342,39 @@ class Trainer:
     def compute_loss(self, batch):
         raise NotImplementedError
 
+    def _optimizer_update(self):
+        """Apply one optimizer update and advance scheduler state with that update."""
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.config.max_grad_norm,
+            error_if_nonfinite=True,
+        )
+        old_scale = self.scaler.get_scale()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        stepped = not self.scaler.is_enabled() or self.scaler.get_scale() >= old_scale
+        if not stepped:
+            raise FloatingPointError(
+                "AMP skipped the optimizer update; stopping before training step accounting advances"
+            )
+        self.scheduler.step()
+        return True
+
+    def _save_checkpoint_for_step(self):
+        self.save_checkpoint()
+        self._last_checkpoint_step = self.step
+
+    def _save_checkpoint_if_due(self):
+        if self.config.save_every > 0 and self.step % self.config.save_every == 0:
+            self._save_checkpoint_for_step()
+
+    def _save_final_checkpoint(self):
+        if self.config.save_every > 0 and self._last_checkpoint_step != self.step:
+            self._save_checkpoint_for_step()
+
     def train(self):
         self.model.train()
         pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
@@ -247,17 +383,12 @@ class Trainer:
             total_loss = 0.0
             for _ in range(self.config.grad_accum_steps):
                 batch = self._next_batch()
-                with torch.autocast(self.device, dtype=self.dtype):
+                with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
                     loss = self.compute_loss(batch) / self.config.grad_accum_steps
                 self.scaler.scale(loss).backward()
                 total_loss += loss.item()
 
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scheduler.step()
+            self._optimizer_update()
 
             lr = self.scheduler.get_last_lr()[0]
             if self.step % self.config.log_every == 0:
@@ -266,18 +397,16 @@ class Trainer:
                     self.aim_run.track(total_loss, name="loss", step=self.step)
                     self.aim_run.track(lr, name="lr", step=self.step)
 
-            if self.eval_loader and self.config.eval_every > 0 and self.step % self.config.eval_every == 0:
+            if self.eval_loader is not None and self.config.eval_every > 0 and self.step % self.config.eval_every == 0:
                 eval_loss = self.evaluate()
                 print(f"\n  step {self.step} eval loss: {eval_loss:.4f}")
                 if self.aim_run:
                     self.aim_run.track(eval_loss, name="eval_loss", step=self.step)
                 self.model.train()
 
-            if self.config.save_every > 0 and self.step % self.config.save_every == 0:
-                self.save_checkpoint()
+            self._save_checkpoint_if_due()
 
-        if self.config.save_every > 0:
-            self.save_checkpoint()
+        self._save_final_checkpoint()
 
     @torch.no_grad()
     def evaluate(self):
@@ -287,10 +416,10 @@ class Trainer:
             if i >= self.config.eval_steps:
                 break
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            with torch.autocast(self.device, dtype=self.dtype):
+            with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
                 total += self.compute_loss(batch).item()
             count += 1
-        assert count > 0, "Eval loader produced no batches"
+        require(count > 0, "Eval loader produced no batches")
         return total / count
 
     def save_checkpoint(self):
@@ -311,10 +440,14 @@ class Trainer:
             },
             path / "trainer_state.pt",
         )
-        (path / "run_meta.json").write_text(json.dumps({
+        run_meta = {
             "signature": self.signature,
             "config": self.config.to_dict(),
-        }, indent=2))
+            "scheduler_total_steps": self._scheduler_total_steps(),
+        }
+        if self.tokenizer_signature:
+            run_meta["tokenizer_signature"] = self.tokenizer_signature
+        (path / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
         print(f"\n  saved {path}")
 
 
@@ -327,12 +460,21 @@ class LMTrainer(Trainer):
 
 @register_trainer("diffusion")
 class DiffusionTrainer(Trainer):
-    def __init__(self, model, forward_process, train_dataset, config, *, signature, eval_dataset=None):
-        # Bind the noise schedule into the resume signature so a checkpoint built
-        # with one schedule cannot be silently resumed under another.
-        signature = hashlib.sha256((signature + forward_process.schedule).encode()).hexdigest()
-        super().__init__(model, train_dataset, config, signature=signature, eval_dataset=eval_dataset)
+    def __init__(self, model, forward_process, train_dataset, config, *, signature, tokenizer_sig="", eval_dataset=None):
+        if not config.resume_from:
+            _validate_diffusion_trainer_contract(model, forward_process)
+        # Bind the forward process into the resume signature so a checkpoint built
+        # with one forward process cannot be silently resumed under another.
+        fwd_signature = json.dumps({
+            "process_type": forward_process.process_type,
+            "mask_token_id": forward_process.mask_token_id,
+            "num_timesteps": forward_process.num_timesteps,
+            "schedule": forward_process.schedule,
+        }, sort_keys=True)
+        signature = hashlib.sha256((signature + fwd_signature).encode()).hexdigest()
+        super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
         self.fwd = forward_process
+        _validate_diffusion_trainer_contract(self.model, forward_process)
 
     def save_checkpoint(self):
         super().save_checkpoint()
@@ -340,14 +482,28 @@ class DiffusionTrainer(Trainer):
 
     def compute_loss(self, batch):
         x_0 = batch["input_ids"]
-        # Resample t until at least one position is masked. With tiny batch_size and
-        # small alpha_t samples, q_sample can produce an all-clean batch; running the
-        # loss on that would return a detached zero whose backward() raises.
-        for _ in range(10):
-            t = torch.rand(x_0.size(0), device=self.device) * 0.999 + 0.001
-            z_t, mask = self.fwd.q_sample(x_0, t)
-            if mask.any():
-                break
-        assert mask.any(), "q_sample produced no masked positions after 10 retries"
+        model = unwrap_model(self.model)
+        t = self.fwd.sample_time(x_0.size(0), self.device, mode=model.config.time_sampling)
+        z_t, mask = self.fwd.q_sample(x_0, t)
         output = self.model(z_t, t)
-        return self.model.compute_loss(output, x_0, mask, t, self.fwd)
+        return model.compute_loss(output, x_0, mask, t, self.fwd)
+
+
+def _validate_diffusion_trainer_contract(model, forward_process):
+    model = unwrap_model(model)
+    require(isinstance(model, BaseModel), "DiffusionTrainer requires a BaseModel")
+    model_config = model.config
+    expected_process = model.forward_process_type
+    require(expected_process is not None, "DiffusionTrainer requires model.forward_process_type")
+    require(forward_process.process_type == expected_process, (
+        f"DiffusionTrainer forward process mismatch: model expects {expected_process!r}, "
+        f"got {forward_process.process_type!r}"
+    ))
+    require(model_config.mask_token_id == forward_process.mask_token_id, (
+        "model config and forward process must use the same mask_token_id"
+    ))
+    if model.requires_terminal_mask_prior:
+        require(forward_process.has_terminal_mask_prior(), (
+            f"{type(model).__name__} requires a forward process with alpha[-1] = 0 "
+            "so q(x_T | x_0) matches the all-mask terminal prior"
+        ))

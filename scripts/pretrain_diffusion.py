@@ -11,7 +11,7 @@ from minilab.models.sedd import SEDD, SEDDConfig
 from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
-from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature
+from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.generation import sample_d3pm, sample_diffusion, sample_sedd
 
 MODELS = {"mdlm": (MDLM, MDLMConfig), "sedd": (SEDD, SEDDConfig), "d3pm": (D3PM, D3PMConfig)}
@@ -25,7 +25,7 @@ p.add_argument("--dim", type=int, default=256)
 p.add_argument("--num-layers", type=int, default=6)
 p.add_argument("--num-heads", type=int, default=8)
 p.add_argument("--seq-len", type=int, default=256)
-p.add_argument("--schedule", default="cosine", choices=["cosine", "linear", "log_linear"])
+p.add_argument("--schedule", default="", choices=["", "cosine", "linear", "geometric", "log_linear"])
 p.add_argument("--max-steps", type=int, default=5000)
 p.add_argument("--warmup-steps", type=int, default=100)
 p.add_argument("--save-every", type=int, default=0, help="periodic save interval (0 = save once at end)")
@@ -34,7 +34,9 @@ p.add_argument("--lr", type=float, default=3e-4)
 p.add_argument("--max-examples", type=int, default=50000)
 p.add_argument("--grad-checkpoint", action="store_true")
 p.add_argument("--resume-from", default="")
+p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size
@@ -44,7 +46,9 @@ eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=2
 print(f"Data: train={len(train_ds)} eval={len(eval_ds)}")
 
 cls, cfg_cls = MODELS[args.model]
+schedule = args.schedule or ("log_linear" if args.model == "sedd" else "cosine")
 if args.resume_from:
+    validate_checkpoint_tokenizer(args.resume_from, tok)
     model = cls.load(args.resume_from)
     fwd = ForwardProcess.load(f"{args.resume_from}/forward_process.json")
     print(f"Resuming from {args.resume_from} (schedule={fwd.schedule})")
@@ -54,7 +58,11 @@ else:
         num_heads=args.num_heads, max_seq_len=args.seq_len, mask_token_id=mask_id,
     )
     model = cls(config)
-    fwd = ForwardProcess(mask_id, schedule=args.schedule)
+    fwd = ForwardProcess(mask_id, schedule=schedule)
+if model.requires_terminal_mask_prior and not fwd.has_terminal_mask_prior():
+    raise ValueError(
+        f"{args.model} sampling starts from all [MASK] tokens; choose a schedule with alpha[-1] = 0"
+    )
 if args.grad_checkpoint:
     model.gradient_checkpointing_enable()
 print(f"{args.model.upper()}: {model.num_parameters():,} params")
@@ -62,14 +70,17 @@ print(f"{args.model.upper()}: {model.num_parameters():,} params")
 tc = TrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
     log_every=100, eval_every=500, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
-    resume_from=args.resume_from,
+    resume_from=args.resume_from, seed=args.seed,
 )
 sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples, "mode": "diffusion"}, args.seq_len)
-DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, eval_dataset=eval_ds).train()
+trainer = DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
+trainer.train()
+model = trainer.model
 
 print("\n--- Samples ---")
 model.eval()
-samples = SAMPLERS[args.model](model, fwd, batch_size=4, seq_len=args.seq_len, num_steps=256)
+sample_steps = min(256, fwd.num_timesteps)
+samples = SAMPLERS[args.model](model, fwd, batch_size=4, seq_len=args.seq_len, num_steps=sample_steps)
 for i in range(4):
     s = [t for t in samples[i].tolist() if t < tok.vocab_size]
     print(f"  {tok.decode(s)[:120]}")
