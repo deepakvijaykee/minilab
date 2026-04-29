@@ -4,6 +4,8 @@ policy's training prompt and the reward function."""
 
 import re
 
+import torch
+
 from minilab.checks import require
 from minilab.evaluation import accuracy_reward
 
@@ -45,3 +47,14 @@ def parse_gold_answer(answer_text):
 def reward(completion_text, expected):
     predicted = extract_answer(completion_text)
     return accuracy_reward(predicted, expected) if predicted is not None else 0.0
+
+
+def batch_reward(tokenizer, answers, batch, completions, completion_mask):
+    rewards = [
+        reward(
+            tokenizer.decode(completions[b][completion_mask[b]].tolist()),
+            answers[batch["idx"][b].item()],
+        )
+        for b in range(completions.size(0))
+    ]
+    return torch.tensor(rewards)

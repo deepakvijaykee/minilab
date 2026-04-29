@@ -6,7 +6,9 @@ _REGISTRIES: dict[str, dict[str, type]] = {}
 
 def register(kind, name):
     def decorator(cls):
-        registry = _REGISTRIES.setdefault(kind, {})
+        if kind not in _REGISTRIES:
+            _REGISTRIES[kind] = {}
+        registry = _REGISTRIES[kind]
         require(name not in registry, f"{kind} '{name}' is already registered")
         registry[name] = cls
         return cls

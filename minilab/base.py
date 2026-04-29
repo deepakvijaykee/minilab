@@ -12,6 +12,7 @@ class BaseModel(nn.Module):
     forward_process_type = None
     reverse_parameterization = None
     requires_terminal_mask_prior = False
+    provides_hidden_states = False
 
     def __init__(self, config):
         super().__init__()
@@ -36,11 +37,29 @@ class BaseModel(nn.Module):
         """Modules whose matrix parameters should stay on Muon's AdamW path."""
         return ()
 
+    def no_weight_decay_parameter_names(self):
+        return ()
+
+    def auxiliary_loss(self):
+        for param in self.parameters():
+            return torch.tensor(0.0, device=param.device)
+        for buffer in self.buffers():
+            return torch.tensor(0.0, device=buffer.device)
+        return torch.tensor(0.0)
+
+    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
+        return None
+
     def muon_parameter_groups(self):
         auxiliary_ids = {
             id(param)
             for module in self.muon_auxiliary_modules()
             for param in module.parameters()
+        }
+        no_decay_ids = {
+            id(param)
+            for name, param in self.named_parameters()
+            if name in self.no_weight_decay_parameter_names()
         }
         hidden, auxiliary, biases = [], [], []
         seen = set()
@@ -50,6 +69,8 @@ class BaseModel(nn.Module):
                 continue
             seen.add(param_id)
             if param.dim() < 2:
+                biases.append(param)
+            elif param_id in no_decay_ids:
                 biases.append(param)
             elif param_id in auxiliary_ids:
                 auxiliary.append(param)
@@ -93,8 +114,10 @@ class BaseModel(nn.Module):
 
 
 def unwrap_model(model):
-    """Return the real module behind torch.compile's OptimizedModule wrapper."""
-    return getattr(model, "_orig_mod", model)
+    """Return the real module behind torch.compile's optimized wrapper."""
+    if isinstance(model, torch._dynamo.OptimizedModule):
+        return model._orig_mod
+    return model
 
 
 class BaseTokenizer:
@@ -107,7 +130,14 @@ class BaseTokenizer:
     @classmethod
     def load(cls, path):
         tok = cls()
-        tok._set_state(json.loads(Path(path).read_text()))
+        state = json.loads(Path(path).read_text())
+        require(isinstance(state, dict), "Tokenizer state must be a JSON object")
+        expected_type = tok._get_state().get("type")
+        if expected_type is not None:
+            require(state.get("type") == expected_type, (
+                f"Tokenizer state was saved as {state.get('type')!r}, cannot load as {cls.__name__}."
+            ))
+        tok._set_state(state)
         return tok
 
     def _get_state(self):

@@ -24,6 +24,9 @@ def load_tokenizer(path):
     state = json.loads(Path(path).read_text())
     require(isinstance(state, dict), "Tokenizer state must be a JSON object")
     require("type" in state, "Tokenizer state is missing required field: type")
+    require(isinstance(state["type"], str) and state["type"], (
+        "Tokenizer state field 'type' must be a non-empty string"
+    ))
     cls = get_tokenizer(state["type"])
     tok = cls()
     tok._set_state(state)

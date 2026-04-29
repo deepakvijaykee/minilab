@@ -26,6 +26,7 @@ class BPETokenizer(BaseTokenizer):
         self.vocab: dict[int, bytes] = {}  # id -> bytes
 
     def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
+        require(isinstance(text, str) and len(text) > 0, "BPE training text must be a non-empty string")
         require(vocab_size >= 256, "BPE vocab must be >= 256 (byte-level base)")
         num_merges = vocab_size - 256
 
@@ -53,6 +54,7 @@ class BPETokenizer(BaseTokenizer):
                 print(f"merge {i + 1}/{num_merges}: {best} -> '{token}' (freq={counts[best]})")
 
     def encode(self, text: str) -> list[int]:
+        require(self.vocab, "BPE tokenizer must be trained or loaded before encoding")
         ids = list(text.encode("utf-8"))
         while len(ids) >= 2:
             # Find mergeable pair with lowest new_id (earliest learned)
@@ -69,7 +71,13 @@ class BPETokenizer(BaseTokenizer):
         return ids
 
     def decode(self, ids: list[int]) -> str:
-        return b"".join(self.vocab[i] for i in ids).decode("utf-8", errors="replace")
+        missing = [i for i in ids if i not in self.vocab]
+        require(not missing, f"BPE decode received unknown token ids: {missing[:5]}")
+        raw = b"".join(self.vocab[i] for i in ids)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("BPE decode received a token sequence that is not valid UTF-8") from exc
 
     @property
     def vocab_size(self) -> int:

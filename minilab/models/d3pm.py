@@ -12,8 +12,18 @@ import torch.nn.functional as F
 
 from minilab.base import BaseModel
 from minilab.checks import require
-from minilab.models.diffusion_base import DiffusionModelConfig, validate_clean_tokens
-from minilab.nn.diffusion import DiffusionBlock, SinusoidalTimeEmbedding
+from minilab.models.diffusion_base import (
+    DiffusionModelConfig,
+    loss_normalizer,
+    validate_clean_tokens,
+    validate_loss_mask,
+)
+from minilab.nn.diffusion import (
+    DiffusionBlock,
+    SinusoidalTimeEmbedding,
+    commit_diffusion_block_updates,
+    diffusion_blocks_auxiliary_loss,
+)
 from minilab.registry import get_position, register_model
 
 
@@ -44,8 +54,19 @@ class D3PM(BaseModel):
         self.time_emb = SinusoidalTimeEmbedding(config.dim)
         self.pos_enc = get_position("rope")(head_dim, config.max_seq_len)
         self.blocks = nn.ModuleList([
-            DiffusionBlock(config.dim, config.num_heads, int(config.dim * config.ffn_mult), config.dropout)
-            for _ in range(config.num_layers)
+            DiffusionBlock(
+                config.dim,
+                config.num_heads,
+                int(config.dim * config.ffn_mult),
+                config.dropout,
+                attention=config.attention,
+                num_kv_heads=config.num_kv_heads,
+                ffn=config.ffn,
+                num_experts=config.num_experts,
+                top_k_experts=config.top_k_experts,
+                block_id=i,
+            )
+            for i in range(config.num_layers)
         ])
         self.ln_f = nn.LayerNorm(config.dim)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -58,8 +79,17 @@ class D3PM(BaseModel):
     def muon_auxiliary_modules(self):
         return (self.tok_emb, self.lm_head)
 
+    def auxiliary_loss(self):
+        return diffusion_blocks_auxiliary_loss(self.blocks, self.tok_emb.weight)
+
+    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
+        commit_diffusion_block_updates(self.blocks, qk_clip_threshold, qk_clip_balance)
+
     def forward(self, z_t, t):
         """Predicts clean-token logits p_tilde_theta(x_0 | z_t)."""
+        require(z_t.size(1) <= self.config.max_seq_len, (
+            f"D3PM supports at most {self.config.max_seq_len} tokens, got {z_t.size(1)}"
+        ))
         x = self._cast_hidden(self.tok_emb(z_t))
         t_emb = self.time_emb(t)
         freqs_cis = self.pos_enc(z_t.size(1))
@@ -71,12 +101,14 @@ class D3PM(BaseModel):
         x = self.ln_f(x)
         return self.lm_head(x)
 
-    def compute_loss(self, logits, x_0, mask, t, fwd):
+    def compute_loss_per_example(self, logits, x_0, mask, t, fwd, loss_mask=None, normalization="sequence"):
         """VLB KL over the absorbing posterior plus auxiliary clean-token CE."""
         validate_clean_tokens(x_0, self.config, "D3PM loss")
+        loss_mask = validate_loss_mask(loss_mask, x_0, "D3PM loss")
         require(fwd.process_type == self.forward_process_type == self.transition, (
             "D3PM loss requires the absorbing forward process"
         ))
+        target_mask = mask if loss_mask is None else (mask & loss_mask)
         idx = fwd.time_index(t, min_index=1, max_index=fwd.num_timesteps)
         t_now = idx.to(device=logits.device, dtype=torch.float32) / fwd.num_timesteps
         t_prev = (idx - 1).to(device=logits.device, dtype=torch.float32) / fwd.num_timesteps
@@ -86,18 +118,28 @@ class D3PM(BaseModel):
         log_p = absorbing_posterior_log_probs(logits, z_t, t_now, t_prev, fwd, self.mask_token_id)
         log_p_x0 = log_p.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)
         log_p_mask = log_p[:, :, self.mask_token_id]
-        if mask.any():
+        if target_mask.any():
             kl = log_p_x0.new_zeros(x_0.shape)
-            q_unmask = q_unmask.expand_as(x_0)[mask]
-            q_stay = q_stay.expand_as(x_0)[mask]
-            kl[mask] = _kl_two_atom(q_unmask, q_stay, log_p_x0[mask], log_p_mask[mask])
-            vlb = kl.sum(dim=-1).mean() / x_0.size(1)
+            q_unmask = q_unmask.expand_as(x_0)[target_mask]
+            q_stay = q_stay.expand_as(x_0)[target_mask]
+            kl[target_mask] = _kl_two_atom(q_unmask, q_stay, log_p_x0[target_mask], log_p_mask[target_mask])
+            vlb = kl.sum(dim=-1) / loss_normalizer(x_0, loss_mask, normalization).to(logits.device, dtype=logits.dtype)
         else:
-            vlb = logits.sum() * 0.0
+            vlb = logits.sum(dim=(1, 2)) * 0.0
 
         clean_logits = _clean_x0_logits(logits, self.mask_token_id)
-        ce = F.cross_entropy(clean_logits.reshape(-1, clean_logits.size(-1)), x_0.reshape(-1))
+        token_ce = F.cross_entropy(
+            clean_logits.reshape(-1, clean_logits.size(-1)),
+            x_0.reshape(-1),
+            reduction="none",
+        ).view_as(x_0)
+        ce_mask = torch.ones_like(x_0, dtype=torch.bool) if loss_mask is None else loss_mask
+        ce = (token_ce * ce_mask.float()).sum(dim=-1)
+        ce = ce / loss_normalizer(x_0, loss_mask, normalization).to(logits.device, dtype=logits.dtype)
         return vlb + self.hybrid_coef * ce
+
+    def compute_loss(self, logits, x_0, mask, t, fwd):
+        return self.compute_loss_per_example(logits, x_0, mask, t, fwd).mean()
 
 
 def absorbing_posterior_log_probs(x0_logits, z_t, t_now, t_prev, fwd, mask_token_id):

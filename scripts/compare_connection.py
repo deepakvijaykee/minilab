@@ -4,12 +4,10 @@
 """
 
 import argparse
-from torch.utils.data import DataLoader
+from common import compare_lm_variants
 from minilab.tokenizers import load_tokenizer
-from minilab.models.gpt import GPT, GPTConfig
 from minilab.data import load_tinystories
-from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
-from minilab.evaluation import perplexity
+from minilab.trainer import TrainConfig, run_signature, set_seed
 
 VARIANTS = [
     ("Residual", {"connection": "residual"}),
@@ -37,22 +35,16 @@ tc = TrainConfig(max_steps=args.max_steps, batch_size=args.batch_size, lr=3e-4,
                  log_every=args.max_steps, eval_every=0, save_every=0, seed=args.seed)
 sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples}, args.seq_len)
 
-results = []
-for name, overrides in VARIANTS:
-    print(f"\n=== {name} ===")
-    set_seed(args.seed)
-    cfg = GPTConfig(vocab_size=tok.vocab_size, dim=args.dim, num_layers=args.num_layers,
-                    num_heads=args.num_heads, max_seq_len=args.seq_len, **overrides)
-    model = GPT(cfg)
-    print(f"  {model.num_parameters():,} params")
-    trainer = LMTrainer(model, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
-    trainer.train()
-    eval_loss = trainer.evaluate()
-    model.eval()
-    ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))
-    results.append((name, model.num_parameters(), eval_loss, ppl))
-
-print(f"\n{'Variant':<15} {'Params':>10} {'Loss':>10} {'PPL':>10}")
-print("-" * 48)
-for name, params, loss, ppl in results:
-    print(f"{name:<15} {params:>10,} {loss:>10.4f} {ppl:>10.1f}")
+compare_lm_variants(
+    VARIANTS,
+    tok,
+    train_ds,
+    eval_ds,
+    tc,
+    sig,
+    seed=args.seed,
+    dim=args.dim,
+    num_layers=args.num_layers,
+    num_heads=args.num_heads,
+    seq_len=args.seq_len,
+)

@@ -2,9 +2,80 @@ import torch
 
 from minilab.base import BaseModel, unwrap_model
 from minilab.checks import require
-from minilab.models.diffusion_base import DiffusionModelConfig, validate_infill_tokens
+from minilab.diffusion_sampling import (
+    d3pm_reverse_timesteps,
+    sample_categorical,
+    sample_clean_logits,
+    sample_logits,
+    sedd_absorbing_step_probs,
+)
 from minilab.models.d3pm import absorbing_posterior_log_probs
+from minilab.models.diffusion_base import DiffusionModelConfig, validate_infill_tokens
 from minilab.registry import register_sampler
+
+
+def _apply_repetition_penalty(logits, ids, repetition_penalty):
+    if repetition_penalty == 1.0:
+        return logits
+    logits = logits.clone()
+    for b in range(ids.size(0)):
+        seen = ids[b].unique()
+        seen_logits = logits[b, seen]
+        logits[b, seen] = torch.where(
+            seen_logits < 0,
+            seen_logits * repetition_penalty,
+            seen_logits / repetition_penalty,
+        )
+    return logits
+
+
+def _apply_top_k_top_p(logits, top_k, top_p):
+    if 0 < top_k < logits.size(-1):
+        logits = logits.clone()
+        cutoff = logits.topk(top_k).values[:, -1:]
+        logits[logits < cutoff] = float("-inf")
+    if top_p < 1.0:
+        sorted_logits, sorted_idx = logits.sort(descending=True)
+        sorted_probs = sorted_logits.softmax(-1)
+        remove = sorted_probs.cumsum(-1) - sorted_probs > top_p
+        sorted_logits[remove] = float("-inf")
+        filtered_logits = torch.full_like(logits, float("-inf"))
+        logits = filtered_logits.scatter(-1, sorted_idx, sorted_logits)
+    return logits
+
+
+def _sample_next_token(logits, temperature, top_k=0, top_p=1.0):
+    if temperature == 0:
+        return logits.argmax(-1, keepdim=True)
+    logits = _apply_top_k_top_p(logits / temperature, top_k, top_p)
+    return torch.multinomial(logits.softmax(-1), 1)
+
+
+def _sample_clean_predictions(logits, mask_id, temperature):
+    logits = logits.clone()
+    logits[:, :, mask_id] = float("-inf")
+    if temperature == 0:
+        return logits.argmax(-1)
+    logits = logits / temperature
+    return torch.multinomial(logits.softmax(-1).view(-1, logits.size(-1)), 1).view(logits.shape[:2])
+
+
+def _absorbing_unmask_probability(fwd, t_now, t_next):
+    alpha_now = fwd.alpha_at(t_now.unsqueeze(0)).item()
+    alpha_next = fwd.alpha_at(t_next.unsqueeze(0)).item()
+    return (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
+
+
+def _fill_remaining_masks(model, z, mask_id, batch_size):
+    still_masked = z == mask_id
+    if not still_masked.any():
+        return z
+    predictions = _sample_clean_predictions(
+        model(z, torch.zeros(batch_size, device=z.device)),
+        mask_id,
+        temperature=0,
+    )
+    return torch.where(still_masked, predictions, z)
 
 
 @torch.no_grad()
@@ -32,31 +103,8 @@ def generate(model, prompt_ids, max_new_tokens=100, temperature=1.0, top_k=50, t
         logits, _ = model(ids[:, -max_ctx:])
         logits = logits[:, -1]
 
-        if repetition_penalty != 1.0:
-            for b in range(ids.size(0)):
-                seen = ids[b].unique()
-                seen_logits = logits[b, seen]
-                logits[b, seen] = torch.where(
-                    seen_logits < 0,
-                    seen_logits * repetition_penalty,
-                    seen_logits / repetition_penalty,
-                )
-
-        if temperature == 0:
-            next_id = logits.argmax(-1, keepdim=True)
-        else:
-            logits = logits / temperature
-            if 0 < top_k < logits.size(-1):
-                cutoff = logits.topk(top_k).values[:, -1:]
-                logits[logits < cutoff] = float("-inf")
-            if top_p < 1.0:
-                sorted_logits, sorted_idx = logits.sort(descending=True)
-                sorted_probs = sorted_logits.softmax(-1)
-                remove = sorted_probs.cumsum(-1) - sorted_probs > top_p
-                sorted_logits[remove] = float("-inf")
-                filtered_logits = torch.full_like(logits, float("-inf"))
-                logits = filtered_logits.scatter(-1, sorted_idx, sorted_logits)
-            next_id = torch.multinomial(logits.softmax(-1), 1)
+        logits = _apply_repetition_penalty(logits, ids, repetition_penalty)
+        next_id = _sample_next_token(logits, temperature, top_k, top_p)
 
         ids = torch.cat([ids, next_id], dim=1)
 
@@ -89,28 +137,13 @@ def sample_diffusion(model, fwd, batch_size, seq_len, num_steps=None, temperatur
     for i in range(num_steps):
         t_now, t_next = timesteps[i], timesteps[i + 1]
         logits = model(z, t_now.expand(batch_size))
-        logits[:, :, mask_id] = float("-inf")
-        if temperature == 0:
-            predictions = logits.argmax(-1)
-        else:
-            if temperature > 0:
-                logits = logits / temperature
-            predictions = torch.multinomial(logits.softmax(-1).view(-1, logits.size(-1)), 1).view(batch_size, seq_len)
-
-        alpha_now = fwd.get_alpha(t_now.unsqueeze(0)).item()
-        alpha_next = fwd.get_alpha(t_next.unsqueeze(0)).item()
-        unmask_prob = (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
+        predictions = _sample_clean_predictions(logits, mask_id, temperature)
+        unmask_prob = _absorbing_unmask_probability(fwd, t_now, t_next)
 
         unmask = torch.rand(batch_size, seq_len, device=device) < unmask_prob
         z = torch.where((z == mask_id) & unmask, predictions, z)
 
-    still_masked = z == mask_id
-    if still_masked.any():
-        logits = model(z, torch.zeros(batch_size, device=device))
-        logits[:, :, mask_id] = float("-inf")
-        z = torch.where(still_masked, logits.argmax(-1), z)
-
-    return z
+    return _fill_remaining_masks(model, z, mask_id, batch_size)
 
 
 @register_sampler("ddpm_cache")
@@ -138,29 +171,14 @@ def sample_diffusion_cached(model, fwd, batch_size, seq_len, num_steps=None, tem
 
         if i % cache_interval == 0:
             logits = model(z, t_now.expand(batch_size))
-            logits[:, :, mask_id] = float("-inf")
-            if temperature > 0:
-                logits = logits / temperature
 
-        if temperature == 0:
-            predictions = logits.argmax(-1)
-        else:
-            predictions = torch.multinomial(logits.softmax(-1).view(-1, logits.size(-1)), 1).view(batch_size, seq_len)
-
-        alpha_now = fwd.get_alpha(t_now.unsqueeze(0)).item()
-        alpha_next = fwd.get_alpha(t_next.unsqueeze(0)).item()
-        unmask_prob = (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
+        predictions = _sample_clean_predictions(logits.clone(), mask_id, temperature)
+        unmask_prob = _absorbing_unmask_probability(fwd, t_now, t_next)
 
         unmask = torch.rand(batch_size, seq_len, device=device) < unmask_prob
         z = torch.where((z == mask_id) & unmask, predictions, z)
 
-    still_masked = z == mask_id
-    if still_masked.any():
-        logits = model(z, torch.zeros(batch_size, device=device))
-        logits[:, :, mask_id] = float("-inf")
-        z = torch.where(still_masked, logits.argmax(-1), z)
-
-    return z
+    return _fill_remaining_masks(model, z, mask_id, batch_size)
 
 
 @register_sampler("sedd_analytical")
@@ -192,116 +210,18 @@ def sample_sedd(model, fwd, batch_size, seq_len, num_steps=None, temperature=1.0
         log_scores = model(z, t_now.expand(batch_size))
         sigma_now = fwd.get_sigma(t_now.unsqueeze(0)).to(device)
         sigma_next = fwd.get_sigma(t_next.unsqueeze(0)).to(device)
-        probs = _sedd_absorbing_step_probs(log_scores, z, sigma_now - sigma_next, mask_id, temperature)
-        z = _sample_categorical(probs)
+        probs = sedd_absorbing_step_probs(log_scores, z, sigma_now - sigma_next, mask_id, temperature)
+        z = sample_categorical(probs)
 
     still_masked = z == mask_id
     if still_masked.any():
         t_eps = timesteps[-1]
         log_scores = model(z, t_eps.expand(batch_size))
         sigma = fwd.get_sigma(t_eps.unsqueeze(0)).to(device)
-        probs = _sedd_absorbing_step_probs(log_scores, z, sigma, mask_id, temperature, drop_mask=True)
-        z = torch.where(still_masked, _sample_categorical(probs), z)
+        probs = sedd_absorbing_step_probs(log_scores, z, sigma, mask_id, temperature, drop_mask=True)
+        z = torch.where(still_masked, sample_categorical(probs), z)
 
     return z
-
-
-def _sedd_absorbing_step_probs(log_scores, z, dsigma, mask_id, temperature, drop_mask=False):
-    require(temperature >= 0, "temperature must be >= 0")
-    if temperature == 0:
-        scaled_log_scores = log_scores.double()
-    else:
-        scaled_log_scores = (log_scores / temperature).double()
-    dsigma = dsigma.to(scaled_log_scores.device, dtype=scaled_log_scores.dtype).view(1, 1)
-    require((dsigma >= 0).all(), "SEDD sigma step must be non-negative")
-    log_weights = (
-        _sedd_absorbing_log_staggered_scores(scaled_log_scores, dsigma, mask_id)
-        + _absorbing_transposed_transition_log_probs(z, dsigma, mask_id, log_scores.size(-1))
-    )
-    if drop_mask:
-        log_weights[:, :, mask_id] = float("-inf")
-    has_support = torch.isfinite(log_weights).any(dim=-1, keepdim=True)
-    require(has_support.all(), "SEDD categorical step has no valid support")
-    if temperature == 0:
-        greedy = torch.zeros_like(log_weights)
-        greedy.scatter_(-1, log_weights.argmax(dim=-1, keepdim=True), 1.0)
-        return greedy
-    log_probs = log_weights - torch.logsumexp(log_weights, dim=-1, keepdim=True)
-    return log_probs.exp()
-
-
-def _sedd_absorbing_log_staggered_scores(log_scores, dsigma, mask_id):
-    log_staggered = log_scores + dsigma[..., None]
-    mask_log_a = log_scores[:, :, mask_id] + dsigma
-    mask_log_b = torch.logsumexp(log_scores, dim=-1) + torch.expm1(dsigma).log()
-    delta = mask_log_b - mask_log_a
-    positive = delta < 0
-    safe_delta = torch.where(positive, delta, torch.full_like(delta, float("-inf")))
-    mask_log_staggered = torch.where(
-        positive,
-        mask_log_a + torch.log1p(-safe_delta.exp()),
-        torch.full_like(mask_log_a, float("-inf")),
-    )
-    log_staggered[:, :, mask_id] = mask_log_staggered
-    return log_staggered
-
-
-def _absorbing_transposed_transition_log_probs(z, dsigma, mask_id, vocab_size):
-    log_transition = torch.full(
-        (*z.shape, vocab_size),
-        float("-inf"),
-        device=z.device,
-        dtype=dsigma.dtype,
-    )
-    log_decay = -dsigma.squeeze()
-    log_unmask = torch.log1p(-(-dsigma).exp()).squeeze()
-    masked = z == mask_id
-    observed = ~masked
-    if observed.any():
-        observed_rows = log_transition[observed]
-        observed_rows.scatter_(1, z[observed].unsqueeze(-1), log_decay.expand(observed_rows.size(0), 1))
-        log_transition[observed] = observed_rows
-    if masked.any():
-        masked_rows = log_transition[masked]
-        masked_rows[:] = log_unmask
-        masked_rows[:, mask_id] = 0.0
-        log_transition[masked] = masked_rows
-    return log_transition
-
-
-def _sample_categorical(probs):
-    flat = probs.reshape(-1, probs.size(-1))
-    row_sum = flat.sum(dim=-1, keepdim=True)
-    require((row_sum > 0).all(), "categorical sampler received a zero-probability row")
-    normalized = flat / row_sum
-    return torch.multinomial(normalized, 1).view(probs.shape[:-1])
-
-
-def _sample_logits(logits, temperature):
-    if temperature == 0:
-        return logits.argmax(-1)
-    probs = (logits / temperature).softmax(-1)
-    return torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(logits.shape[:-1])
-
-
-def _sample_clean_logits(logits, mask_id, temperature):
-    logits = logits.clone()
-    logits[:, :, mask_id] = float("-inf")
-    return _sample_logits(logits, temperature)
-
-
-def _d3pm_reverse_timesteps(fwd, num_steps, device):
-    step = torch.arange(num_steps + 1, device=device, dtype=torch.long)
-    offset = torch.div(
-        step * fwd.num_timesteps + num_steps // 2,
-        num_steps,
-        rounding_mode="floor",
-    )
-    idx = fwd.num_timesteps - offset
-    require((idx[:-1] > idx[1:]).all(), (
-        "D3PM reverse timesteps must be strictly descending grid indices"
-    ))
-    return idx.float() / fwd.num_timesteps
 
 
 @register_sampler("d3pm_ancestral")
@@ -324,7 +244,7 @@ def sample_d3pm(model, fwd, batch_size, seq_len, num_steps=None, temperature=1.0
     device = next(model.parameters()).device
     mask_id = fwd.mask_token_id
     z = torch.full((batch_size, seq_len), mask_id, device=device, dtype=torch.long)
-    timesteps = _d3pm_reverse_timesteps(fwd, num_steps, device)
+    timesteps = d3pm_reverse_timesteps(fwd, num_steps, device)
 
     for i in range(num_steps):
         masked = z == mask_id
@@ -336,13 +256,11 @@ def sample_d3pm(model, fwd, batch_size, seq_len, num_steps=None, temperature=1.0
         log_probs = absorbing_posterior_log_probs(
             logits, z, t_now.expand(batch_size), t_prev.expand(batch_size), fwd, mask_id
         )
-        predictions = _sample_logits(log_probs, temperature)
+        predictions = sample_logits(log_probs, temperature)
         z = torch.where(masked, predictions, z)
 
     still_masked = z == mask_id
-    if still_masked.any():
-        logits = model(z, torch.zeros(batch_size, device=device))
-        z = torch.where(still_masked, _sample_clean_logits(logits, mask_id, temperature=0), z)
+    require(not still_masked.any(), "D3PM reverse chain left masked tokens at t=0")
     return z
 
 
@@ -443,10 +361,10 @@ def _infill_clean_logits(model, fwd, tokens, mask_positions, num_steps, temperat
         if not masked.any():
             break
         t_now = timesteps[i]
-        predictions = _sample_clean_logits(model(z, t_now.expand(B)), mask_id, temperature)
+        predictions = sample_clean_logits(model(z, t_now.expand(B)), mask_id, temperature)
 
-        alpha_now = fwd.get_alpha(t_now.unsqueeze(0)).item()
-        alpha_next = fwd.get_alpha(timesteps[i + 1].unsqueeze(0)).item()
+        alpha_now = fwd.alpha_at(t_now.unsqueeze(0)).item()
+        alpha_next = fwd.alpha_at(timesteps[i + 1].unsqueeze(0)).item()
         unmask_prob = (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
 
         unmask = torch.rand_like(tokens, dtype=torch.float) < unmask_prob
@@ -455,7 +373,7 @@ def _infill_clean_logits(model, fwd, tokens, mask_positions, num_steps, temperat
     still_masked = (z == mask_id) & mask_positions
     if still_masked.any():
         logits = model(z, torch.zeros(B, device=device))
-        z = torch.where(still_masked, _sample_clean_logits(logits, mask_id, temperature=0), z)
+        z = torch.where(still_masked, sample_clean_logits(logits, mask_id, temperature=0), z)
 
     return z
 
@@ -482,16 +400,16 @@ def _infill_sedd(model, fwd, tokens, mask_positions, num_steps, temperature):
         log_scores = model(z, t_now.expand(B))
         sigma_now = fwd.get_sigma(t_now.unsqueeze(0)).to(device)
         sigma_next = fwd.get_sigma(t_next.unsqueeze(0)).to(device)
-        probs = _sedd_absorbing_step_probs(log_scores, z, sigma_now - sigma_next, mask_id, temperature)
-        z = torch.where(mask_positions, _sample_categorical(probs), tokens)
+        probs = sedd_absorbing_step_probs(log_scores, z, sigma_now - sigma_next, mask_id, temperature)
+        z = torch.where(mask_positions, sample_categorical(probs), tokens)
 
     still_masked = (z == mask_id) & mask_positions
     if still_masked.any():
         t_eps = timesteps[-1]
         log_scores = model(z, t_eps.expand(B))
         sigma = fwd.get_sigma(t_eps.unsqueeze(0)).to(device)
-        probs = _sedd_absorbing_step_probs(log_scores, z, sigma, mask_id, temperature, drop_mask=True)
-        z = torch.where(still_masked, _sample_categorical(probs), z)
+        probs = sedd_absorbing_step_probs(log_scores, z, sigma, mask_id, temperature, drop_mask=True)
+        z = torch.where(still_masked, sample_categorical(probs), z)
     return z
 
 
@@ -505,7 +423,7 @@ def _infill_d3pm(model, fwd, tokens, mask_positions, num_steps, temperature):
 
     z = tokens.clone()
     z[mask_positions] = mask_id
-    timesteps = _d3pm_reverse_timesteps(fwd, num_steps, device)
+    timesteps = d3pm_reverse_timesteps(fwd, num_steps, device)
     for i in range(num_steps):
         masked = (z == mask_id) & mask_positions
         if not masked.any():
@@ -514,11 +432,9 @@ def _infill_d3pm(model, fwd, tokens, mask_positions, num_steps, temperature):
         t_now, t_prev = timesteps[i], timesteps[i + 1]
         logits = model(z, t_now.expand(B))
         log_probs = absorbing_posterior_log_probs(logits, z, t_now.expand(B), t_prev.expand(B), fwd, mask_id)
-        predictions = _sample_logits(log_probs, temperature)
+        predictions = sample_logits(log_probs, temperature)
         z = torch.where(masked, predictions, z)
 
     still_masked = (z == mask_id) & mask_positions
-    if still_masked.any():
-        logits = model(z, torch.zeros(B, device=device))
-        z = torch.where(still_masked, _sample_clean_logits(logits, mask_id, temperature=0), z)
+    require(not still_masked.any(), "D3PM infill reverse chain left masked tokens at t=0")
     return z

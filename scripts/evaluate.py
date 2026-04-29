@@ -1,4 +1,4 @@
-"""Evaluate a saved GPT: perplexity and generation diversity.
+"""Evaluate a saved autoregressive LM: perplexity and generation diversity.
 
     python scripts/evaluate.py --tokenizer tokenizer.json --checkpoint checkpoints/lm/step_5000
 """
@@ -7,15 +7,17 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 from minilab.tokenizers import load_tokenizer
-from minilab.models.gpt import GPT
 from minilab.data import load_tinystories
 from minilab.evaluation import perplexity, distinct_n, self_bleu
 from minilab.generation import generate
 from minilab.trainer import validate_checkpoint_tokenizer
+from common import MODEL_CHOICES, load_model_checkpoint
+
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--checkpoint", required=True)
+p.add_argument("--model", choices=MODEL_CHOICES, default=None, help="override checkpoint model family")
 p.add_argument("--seq-len", type=int, default=256)
 p.add_argument("--num-samples", type=int, default=50)
 args = p.parse_args()
@@ -23,9 +25,9 @@ args = p.parse_args()
 tok = load_tokenizer(args.tokenizer)
 validate_checkpoint_tokenizer(args.checkpoint, tok)
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = GPT.load(args.checkpoint, device=device)
+model_name, model = load_model_checkpoint(args.checkpoint, args.model, device=device)
 model.eval()
-print(f"Loaded {args.checkpoint} on {device} ({model.num_parameters():,} params)")
+print(f"Loaded {args.checkpoint} ({model_name}) on {device} ({model.num_parameters():,} params)")
 
 eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=2000)
 ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))

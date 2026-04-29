@@ -1,3 +1,3 @@
-def require(condition, message, error_type=ValueError):
+def require(condition, message):
     if not bool(condition):
-        raise error_type(message)
+        raise ValueError(message)

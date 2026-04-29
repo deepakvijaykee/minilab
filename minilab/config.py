@@ -13,6 +13,7 @@ class BaseConfig:
 
     @classmethod
     def from_dict(cls, d):
+        require(isinstance(d, dict), f"{cls.__name__} config must be a JSON object")
         valid = {f.name for f in fields(cls)}
         provided = set(d)
         unknown = provided - valid

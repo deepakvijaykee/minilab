@@ -31,6 +31,7 @@ def perplexity(model, dataloader):
 
 
 def distinct_n(texts, n=2):
+    require(n > 0, "distinct_n requires n > 0")
     all_ngrams = []
     for text in texts:
         tokens = text.split()
@@ -42,6 +43,7 @@ def distinct_n(texts, n=2):
 
 
 def self_bleu(texts, n=4):
+    require(n > 0, "self_bleu requires n > 0")
     scores = []
     for i, hyp in enumerate(texts):
         refs = [t for j, t in enumerate(texts) if j != i]

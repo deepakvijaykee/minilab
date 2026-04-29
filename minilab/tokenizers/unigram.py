@@ -34,7 +34,7 @@ class UnigramTokenizer(BaseTokenizer):
         self.scores: dict[str, float] = {}  # token -> log probability
 
     def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
-        require(text, "Unigram training text must be non-empty")
+        require(isinstance(text, str) and len(text) > 0, "Unigram training text must be a non-empty string")
         all_chars = set(text)
         require(vocab_size >= len(all_chars) + 1, (
             f"Unigram vocab_size ({vocab_size}) must cover all {len(all_chars)} unique characters plus {self.UNK}"
@@ -150,6 +150,7 @@ class UnigramTokenizer(BaseTokenizer):
         return {piece: math.log(count / total) for piece, count in adjusted.items()}
 
     def encode(self, text: str) -> list[int]:
+        require(self.UNK in self.token_to_id, "Unigram tokenizer must be trained or loaded before encoding")
         ids = []
         unk_id = self.token_to_id[self.UNK]
         space_id = self.token_to_id.get(" ")
@@ -191,6 +192,8 @@ class UnigramTokenizer(BaseTokenizer):
         return tokens[::-1]
 
     def decode(self, ids: list[int]) -> str:
+        missing = [i for i in ids if i not in self.id_to_token]
+        require(not missing, f"Unigram decode received unknown token ids: {missing[:5]}")
         return "".join(self.id_to_token[i] for i in ids)
 
     @property

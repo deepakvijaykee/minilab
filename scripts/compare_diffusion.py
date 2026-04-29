@@ -4,6 +4,7 @@
 """
 
 import argparse
+from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.models.mdlm import MDLM, MDLMConfig
 from minilab.models.sedd import SEDD, SEDDConfig
@@ -11,6 +12,7 @@ from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
+from minilab.nn.architecture import GQA_ATTENTIONS, MOE_FFNS, resolve_deepseek_v4_attention
 
 VARIANTS = [
     ("MDLM", MDLM, MDLMConfig, "cosine"),
@@ -18,18 +20,39 @@ VARIANTS = [
     ("D3PM", D3PM, D3PMConfig, "cosine"),
 ]
 
+
+def _resolve(value, default):
+    return default if value is None else value
+
+
+def _attention_uses_gqa(attention):
+    return resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
+
+
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--dim", type=int, default=128)
 p.add_argument("--num-layers", type=int, default=4)
 p.add_argument("--num-heads", type=int, default=8)
+p.add_argument("--num-kv-heads", type=int, default=None, help="KV heads for GQA; defaults to num_heads")
 p.add_argument("--seq-len", type=int, default=128)
+p.add_argument("--attention", default="mha")
+p.add_argument("--ffn", default="swiglu")
+p.add_argument("--num-experts", type=int, default=None)
+p.add_argument("--top-k-experts", type=int, default=None)
 p.add_argument("--max-steps", type=int, default=2000)
 p.add_argument("--batch-size", type=int, default=16)
 p.add_argument("--max-examples", type=int, default=10000)
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+if args.num_kv_heads is not None:
+    require(_attention_uses_gqa(args.attention), "--num-kv-heads only applies to GQA attention variants")
+if args.num_experts is not None or args.top_k_experts is not None:
+    require(args.ffn in MOE_FFNS, "--num-experts and --top-k-experts only apply to MoE FFNs")
 set_seed(args.seed)
+
+num_experts = _resolve(args.num_experts, 8)
+top_k_experts = _resolve(args.top_k_experts, 2)
 
 tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size
@@ -44,7 +67,9 @@ for name, cls, cfg_cls, schedule in VARIANTS:
     print(f"\n=== {name} (schedule={schedule}) ===")
     set_seed(args.seed)
     cfg = cfg_cls(vocab_size=tok.vocab_size + 1, dim=args.dim, num_layers=args.num_layers,
-                  num_heads=args.num_heads, max_seq_len=args.seq_len, mask_token_id=mask_id)
+                  num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, max_seq_len=args.seq_len,
+                  attention=args.attention, ffn=args.ffn, num_experts=num_experts,
+                  top_k_experts=top_k_experts, mask_token_id=mask_id)
     model = cls(cfg)
     fwd = ForwardProcess(mask_id, schedule=schedule)
     print(f"  {model.num_parameters():,} params")

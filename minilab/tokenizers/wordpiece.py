@@ -26,6 +26,7 @@ class WordPieceTokenizer(BaseTokenizer):
         self.id_to_token: dict[int, str] = {}
 
     def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
+        require(isinstance(text, str) and len(text) > 0, "WordPiece training text must be a non-empty string")
         words = text.split()
         require(words, "WordPiece training text must contain at least one word")
         word_freqs: dict[str, int] = {}
@@ -90,6 +91,7 @@ class WordPieceTokenizer(BaseTokenizer):
         return tokens
 
     def encode(self, text: str) -> list[int]:
+        require(self.UNK in self.token_to_id, "WordPiece tokenizer must be trained or loaded before encoding")
         ids = []
         unk_id = self.token_to_id[self.UNK]
         for word in text.split():
@@ -98,6 +100,8 @@ class WordPieceTokenizer(BaseTokenizer):
         return ids
 
     def decode(self, ids: list[int]) -> str:
+        missing = [i for i in ids if i not in self.id_to_token]
+        require(not missing, f"WordPiece decode received unknown token ids: {missing[:5]}")
         parts: list[str] = []
         for i in ids:
             token = self.id_to_token[i]

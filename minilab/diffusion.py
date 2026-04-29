@@ -129,6 +129,7 @@ class ForwardProcess:
     @classmethod
     def load(cls, path):
         s = json.loads(Path(path).read_text())
+        require(isinstance(s, dict), "Forward process state must be a JSON object")
         required = {"process_type", "mask_token_id", "num_timesteps", "schedule"}
         missing = required - set(s)
         require(not missing, f"Missing forward process fields: {sorted(missing)}")
@@ -160,6 +161,11 @@ class ForwardProcess:
     def get_alpha(self, t):
         idx = self.time_index(t)
         return self.alpha.to(t.device)[idx]
+
+    def alpha_at(self, t):
+        if self.schedule in _SCHEDULE_ALPHA_FUNCTIONS:
+            return self.get_alpha_continuous(t)
+        return self.get_alpha(t)
 
     def get_alpha_continuous(self, t):
         require(self.schedule in _SCHEDULE_ALPHA_FUNCTIONS, (
