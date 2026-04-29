@@ -16,6 +16,7 @@ Used by: GPT-2/3/4, Llama, Mistral, RoBERTa
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
+from minilab.tokenizers._state import require_tokenizer_state
 
 
 @register_tokenizer("bpe")
@@ -91,8 +92,27 @@ class BPETokenizer(BaseTokenizer):
         }
 
     def _set_state(self, state):
-        self.merges = {tuple(map(int, k.split(","))): v for k, v in state["merges"].items()}
-        self.vocab = {int(k): bytes(v) for k, v in state["vocab"].items()}
+        require_tokenizer_state(state, "BPE", "bpe", ("merges", "vocab"))
+
+        merges: dict[tuple[int, int], int] = {}
+        for key, value in state["merges"].items():
+            parts = key.split(",") if type(key) is str else []
+            require(len(parts) == 2 and all(part.isdecimal() for part in parts), (
+                "BPE tokenizer merge keys must be 'left,right' token ids"
+            ))
+            require(type(value) is int and value >= 0, "BPE tokenizer merge values must be token ids")
+            merges[(int(parts[0]), int(parts[1]))] = value
+
+        vocab: dict[int, bytes] = {}
+        for key, value in state["vocab"].items():
+            require(type(key) is str and key.isdecimal(), "BPE tokenizer vocab keys must be token ids")
+            require(type(value) is list and all(type(byte) is int and 0 <= byte <= 255 for byte in value), (
+                "BPE tokenizer vocab values must be byte lists"
+            ))
+            vocab[int(key)] = bytes(value)
+        require(vocab, "BPE tokenizer state vocab must be non-empty")
+        self.merges = merges
+        self.vocab = vocab
 
 
 def _apply_merge(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:

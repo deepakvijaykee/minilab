@@ -48,18 +48,27 @@ class _QKClipMixin:
     def _init_qk_clip(self, num_heads):
         self.register_buffer("_qk_clip_max_logits", torch.zeros(num_heads), persistent=False)
         self.register_buffer("_qk_clip_seen", torch.zeros((), dtype=torch.bool), persistent=False)
+        self._qk_clip_recording = False
+
+    @torch.no_grad()
+    def set_qk_clip_recording(self, enabled):
+        self._qk_clip_recording = enabled
+        if not enabled:
+            self._reset_qk_clip_stats()
 
     def _record_qk_clip_logits(self, q, k):
-        if not torch.is_grad_enabled():
+        if not self._qk_clip_recording or not torch.is_grad_enabled():
             return
         with torch.no_grad():
             scores = torch.matmul(q.detach().float(), k.detach().float().transpose(-2, -1)) / math.sqrt(q.size(-1))
             max_logits = scores.amax(dim=(0, 2, 3)).to(self._qk_clip_max_logits.dtype)
-            if bool(self._qk_clip_seen.item()):
-                self._qk_clip_max_logits.copy_(torch.maximum(self._qk_clip_max_logits, max_logits))
-            else:
-                self._qk_clip_max_logits.copy_(max_logits)
-                self._qk_clip_seen.fill_(True)
+            current = torch.where(
+                self._qk_clip_seen,
+                torch.maximum(self._qk_clip_max_logits, max_logits),
+                max_logits,
+            )
+            self._qk_clip_max_logits.copy_(current)
+            self._qk_clip_seen.fill_(True)
 
     @torch.no_grad()
     def _qk_clip_gammas(self, threshold):

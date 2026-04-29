@@ -561,8 +561,12 @@ class GRPOTrainer(Trainer):
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
         for k in range(self.K):
-            logp, mask = _generation_context_token_logp(self.model, rollout.seqs[k], rollout.label_seqs[k])
-            aux = model_aux_loss(self.model)
+            logp, mask, aux = _generation_context_token_logp(
+                self.model,
+                rollout.seqs[k],
+                rollout.label_seqs[k],
+                return_aux=True,
+            )
             ratio = (logp - rollout.old_token_logps[k]).clamp(min=-20.0, max=20.0).exp()
             adv_k = rollout.adv[:, k : k + 1]
             surr1 = ratio * adv_k
@@ -608,8 +612,12 @@ class RLOOTrainer(GRPOTrainer):
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
         for k in range(self.K):
-            logp, mask = _generation_context_token_logp(self.model, rollout.seqs[k], rollout.label_seqs[k])
-            aux = model_aux_loss(self.model)
+            logp, mask, aux = _generation_context_token_logp(
+                self.model,
+                rollout.seqs[k],
+                rollout.label_seqs[k],
+                return_aux=True,
+            )
             seq_logp = (logp * mask).sum(dim=-1)
             total = total - (seq_logp * rollout.adv[:, k].detach()).mean() + aux
         return total / self.K
@@ -631,8 +639,12 @@ class GSPOTrainer(GRPOTrainer):
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
         for k in range(self.K):
-            logp, mask = _generation_context_token_logp(self.model, rollout.seqs[k], rollout.label_seqs[k])
-            aux = model_aux_loss(self.model)
+            logp, mask, aux = _generation_context_token_logp(
+                self.model,
+                rollout.seqs[k],
+                rollout.label_seqs[k],
+                return_aux=True,
+            )
             token_counts = mask.sum(dim=-1).clamp(min=1.0)
             seq_log_ratio = ((logp - rollout.old_token_logps[k]) * mask).sum(dim=-1) / token_counts
             ratio = seq_log_ratio.clamp(min=-20.0, max=20.0).exp()
@@ -738,8 +750,12 @@ class DAPOTrainer(GRPOTrainer):
         token_total = torch.tensor(0.0, device=self.device)
         aux_total = torch.tensor(0.0, device=self.device)
         for k in range(self.K):
-            logp, mask = _generation_context_token_logp(self.model, rollout.seqs[k], rollout.label_seqs[k])
-            aux = model_aux_loss(self.model)
+            logp, mask, aux = _generation_context_token_logp(
+                self.model,
+                rollout.seqs[k],
+                rollout.label_seqs[k],
+                return_aux=True,
+            )
             ratio = (logp - rollout.old_token_logps[k]).clamp(min=-20.0, max=20.0).exp()
             adv = rollout.adv[:, k : k + 1]
             clipped = ratio.clamp(1 - self.clip_ratio_low, 1 + self.clip_ratio_high)

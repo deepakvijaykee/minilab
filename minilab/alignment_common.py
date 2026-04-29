@@ -28,6 +28,7 @@ def _resume_reference_path(resume_from, algorithm):
 
 
 def resolve_reference_path(checkpoint, resume_from, algorithm):
+    require(not (checkpoint and resume_from), f"{algorithm} accepts --checkpoint or --resume-from, not both")
     if resume_from:
         return _resume_reference_path(resume_from, algorithm)
     return _validated_reference_path(checkpoint, algorithm)
@@ -144,14 +145,19 @@ def _whiten_masked(values, mask, eps=1e-8):
     return whitened * mask
 
 
-def _generation_context_token_logp(model, input_ids, labels):
+def _generation_context_token_logp(model, input_ids, labels, return_aux=False):
     """Token log-probs under the same cropped context contract used by generate()."""
     max_ctx = _model_max_seq_len(model, "GRPO token log-prob scoring")
     if input_ids.size(1) <= max_ctx:
-        return _token_logp(model, input_ids, labels)
+        token_logp, mask = _token_logp(model, input_ids, labels)
+        if return_aux:
+            return token_logp, mask, unwrap_model(model).auxiliary_loss()
+        return token_logp, mask
 
     mask = labels != -100
     token_logp = None
+    total_aux = None
+    aux_count = 0
     safe_targets = labels.where(mask, torch.zeros_like(labels))
     for pos in range(input_ids.size(1)):
         active = mask[:, pos]
@@ -160,6 +166,10 @@ def _generation_context_token_logp(model, input_ids, labels):
         start = max(0, pos + 1 - max_ctx)
         context = input_ids[active, start : pos + 1]
         logits, _ = model(context)
+        if return_aux:
+            aux = unwrap_model(model).auxiliary_loss()
+            total_aux = aux if total_aux is None else total_aux + aux
+            aux_count += 1
         selected = F.log_softmax(logits[:, -1], dim=-1).gather(
             -1,
             safe_targets[active, pos].unsqueeze(-1),
@@ -170,6 +180,9 @@ def _generation_context_token_logp(model, input_ids, labels):
 
     if token_logp is None:
         token_logp = torch.zeros(labels.shape, device=input_ids.device, dtype=torch.float32)
+    if return_aux:
+        require(total_aux is not None, "cropped token log-prob scoring with auxiliary loss requires a supervised token")
+        return token_logp, mask.float(), total_aux / aux_count
     return token_logp, mask.float()
 
 
@@ -183,7 +196,6 @@ def _model_max_seq_len(model, context):
 
 def _diffusion_loss_per_example(model, fwd, x_0, loss_mask, t, z_t, mask):
     core = unwrap_model(model)
-    require(isinstance(core, BaseModel), "diffusion preference tuning requires a BaseModel")
     output = model(z_t, t)
     return core.compute_loss_per_example(
         output,

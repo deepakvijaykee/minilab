@@ -6,7 +6,7 @@
 
 import argparse
 import torch
-from common import MODEL_CHOICES, load_model_checkpoint
+from common import MODEL_CHOICES, load_model_checkpoint, reject_supplied, resolve_default
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT, GPTConfig
@@ -18,19 +18,6 @@ from minilab.generation import generate
 
 
 _MODEL_BUILD_FLAGS = ("dim", "num_layers", "num_heads")
-
-
-def _flag(name):
-    return "--" + name.replace("_", "-")
-
-
-def _reject_supplied(args, names, reason):
-    for name in names:
-        require(getattr(args, name) is None, f"{_flag(name)} {reason}")
-
-
-def _resolve(value, default):
-    return default if value is None else value
 
 
 p = argparse.ArgumentParser()
@@ -52,17 +39,18 @@ p.add_argument("--resume-from", default="")
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
 model_name = args.model or "gpt"
+require(not (args.checkpoint and args.resume_from), "SFT accepts --checkpoint or --resume-from, not both")
 
 if args.resume_from or args.checkpoint:
-    _reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
+    reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
 elif model_name != "gpt":
-    _reject_supplied(args, ("num_heads",), "only applies to --model gpt")
+    reject_supplied(args, ("num_heads",), "only applies to --model gpt")
 
 set_seed(args.seed)
 
-dim = _resolve(args.dim, 256)
-num_layers = _resolve(args.num_layers, 6)
-num_heads = _resolve(args.num_heads, 8)
+dim = resolve_default(args.dim, 256)
+num_layers = resolve_default(args.num_layers, 6)
+num_heads = resolve_default(args.num_heads, 8)
 
 tok = load_tokenizer(args.tokenizer)
 

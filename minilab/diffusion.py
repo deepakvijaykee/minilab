@@ -132,7 +132,9 @@ class ForwardProcess:
         require(isinstance(s, dict), "Forward process state must be a JSON object")
         required = {"process_type", "mask_token_id", "num_timesteps", "schedule"}
         missing = required - set(s)
+        unknown = set(s) - required
         require(not missing, f"Missing forward process fields: {sorted(missing)}")
+        require(not unknown, f"Unknown forward process fields: {sorted(unknown)}")
         require(s["process_type"] == cls.process_type, (
             f"Unsupported forward process type: {s['process_type']}"
         ))

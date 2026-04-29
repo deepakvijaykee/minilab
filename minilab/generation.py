@@ -172,7 +172,7 @@ def sample_diffusion_cached(model, fwd, batch_size, seq_len, num_steps=None, tem
         if i % cache_interval == 0:
             logits = model(z, t_now.expand(batch_size))
 
-        predictions = _sample_clean_predictions(logits.clone(), mask_id, temperature)
+        predictions = _sample_clean_predictions(logits, mask_id, temperature)
         unmask_prob = _absorbing_unmask_probability(fwd, t_now, t_next)
 
         unmask = torch.rand(batch_size, seq_len, device=device) < unmask_prob

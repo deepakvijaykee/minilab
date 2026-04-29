@@ -7,7 +7,7 @@ import argparse
 
 import torch
 
-from common import MODEL_CHOICES, load_model_checkpoint
+from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path
 from minilab.alignment import (
     CPOTrainConfig,
     CPOTrainer,
@@ -78,7 +78,7 @@ kto_undesirable_weight = 1.0 if args.kto_undesirable_weight is None else args.kt
 set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
-model_path = args.resume_from or args.checkpoint
+model_path = require_checkpoint_path(args.checkpoint, args.resume_from, "preference training")
 validate_checkpoint_tokenizer(model_path, tok)
 model_name, model = load_model_checkpoint(model_path, args.model)
 print(f"Trainable: {model_path} ({model_name}, {model.num_parameters():,} params)")

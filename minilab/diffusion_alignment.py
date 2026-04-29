@@ -89,7 +89,9 @@ def _validate_reference_forward_process(ref_model_path, forward_process, algorit
         "schedule": forward_process.schedule,
     }
     missing = set(expected) - set(saved)
+    unknown = set(saved) - set(expected)
     require(not missing, f"{algorithm} frozen reference forward process is missing fields: {sorted(missing)}")
+    require(not unknown, f"{algorithm} frozen reference forward process has unknown fields: {sorted(unknown)}")
     mismatches = {
         key: (saved[key], expected[key])
         for key in expected

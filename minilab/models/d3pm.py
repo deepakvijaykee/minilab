@@ -82,6 +82,10 @@ class D3PM(BaseModel):
     def auxiliary_loss(self):
         return diffusion_blocks_auxiliary_loss(self.blocks, self.tok_emb.weight)
 
+    def set_qk_clip_recording(self, enabled):
+        for block in self.blocks:
+            block.set_qk_clip_recording(enabled)
+
     def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
         commit_diffusion_block_updates(self.blocks, qk_clip_threshold, qk_clip_balance)
 
@@ -118,14 +122,11 @@ class D3PM(BaseModel):
         log_p = absorbing_posterior_log_probs(logits, z_t, t_now, t_prev, fwd, self.mask_token_id)
         log_p_x0 = log_p.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)
         log_p_mask = log_p[:, :, self.mask_token_id]
-        if target_mask.any():
-            kl = log_p_x0.new_zeros(x_0.shape)
-            q_unmask = q_unmask.expand_as(x_0)[target_mask]
-            q_stay = q_stay.expand_as(x_0)[target_mask]
-            kl[target_mask] = _kl_two_atom(q_unmask, q_stay, log_p_x0[target_mask], log_p_mask[target_mask])
-            vlb = kl.sum(dim=-1) / loss_normalizer(x_0, loss_mask, normalization).to(logits.device, dtype=logits.dtype)
-        else:
-            vlb = logits.sum(dim=(1, 2)) * 0.0
+        kl = log_p_x0.new_zeros(x_0.shape)
+        q_unmask = q_unmask.expand_as(x_0)[target_mask]
+        q_stay = q_stay.expand_as(x_0)[target_mask]
+        kl[target_mask] = _kl_two_atom(q_unmask, q_stay, log_p_x0[target_mask], log_p_mask[target_mask])
+        vlb = kl.sum(dim=-1) / loss_normalizer(x_0, loss_mask, normalization).to(logits.device, dtype=logits.dtype)
 
         clean_logits = _clean_x0_logits(logits, self.mask_token_id)
         token_ce = F.cross_entropy(
@@ -156,10 +157,9 @@ def absorbing_posterior_log_probs(x0_logits, z_t, t_now, t_prev, fwd, mask_token
     log_probs[:, :, mask_token_id] = _prob_log(q_stay).expand_as(log_probs[:, :, mask_token_id])
 
     observed = z_t != mask_token_id
-    if observed.any():
-        fixed = torch.full_like(log_probs, float("-inf"))
-        fixed.scatter_(-1, z_t.unsqueeze(-1), 0.0)
-        log_probs = torch.where(observed.unsqueeze(-1), fixed, log_probs)
+    fixed = torch.full_like(log_probs, float("-inf"))
+    fixed.scatter_(-1, z_t.unsqueeze(-1), 0.0)
+    log_probs = torch.where(observed.unsqueeze(-1), fixed, log_probs)
     return log_probs
 
 

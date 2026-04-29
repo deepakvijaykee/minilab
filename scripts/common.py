@@ -8,6 +8,7 @@ from minilab.models.mamba import MambaLM
 from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.models.mdlm import MDLM, MDLMConfig
 from minilab.models.sedd import SEDD, SEDDConfig
+from minilab.nn.architecture import GQA_ATTENTIONS, resolve_deepseek_v4_attention
 from minilab.trainer import LMTrainer, set_seed, tokenizer_signature
 from torch.utils.data import DataLoader
 
@@ -24,28 +25,51 @@ _DIFFUSION_NAME_BY_CHECKPOINT_TYPE = {
 }
 
 
+def _lookup(table, name, kind):
+    require(name in table, f"Unknown {kind}: {name}. Available: {tuple(table)}")
+    return table[name]
+
+
 def model_class(name):
-    if name in _MODEL_CLASSES:
-        return _MODEL_CLASSES[name]
-    require(False, f"Unknown model: {name}")
+    return _lookup(_MODEL_CLASSES, name, "model")
 
 
 def diffusion_model_class(name):
-    if name in _DIFFUSION_MODEL_CLASSES:
-        return _DIFFUSION_MODEL_CLASSES[name]
-    require(False, f"Unknown diffusion model: {name}")
+    return _lookup(_DIFFUSION_MODEL_CLASSES, name, "diffusion model")
 
 
 def diffusion_config_class(name):
-    if name in _DIFFUSION_CONFIG_CLASSES:
-        return _DIFFUSION_CONFIG_CLASSES[name]
-    require(False, f"Unknown diffusion model: {name}")
+    return _lookup(_DIFFUSION_CONFIG_CLASSES, name, "diffusion model")
 
 
 def diffusion_sampler(name):
-    if name in _DIFFUSION_SAMPLER_BY_MODEL:
-        return _DIFFUSION_SAMPLER_BY_MODEL[name]
-    require(False, f"Unknown diffusion model: {name}")
+    return _lookup(_DIFFUSION_SAMPLER_BY_MODEL, name, "diffusion model")
+
+
+def flag_name(name):
+    return "--" + name.replace("_", "-")
+
+
+def reject_supplied(args, names, reason):
+    for name in names:
+        require(getattr(args, name) is None, f"{flag_name(name)} {reason}")
+
+
+def resolve_default(value, default):
+    return default if value is None else value
+
+
+def attention_uses_gqa(attention):
+    return attention in {"gemma3", "gemma4", "qwen3_next"} or (
+        resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
+    )
+
+
+def require_checkpoint_path(checkpoint, resume_from, context):
+    require(not (checkpoint and resume_from), f"{context} accepts --checkpoint or --resume-from, not both")
+    path = resume_from or checkpoint
+    require(path, f"{context} requires --checkpoint or --resume-from")
+    return path
 
 
 def _checkpoint_model_name(path, name_by_type, kind):

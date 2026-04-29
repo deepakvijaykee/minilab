@@ -12,21 +12,14 @@ from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
-from minilab.nn.architecture import GQA_ATTENTIONS, MOE_FFNS, resolve_deepseek_v4_attention
+from minilab.nn.architecture import MOE_FFNS
+from common import attention_uses_gqa, resolve_default
 
 VARIANTS = [
     ("MDLM", MDLM, MDLMConfig, "cosine"),
     ("SEDD", SEDD, SEDDConfig, "log_linear"),
     ("D3PM", D3PM, D3PMConfig, "cosine"),
 ]
-
-
-def _resolve(value, default):
-    return default if value is None else value
-
-
-def _attention_uses_gqa(attention):
-    return resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
 
 
 p = argparse.ArgumentParser()
@@ -46,13 +39,13 @@ p.add_argument("--max-examples", type=int, default=10000)
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
 if args.num_kv_heads is not None:
-    require(_attention_uses_gqa(args.attention), "--num-kv-heads only applies to GQA attention variants")
+    require(attention_uses_gqa(args.attention), "--num-kv-heads only applies to GQA attention variants")
 if args.num_experts is not None or args.top_k_experts is not None:
     require(args.ffn in MOE_FFNS, "--num-experts and --top-k-experts only apply to MoE FFNs")
 set_seed(args.seed)
 
-num_experts = _resolve(args.num_experts, 8)
-top_k_experts = _resolve(args.top_k_experts, 2)
+num_experts = resolve_default(args.num_experts, 8)
+top_k_experts = resolve_default(args.top_k_experts, 2)
 
 tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size

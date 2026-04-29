@@ -354,6 +354,15 @@ class GPT(BaseModel):
                 modules.extend((block.attn_conn, block.ffn_conn))
         return tuple(modules)
 
+    def set_qk_clip_recording(self, enabled):
+        for block in self.blocks:
+            if block.attention_name in QK_CLIP_ATTENTIONS:
+                block.attn.set_qk_clip_recording(enabled)
+        for module in self.mtp_modules:
+            block = module.block
+            if block.attention_name in QK_CLIP_ATTENTIONS:
+                block.attn.set_qk_clip_recording(enabled)
+
     def auxiliary_loss(self):
         return self._ffn_auxiliary_loss()
 

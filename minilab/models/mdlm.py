@@ -71,6 +71,10 @@ class MDLM(BaseModel):
     def auxiliary_loss(self):
         return diffusion_blocks_auxiliary_loss(self.blocks, self.tok_emb.weight)
 
+    def set_qk_clip_recording(self, enabled):
+        for block in self.blocks:
+            block.set_qk_clip_recording(enabled)
+
     def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
         commit_diffusion_block_updates(self.blocks, qk_clip_threshold, qk_clip_balance)
 

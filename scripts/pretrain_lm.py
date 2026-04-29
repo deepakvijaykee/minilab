@@ -9,7 +9,13 @@
 import argparse
 import torch
 from torch.utils.data import DataLoader
-from common import MODEL_CHOICES, load_model_checkpoint
+from common import (
+    MODEL_CHOICES,
+    attention_uses_gqa,
+    load_model_checkpoint,
+    reject_supplied,
+    resolve_default,
+)
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.models.gpt import GPT, GPTConfig
@@ -19,10 +25,8 @@ from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tok
 from minilab.generation import generate
 from minilab.evaluation import perplexity
 from minilab.nn.architecture import (
-    GQA_ATTENTIONS,
     MOE_FFNS,
     QK_CLIP_ATTENTIONS,
-    resolve_deepseek_v4_attention,
 )
 
 
@@ -39,29 +43,10 @@ _GPT_ONLY_BUILD_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in
 _QK_CLIP_FLAGS = ("qk_clip_threshold", "qk_clip_balance")
 
 
-def _flag(name):
-    return "--" + name.replace("_", "-")
-
-
-def _reject_supplied(args, names, reason):
-    for name in names:
-        require(getattr(args, name) is None, f"{_flag(name)} {reason}")
-
-
-def _resolve(value, default):
-    return default if value is None else value
-
-
 def _uses_qk_clip(model):
     return isinstance(model, GPT) and any(
-        getattr(block, "attention_name", None) in QK_CLIP_ATTENTIONS
+        block.attention_name in QK_CLIP_ATTENTIONS
         for block in model.blocks
-    )
-
-
-def _attention_uses_gqa(attention):
-    return attention in {"gemma3", "gemma4", "qwen3_next"} or (
-        resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
     )
 
 
@@ -114,11 +99,11 @@ args = p.parse_args()
 model_name = args.model or "gpt"
 
 if args.resume_from:
-    _reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
+    reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
 elif model_name != "gpt":
-    _reject_supplied(args, _GPT_ONLY_BUILD_FLAGS, "only applies to --model gpt")
+    reject_supplied(args, _GPT_ONLY_BUILD_FLAGS, "only applies to --model gpt")
 if not args.resume_from and model_name != "gpt":
-    _reject_supplied(args, _QK_CLIP_FLAGS, "only applies to --model gpt")
+    reject_supplied(args, _QK_CLIP_FLAGS, "only applies to --model gpt")
 if args.qk_clip_threshold is not None:
     require(args.qk_clip_threshold > 0, "--qk-clip-threshold must be > 0 when supplied")
 if args.qk_clip_balance is not None:
@@ -129,36 +114,36 @@ if args.qk_clip_balance is not None:
 
 set_seed(args.seed)
 
-dim = _resolve(args.dim, 256)
-num_layers = _resolve(args.num_layers, 6)
-num_heads = _resolve(args.num_heads, 8)
-attention = _resolve(args.attention, "mha")
-position = _resolve(args.position, "rope")
-rope_base = _resolve(args.rope_base, 10000.0)
-rope_local_base = _resolve(args.rope_local_base, 10000.0)
-rope_global_base = _resolve(args.rope_global_base, 1000000.0)
-rope_scaling_factor = _resolve(args.rope_scaling_factor, 1.0)
-rope_original_max_seq_len = _resolve(args.rope_original_max_seq_len, 4096)
-rope_partial_rotary_factor = _resolve(args.rope_partial_rotary_factor, 0.25)
-yarn_beta_fast = _resolve(args.yarn_beta_fast, 32.0)
-yarn_beta_slow = _resolve(args.yarn_beta_slow, 1.0)
-local_attention_window = _resolve(args.local_attention_window, 1024)
-qwen3_next_full_attention_interval = _resolve(args.qwen3_next_full_attention_interval, 4)
-attention_k_eq_v = _resolve(args.attention_k_eq_v, False)
-per_layer_embedding_dim = _resolve(args.per_layer_embedding_dim, 0)
-final_logit_softcap = _resolve(args.final_logit_softcap, 0.0)
-connection = _resolve(args.connection, "residual")
-ffn = _resolve(args.ffn, "swiglu")
-num_experts = _resolve(args.num_experts, 8)
-top_k_experts = _resolve(args.top_k_experts, 2)
-post_norm = _resolve(args.post_norm, False)
-mtp_depth = _resolve(args.mtp_depth, 0)
-mtp_loss_weight = _resolve(args.mtp_loss_weight, 0.0)
-qk_clip_threshold = _resolve(args.qk_clip_threshold, 0.0)
-qk_clip_balance = _resolve(args.qk_clip_balance, 0.5)
+dim = resolve_default(args.dim, 256)
+num_layers = resolve_default(args.num_layers, 6)
+num_heads = resolve_default(args.num_heads, 8)
+attention = resolve_default(args.attention, "mha")
+position = resolve_default(args.position, "rope")
+rope_base = resolve_default(args.rope_base, 10000.0)
+rope_local_base = resolve_default(args.rope_local_base, 10000.0)
+rope_global_base = resolve_default(args.rope_global_base, 1000000.0)
+rope_scaling_factor = resolve_default(args.rope_scaling_factor, 1.0)
+rope_original_max_seq_len = resolve_default(args.rope_original_max_seq_len, 4096)
+rope_partial_rotary_factor = resolve_default(args.rope_partial_rotary_factor, 0.25)
+yarn_beta_fast = resolve_default(args.yarn_beta_fast, 32.0)
+yarn_beta_slow = resolve_default(args.yarn_beta_slow, 1.0)
+local_attention_window = resolve_default(args.local_attention_window, 1024)
+qwen3_next_full_attention_interval = resolve_default(args.qwen3_next_full_attention_interval, 4)
+attention_k_eq_v = resolve_default(args.attention_k_eq_v, False)
+per_layer_embedding_dim = resolve_default(args.per_layer_embedding_dim, 0)
+final_logit_softcap = resolve_default(args.final_logit_softcap, 0.0)
+connection = resolve_default(args.connection, "residual")
+ffn = resolve_default(args.ffn, "swiglu")
+num_experts = resolve_default(args.num_experts, 8)
+top_k_experts = resolve_default(args.top_k_experts, 2)
+post_norm = resolve_default(args.post_norm, False)
+mtp_depth = resolve_default(args.mtp_depth, 0)
+mtp_loss_weight = resolve_default(args.mtp_loss_weight, 0.0)
+qk_clip_threshold = resolve_default(args.qk_clip_threshold, 0.0)
+qk_clip_balance = resolve_default(args.qk_clip_balance, 0.5)
 
 if args.num_kv_heads is not None:
-    require(_attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
+    require(attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
 if args.num_experts is not None or args.top_k_experts is not None:
     require(ffn in MOE_FFNS, "--num-experts and --top-k-experts only apply to MoE FFNs")
 if args.mtp_depth is not None:

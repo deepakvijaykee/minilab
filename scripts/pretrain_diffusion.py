@@ -10,13 +10,16 @@ from minilab.tokenizers import load_tokenizer
 from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
-from minilab.nn.architecture import GQA_ATTENTIONS, MOE_FFNS, resolve_deepseek_v4_attention
+from minilab.nn.architecture import MOE_FFNS
 from common import (
     DIFFUSION_MODEL_CHOICES,
+    attention_uses_gqa,
     diffusion_config_class,
     diffusion_model_class,
     diffusion_sampler,
     load_diffusion_model_checkpoint,
+    reject_supplied,
+    resolve_default,
 )
 
 
@@ -24,23 +27,6 @@ _MODEL_BUILD_FLAGS = (
     "dim", "num_layers", "num_heads", "num_kv_heads",
     "attention", "ffn", "num_experts", "top_k_experts",
 )
-
-
-def _flag(name):
-    return "--" + name.replace("_", "-")
-
-
-def _reject_supplied(args, names, reason):
-    for name in names:
-        require(getattr(args, name) is None, f"{_flag(name)} {reason}")
-
-
-def _resolve(value, default):
-    return default if value is None else value
-
-
-def _attention_uses_gqa(attention):
-    return resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
 
 
 p = argparse.ArgumentParser()
@@ -70,22 +56,22 @@ args = p.parse_args()
 model_name = args.model or "mdlm"
 
 if args.resume_from:
-    _reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
+    reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
     require(args.schedule == "", "--schedule only applies when starting a new model")
 
 set_seed(args.seed)
 
-dim = _resolve(args.dim, 256)
-num_layers = _resolve(args.num_layers, 6)
-num_heads = _resolve(args.num_heads, 8)
-attention = _resolve(args.attention, "mha")
-ffn = _resolve(args.ffn, "swiglu")
-num_experts = _resolve(args.num_experts, 8)
-top_k_experts = _resolve(args.top_k_experts, 2)
+dim = resolve_default(args.dim, 256)
+num_layers = resolve_default(args.num_layers, 6)
+num_heads = resolve_default(args.num_heads, 8)
+attention = resolve_default(args.attention, "mha")
+ffn = resolve_default(args.ffn, "swiglu")
+num_experts = resolve_default(args.num_experts, 8)
+top_k_experts = resolve_default(args.top_k_experts, 2)
 
 if not args.resume_from:
     if args.num_kv_heads is not None:
-        require(_attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
+        require(attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
     if args.num_experts is not None or args.top_k_experts is not None:
         require(ffn in MOE_FFNS, "--num-experts and --top-k-experts only apply to MoE FFNs")
 

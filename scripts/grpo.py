@@ -4,7 +4,7 @@
 """
 
 import argparse
-from common import MODEL_CHOICES, load_model_checkpoint
+from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path
 from minilab.tokenizers import load_tokenizer
 from minilab.data import load_gsm8k
 from minilab.alignment import (
@@ -104,7 +104,7 @@ clip_ratio = clip_ratio_default if args.clip_ratio is None else args.clip_ratio
 
 tok = load_tokenizer(args.tokenizer)
 
-model_path = args.resume_from or args.checkpoint
+model_path = require_checkpoint_path(args.checkpoint, args.resume_from, "GRPO training")
 validate_checkpoint_tokenizer(model_path, tok)
 ref_path = None
 if args.algorithm != "dapo":

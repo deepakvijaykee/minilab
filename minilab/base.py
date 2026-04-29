@@ -50,6 +50,9 @@ class BaseModel(nn.Module):
     def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
         return None
 
+    def set_qk_clip_recording(self, enabled):
+        return None
+
     def muon_parameter_groups(self):
         auxiliary_ids = {
             id(param)

@@ -13,6 +13,7 @@ Used by: BERT, DistilBERT, Electra
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
+from minilab.tokenizers._state import require_tokenizer_state
 
 
 @register_tokenizer("wordpiece")
@@ -123,6 +124,13 @@ class WordPieceTokenizer(BaseTokenizer):
         return {"type": "wordpiece", "token_to_id": self.token_to_id}
 
     def _set_state(self, state):
+        require_tokenizer_state(state, "WordPiece", "wordpiece", ("token_to_id",))
+        require(all(type(token) is str and token for token in state["token_to_id"]), (
+            "WordPiece tokenizer state tokens must be non-empty strings"
+        ))
+        require(all(type(idx) is int and idx >= 0 for idx in state["token_to_id"].values()), (
+            "WordPiece tokenizer state ids must be non-negative integers"
+        ))
         self.token_to_id = state["token_to_id"]
         require(self.UNK in self.token_to_id, f"WordPiece tokenizer state is missing {self.UNK}")
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}

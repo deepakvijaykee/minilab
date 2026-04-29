@@ -69,6 +69,10 @@ class SEDD(BaseModel):
     def auxiliary_loss(self):
         return diffusion_blocks_auxiliary_loss(self.blocks, self.tok_emb.weight)
 
+    def set_qk_clip_recording(self, enabled):
+        for block in self.blocks:
+            block.set_qk_clip_recording(enabled)
+
     def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
         commit_diffusion_block_updates(self.blocks, qk_clip_threshold, qk_clip_balance)
 
@@ -99,8 +103,6 @@ class SEDD(BaseModel):
         loss_mask = validate_loss_mask(loss_mask, x_0, "SEDD loss")
         require(fwd.process_type == self.forward_process_type, "SEDD loss requires the absorbing forward process")
         target_mask = mask if loss_mask is None else (mask & loss_mask)
-        if not target_mask.any():
-            return scores.sum(dim=(1, 2)) * 0.0
 
         log_score = scores.double()
         sigma = fwd.get_sigma(t.to(scores.device)).double().view(-1, 1)

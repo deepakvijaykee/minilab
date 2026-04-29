@@ -201,6 +201,7 @@ class Trainer:
         model = model.to(self.device)
         if self.config.resume_from:
             model = self._load_model_for_resume(model)
+        unwrap_model(model).set_qk_clip_recording(self.config.qk_clip_threshold > 0)
         if self.config.compile:
             model = torch.compile(model)
         return model
@@ -574,25 +575,11 @@ def conditional_q_sample(fwd, x_0, t, loss_mask, valid_mask=None):
 
 
 def model_aux_loss(model):
-    model = unwrap_model(model)
-    require(isinstance(model, BaseModel), "auxiliary loss must be declared by the BaseModel")
-    return model.auxiliary_loss()
+    return unwrap_model(model).auxiliary_loss()
 
 
 def commit_post_optimizer_updates(model, qk_clip_threshold, qk_clip_balance):
-    model = unwrap_model(model)
-    require(isinstance(model, BaseModel), "post-optimizer updates must be declared by the BaseModel")
-    model.post_optimizer_step(qk_clip_threshold, qk_clip_balance)
-
-
-def commit_moe_router_updates(model):
-    commit_post_optimizer_updates(model, 0.0, 0.5)
-
-
-def commit_qk_clip_updates(model, threshold, balance=0.5):
-    if threshold <= 0:
-        return
-    commit_post_optimizer_updates(model, threshold, balance)
+    unwrap_model(model).post_optimizer_step(qk_clip_threshold, qk_clip_balance)
 
 
 def _validate_diffusion_trainer_contract(model, forward_process):

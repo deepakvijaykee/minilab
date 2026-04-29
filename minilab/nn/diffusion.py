@@ -97,6 +97,10 @@ class DiffusionBlock(nn.Module):
         if qk_clip_threshold > 0 and self.attention_name in QK_CLIP_ATTENTIONS:
             self.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
 
+    def set_qk_clip_recording(self, enabled):
+        if self.attention_name in QK_CLIP_ATTENTIONS:
+            self.attn.set_qk_clip_recording(enabled)
+
 
 def diffusion_blocks_auxiliary_loss(blocks, reference):
     loss = reference.sum() * 0.0

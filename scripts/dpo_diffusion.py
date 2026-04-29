@@ -13,7 +13,11 @@ from minilab.diffusion import ForwardProcess
 from minilab.generation import infill
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
-from common import DIFFUSION_MODEL_CHOICES, load_diffusion_model_checkpoint
+from common import (
+    DIFFUSION_MODEL_CHOICES,
+    load_diffusion_model_checkpoint,
+    require_checkpoint_path,
+)
 
 
 DATASETS = {"hh-rlhf": load_hh_rlhf_diffusion, "ultrafeedback": load_ultrafeedback_diffusion}
@@ -39,8 +43,8 @@ args = p.parse_args()
 set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
+model_path = require_checkpoint_path(args.checkpoint, args.resume_from, "Diffusion DPO")
 ref_path = resolve_reference_path(args.checkpoint, args.resume_from, "Diffusion DPO")
-model_path = args.resume_from or args.checkpoint
 validate_checkpoint_tokenizer(model_path, tok)
 validate_checkpoint_tokenizer(ref_path, tok)
 

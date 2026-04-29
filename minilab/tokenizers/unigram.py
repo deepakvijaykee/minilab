@@ -15,6 +15,7 @@ import math
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
+from minilab.tokenizers._state import require_tokenizer_state
 
 
 @register_tokenizer("unigram")
@@ -204,6 +205,19 @@ class UnigramTokenizer(BaseTokenizer):
         return {"type": "unigram", "token_to_id": self.token_to_id, "scores": self.scores}
 
     def _set_state(self, state):
+        require_tokenizer_state(state, "Unigram", "unigram", ("token_to_id", "scores"))
+        require(all(type(token) is str and token for token in state["token_to_id"]), (
+            "Unigram tokenizer state tokens must be non-empty strings"
+        ))
+        require(all(type(idx) is int and idx >= 0 for idx in state["token_to_id"].values()), (
+            "Unigram tokenizer state ids must be non-negative integers"
+        ))
+        require(all(type(token) is str and token for token in state["scores"]), (
+            "Unigram tokenizer state score keys must be non-empty strings"
+        ))
+        require(all(type(score) in (int, float) and math.isfinite(score) for score in state["scores"].values()), (
+            "Unigram tokenizer state scores must be finite numbers"
+        ))
         self.token_to_id = state["token_to_id"]
         require(self.UNK in self.token_to_id, f"Unigram tokenizer state is missing {self.UNK}")
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}
