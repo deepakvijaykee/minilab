@@ -1,6 +1,6 @@
 MOE_FFNS = {
     "moe", "switch_moe", "mixtral_moe", "expert_choice_moe",
-    "deepseek_moe", "aux_free_moe", "base_moe", "gemma4_moe",
+    "deepseek_moe", "qwen3_next_moe", "aux_free_moe", "base_moe", "gemma4_moe",
 }
 
 TOP_ONE_MOE_FFNS = {"switch_moe", "base_moe"}
@@ -31,6 +31,12 @@ QK_CLIP_ATTENTIONS = {
 
 
 def resolve_deepseek_v4_attention(attention, block_id):
+    """Resolve compressed-attention schedule aliases.
+
+    The `deepseek_v4*` names are compatibility presets for a compact
+    DeepSeek-V4-style CSA/HCA schedule. They do not imply checkpoint-compatible
+    official kernels or an exact serving cache layout.
+    """
     if attention == "deepseek_v4_flash":
         return "sliding_window" if block_id < 2 else interleaved_csa_hca(block_id)
     if attention in {"deepseek_v4", "deepseek_v4_pro"}:

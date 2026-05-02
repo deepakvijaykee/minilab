@@ -1,3 +1,6 @@
+import hashlib
+import random
+import re
 from pathlib import Path
 
 import torch
@@ -5,6 +8,10 @@ from torch.utils.data import Dataset, Sampler
 
 from minilab.checks import require
 from minilab.tasks.gsm8k import parse_gold_answer, prompt_parts
+
+_TEXT8_TRAIN_CHARS = 90_000_000
+_TEXT8_VALIDATION_CHARS = 5_000_000
+_TEXT8_TEST_CHARS = 5_000_000
 
 
 def load_dataset(*args, **kwargs):
@@ -60,16 +67,10 @@ class SFTDataset(Dataset):
             require(len(p) > 0, "SFT example has empty prompt")
             require(len(r) > 0, "SFT example has empty response")
             prompt_len = min(len(p), seq_len - 1)
-            full = (p[:prompt_len] + r)[:seq_len]
-
-            input_ids = full + [0] * (seq_len - len(full))
-            labels = [-100] * seq_len
-            for i in range(prompt_len - 1, len(full) - 1):
-                labels[i] = full[i + 1]
 
             self.data.append({
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "labels": torch.tensor(labels, dtype=torch.long),
+                "input_ids": _pack(p, r, prompt_len, seq_len),
+                "labels": _labels(p, r, prompt_len, seq_len),
             })
         require(self.data, "SFTDataset received no examples")
 
@@ -97,22 +98,12 @@ class DiffusionSFTDataset(Dataset):
             require(len(p) > 0, "Diffusion SFT example has empty prompt")
             require(len(r) > 0, "Diffusion SFT example has empty response")
             prompt_len = min(len(p), seq_len - 1)
-            full = (p[:prompt_len] + r)[:seq_len]
-            response_start = prompt_len
-            require(len(full) > response_start, "Diffusion SFT example has no response tokens after truncation")
-
-            input_ids = full + [0] * (seq_len - len(full))
-            loss_mask = [False] * seq_len
-            valid_mask = [False] * seq_len
-            for i in range(response_start, len(full)):
-                loss_mask[i] = True
-            for i in range(len(full)):
-                valid_mask[i] = True
+            input_ids, loss_mask, valid_mask = _diffusion_pack(p, r, prompt_len, seq_len)
 
             self.data.append({
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "loss_mask": torch.tensor(loss_mask, dtype=torch.bool),
-                "valid_mask": torch.tensor(valid_mask, dtype=torch.bool),
+                "input_ids": input_ids,
+                "loss_mask": loss_mask,
+                "valid_mask": valid_mask,
             })
         require(self.data, "DiffusionSFTDataset received no examples")
 
@@ -262,7 +253,11 @@ class PromptDataset(Dataset):
         self.data = []
         self.prompt_lens = []
         for ex in examples:
+            require("ids" in ex, "PromptDataset example is missing ids")
             ids = ex["ids"]
+            require(type(ids) is list and all(type(token_id) is int and token_id >= 0 for token_id in ids), (
+                "PromptDataset ids must be a list of non-negative integer token ids"
+            ))
             require(len(ids) > 0, "PromptDataset example has empty prompt")
             require(len(ids) <= seq_len, f"prompt len {len(ids)} exceeds seq_len {seq_len}")
             self.prompt_lens.append(len(ids))
@@ -342,14 +337,29 @@ def _hh_rlhf_examples(max_examples):
     return examples
 
 
-def load_text8(tokenizer, seq_len, mode="lm"):
+def load_text8(tokenizer, seq_len, split="train", mode="lm"):
     ds = load_dataset("afmck/text8", split="train")
-    text = ds[0]["text"]
+    text = text8_standard_split(ds[0]["text"], split)
     return prepare_dataset(text, tokenizer, seq_len, mode)
 
 
-def load_wikitext(tokenizer, seq_len, max_examples=50000, mode="lm"):
-    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
+def text8_standard_split(text, split):
+    require(split in {"train", "validation", "test"}, "text8 split must be 'train', 'validation', or 'test'")
+    train_end = _TEXT8_TRAIN_CHARS
+    validation_end = train_end + _TEXT8_VALIDATION_CHARS
+    test_end = validation_end + _TEXT8_TEST_CHARS
+    require(len(text) >= test_end, (
+        f"text8 corpus must contain at least {test_end} characters for the standard split, got {len(text)}"
+    ))
+    if split == "train":
+        return text[:train_end]
+    if split == "validation":
+        return text[train_end:validation_end]
+    return text[validation_end:test_end]
+
+
+def load_wikitext(tokenizer, seq_len, split="train", max_examples=50000, mode="lm"):
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
     texts = [t for t in ds["text"][:_example_limit(max_examples, len(ds))] if len(t) > 50]
     combined = "\n".join(texts)
     return prepare_dataset(combined, tokenizer, seq_len, mode)
@@ -521,3 +531,318 @@ def prepare_dataset(text, tokenizer, seq_len, mode="lm"):
 
 def load_text(path):
     return Path(path).read_text()
+
+
+def normalize_text_for_dedup(text):
+    return " ".join(text.split()).lower()
+
+
+def dedupe_texts(texts):
+    seen = set()
+    kept = []
+    for text in texts:
+        key = normalize_text_for_dedup(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(text)
+    return kept
+
+
+def curate_texts(texts, min_chars=1, max_chars=0, min_words=0, max_words=0, dedupe=True):
+    require(min_chars >= 0, "min_chars must be >= 0")
+    require(max_chars >= 0, "max_chars must be >= 0")
+    require(min_words >= 0, "min_words must be >= 0")
+    require(max_words >= 0, "max_words must be >= 0")
+    require(max_chars == 0 or max_chars >= min_chars, "max_chars must be 0 or >= min_chars")
+    require(max_words == 0 or max_words >= min_words, "max_words must be 0 or >= min_words")
+
+    kept = []
+    for text in texts:
+        words = text.split()
+        if len(text) < min_chars:
+            continue
+        if max_chars and len(text) > max_chars:
+            continue
+        if len(words) < min_words:
+            continue
+        if max_words and len(words) > max_words:
+            continue
+        kept.append(text)
+    return dedupe_texts(kept) if dedupe else kept
+
+
+def mix_text_sources(sources, weights, max_examples, seed=0):
+    require(len(sources) == len(weights), "sources and weights must have the same length")
+    require(len(sources) > 0, "mix_text_sources requires at least one source")
+    require(max_examples > 0, "max_examples must be > 0")
+    require(all(w > 0 for w in weights), "source weights must be > 0")
+    rng = random.Random(seed)
+    pools = [list(src) for src in sources]
+    for pool in pools:
+        rng.shuffle(pool)
+
+    out = []
+    while len(out) < max_examples and any(pools):
+        active = [i for i, pool in enumerate(pools) if pool]
+        active_weights = [weights[i] for i in active]
+        chosen = rng.choices(active, weights=active_weights, k=1)[0]
+        out.append(pools[chosen].pop())
+    return out
+
+
+def text_curation_report(texts):
+    texts = list(texts)
+    chars = [len(text) for text in texts]
+    words = [len(text.split()) for text in texts]
+    total_chars = sum(chars)
+    total_words = sum(words)
+    n = len(texts)
+    return {
+        "examples": n,
+        "characters": total_chars,
+        "words": total_words,
+        "mean_characters": total_chars / n if n else 0.0,
+        "mean_words": total_words / n if n else 0.0,
+    }
+
+
+def line_repetition_fraction(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return 0.0
+    return (len(lines) - len(set(lines))) / len(lines)
+
+
+def ngram_repetition_fraction(text, n=5):
+    require(n > 0, "n must be > 0")
+    words = re.findall(r"\w+", normalize_text_for_dedup(text))
+    if len(words) < n:
+        return 0.0
+    grams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
+    return (len(grams) - len(set(grams))) / len(grams)
+
+
+def text_quality_stats(text):
+    non_space = sum(not ch.isspace() for ch in text)
+    letters = sum(ch.isalpha() for ch in text)
+    digits = sum(ch.isdigit() for ch in text)
+    words = re.findall(r"\w+", text)
+    return {
+        "characters": len(text),
+        "words": len(words),
+        "alpha_fraction": letters / non_space if non_space else 0.0,
+        "digit_fraction": digits / non_space if non_space else 0.0,
+        "line_repetition_fraction": line_repetition_fraction(text),
+        "ngram_repetition_fraction": ngram_repetition_fraction(text),
+    }
+
+
+def quality_filter_texts(
+    texts,
+    min_chars=200,
+    min_words=40,
+    max_repeated_line_fraction=0.3,
+    max_repeated_ngram_fraction=1.0,
+    min_alpha_fraction=0.55,
+):
+    """FineWeb/DCLM-style lightweight quality gate for raw web text."""
+    require(min_chars >= 0, "min_chars must be >= 0")
+    require(min_words >= 0, "min_words must be >= 0")
+    require(0.0 <= max_repeated_line_fraction <= 1.0, (
+        "max_repeated_line_fraction must be in [0, 1]"
+    ))
+    require(0.0 <= max_repeated_ngram_fraction <= 1.0, (
+        "max_repeated_ngram_fraction must be in [0, 1]"
+    ))
+    require(0.0 <= min_alpha_fraction <= 1.0, "min_alpha_fraction must be in [0, 1]")
+    kept = []
+    for text in texts:
+        stats = text_quality_stats(text)
+        if stats["characters"] < min_chars:
+            continue
+        if stats["words"] < min_words:
+            continue
+        if stats["alpha_fraction"] < min_alpha_fraction:
+            continue
+        if stats["line_repetition_fraction"] > max_repeated_line_fraction:
+            continue
+        if stats["ngram_repetition_fraction"] > max_repeated_ngram_fraction:
+            continue
+        kept.append(text)
+    return kept
+
+
+def minhash_signature(text, num_hashes=64, shingle_size=5):
+    require(num_hashes > 0, "num_hashes must be > 0")
+    require(shingle_size > 0, "shingle_size must be > 0")
+    words = re.findall(r"\w+", normalize_text_for_dedup(text))
+    require(words, "minhash_signature requires at least one token")
+    if len(words) < shingle_size:
+        shingles = {" ".join(words)}
+    else:
+        shingles = {" ".join(words[i : i + shingle_size]) for i in range(len(words) - shingle_size + 1)}
+    sig = []
+    for seed in range(num_hashes):
+        sig.append(min(_stable_hash(f"{seed}:{shingle}") for shingle in shingles))
+    return tuple(sig)
+
+
+def dedupe_texts_minhash(texts, threshold=0.8, num_hashes=64, shingle_size=5):
+    """Near-deduplicate texts using MinHash-estimated Jaccard similarity."""
+    require(0.0 <= threshold <= 1.0, "threshold must be in [0, 1]")
+    kept = []
+    signatures = []
+    for text in texts:
+        sig = minhash_signature(text, num_hashes=num_hashes, shingle_size=shingle_size)
+        duplicate = False
+        for prev_sig in signatures:
+            sim = sum(a == b for a, b in zip(sig, prev_sig, strict=True)) / num_hashes
+            if sim >= threshold:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        kept.append(text)
+        signatures.append(sig)
+    return kept
+
+
+def minhash_lsh_buckets(signatures, bands=8):
+    signatures = list(signatures)
+    require(signatures, "minhash_lsh_buckets requires at least one signature")
+    require(bands > 0, "bands must be > 0")
+    width = len(signatures[0])
+    require(width > 0, "signatures must be non-empty")
+    require(width % bands == 0, "signature length must be divisible by bands")
+    rows = width // bands
+    buckets = {}
+    for idx, sig in enumerate(signatures):
+        require(len(sig) == width, "all signatures must have the same length")
+        for band in range(bands):
+            start = band * rows
+            key = (band, tuple(sig[start : start + rows]))
+            buckets.setdefault(key, []).append(idx)
+    return buckets
+
+
+def dedupe_texts_minhash_lsh(texts, threshold=0.8, num_hashes=64, shingle_size=5, bands=8):
+    """Near-deduplicate texts with MinHash LSH candidate pruning."""
+    require(0.0 <= threshold <= 1.0, "threshold must be in [0, 1]")
+    require(bands > 0, "bands must be > 0")
+    require(num_hashes % bands == 0, "num_hashes must be divisible by bands")
+    kept = []
+    signatures = []
+    buckets = {}
+    rows = num_hashes // bands
+    for text in texts:
+        sig = minhash_signature(text, num_hashes=num_hashes, shingle_size=shingle_size)
+        candidates = set()
+        for band in range(bands):
+            key = (band, sig[band * rows : (band + 1) * rows])
+            if key in buckets:
+                candidates.update(buckets[key])
+        duplicate = False
+        for prev_idx in candidates:
+            prev_sig = signatures[prev_idx]
+            sim = sum(a == b for a, b in zip(sig, prev_sig, strict=True)) / num_hashes
+            if sim >= threshold:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        kept_idx = len(kept)
+        kept.append(text)
+        signatures.append(sig)
+        for band in range(bands):
+            key = (band, sig[band * rows : (band + 1) * rows])
+            buckets.setdefault(key, []).append(kept_idx)
+    return kept
+
+
+def contamination_report(train_texts, eval_texts, threshold=0.8, num_hashes=64, shingle_size=5):
+    require(0.0 <= threshold <= 1.0, "threshold must be in [0, 1]")
+    train_texts = list(train_texts)
+    eval_texts = list(eval_texts)
+    eval_sigs = [minhash_signature(text, num_hashes, shingle_size) for text in eval_texts]
+    matches = []
+    for train_idx, text in enumerate(train_texts):
+        sig = minhash_signature(text, num_hashes, shingle_size)
+        for eval_idx, eval_sig in enumerate(eval_sigs):
+            sim = sum(a == b for a, b in zip(sig, eval_sig, strict=True)) / num_hashes
+            if sim >= threshold:
+                matches.append({"train_index": train_idx, "eval_index": eval_idx, "similarity": sim})
+    return {
+        "train_examples": len(train_texts),
+        "eval_examples": len(eval_sigs),
+        "matches": matches,
+        "contaminated_train_examples": len({m["train_index"] for m in matches}),
+    }
+
+
+def source_mixture_report(sources, weights):
+    require(len(sources) == len(weights), "sources and weights must have the same length")
+    require(len(sources) > 0, "source_mixture_report requires at least one source")
+    require(all(w > 0 for w in weights), "source weights must be > 0")
+    total_weight = sum(weights)
+    rows = []
+    for i, (source, weight) in enumerate(zip(sources, weights, strict=True)):
+        texts = list(source)
+        rows.append({
+            "source": i,
+            "examples": len(texts),
+            "weight": weight,
+            "target_fraction": weight / total_weight,
+            "words": sum(len(text.split()) for text in texts),
+        })
+    return rows
+
+
+def allocate_source_counts(weights, max_examples):
+    require(max_examples > 0, "max_examples must be > 0")
+    require(len(weights) > 0, "weights must be non-empty")
+    require(all(w > 0 for w in weights), "source weights must be > 0")
+    total = sum(weights)
+    raw = [max_examples * w / total for w in weights]
+    counts = [int(x) for x in raw]
+    remaining = max_examples - sum(counts)
+    order = sorted(range(len(weights)), key=lambda i: raw[i] - counts[i], reverse=True)
+    for i in order[:remaining]:
+        counts[i] += 1
+    return counts
+
+
+def mix_text_sources_exact(sources, weights, max_examples, seed=0):
+    """Deterministic source mixture with exact quota allocation when capacity allows."""
+    require(len(sources) == len(weights), "sources and weights must have the same length")
+    require(len(sources) > 0, "mix_text_sources_exact requires at least one source")
+    require(max_examples > 0, "max_examples must be > 0")
+    require(all(w > 0 for w in weights), "source weights must be > 0")
+    rng = random.Random(seed)
+    pools = [list(src) for src in sources]
+    for pool in pools:
+        rng.shuffle(pool)
+    caps = [len(pool) for pool in pools]
+    counts = _allocate_counts_with_caps(weights, caps, max_examples)
+    out = []
+    for pool, count in zip(pools, counts, strict=True):
+        out.extend(pool[:count])
+    rng.shuffle(out)
+    return out
+
+
+def _stable_hash(text):
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest(), "big")
+
+
+def _allocate_counts_with_caps(weights, caps, max_examples):
+    counts = [min(count, cap) for count, cap in zip(allocate_source_counts(weights, max_examples), caps, strict=True)]
+    while sum(counts) < max_examples:
+        active = [i for i, cap in enumerate(caps) if counts[i] < cap]
+        if not active:
+            break
+        total_weight = sum(weights[i] for i in active)
+        target = {i: max_examples * weights[i] / total_weight for i in active}
+        chosen = max(active, key=lambda i: target[i] - counts[i])
+        counts[chosen] += 1
+    return counts

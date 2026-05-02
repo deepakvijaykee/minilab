@@ -9,11 +9,17 @@ from minilab.tokenizers import load_tokenizer
 from minilab.models.mdlm import MDLM, MDLMConfig
 from minilab.models.sedd import SEDD, SEDDConfig
 from minilab.models.d3pm import D3PM, D3PMConfig
-from minilab.data import load_tinystories
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
 from minilab.nn.architecture import MOE_FFNS
-from common import attention_uses_gqa, resolve_default
+from common import (
+    PRETRAIN_DATASET_CHOICES,
+    attention_uses_gqa,
+    load_pretrain_dataset,
+    load_pretrain_eval_dataset,
+    resolve_pretrain_max_examples,
+    resolve_default,
+)
 
 VARIANTS = [
     ("MDLM", MDLM, MDLMConfig, "cosine"),
@@ -24,6 +30,7 @@ VARIANTS = [
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
+p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
 p.add_argument("--dim", type=int, default=128)
 p.add_argument("--num-layers", type=int, default=4)
 p.add_argument("--num-heads", type=int, default=8)
@@ -35,7 +42,7 @@ p.add_argument("--num-experts", type=int, default=None)
 p.add_argument("--top-k-experts", type=int, default=None)
 p.add_argument("--max-steps", type=int, default=2000)
 p.add_argument("--batch-size", type=int, default=16)
-p.add_argument("--max-examples", type=int, default=10000)
+p.add_argument("--max-examples", type=int, default=None)
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
 if args.num_kv_heads is not None:
@@ -49,11 +56,12 @@ top_k_experts = resolve_default(args.top_k_experts, 2)
 
 tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size
-train_ds = load_tinystories(tok, args.seq_len, max_examples=args.max_examples, mode="diffusion")
-eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=1000, mode="diffusion")
+max_examples = resolve_pretrain_max_examples(args.dataset, args.max_examples, 10000)
+train_ds = load_pretrain_dataset(args.dataset, tok, args.seq_len, "train", max_examples, "diffusion")
+eval_ds = load_pretrain_eval_dataset(args.dataset, tok, args.seq_len, 1000, "diffusion")
 tc = TrainConfig(max_steps=args.max_steps, batch_size=args.batch_size, lr=3e-4,
                  log_every=args.max_steps, eval_every=0, save_every=0, seed=args.seed)
-sig = run_signature(tok, {"name": "tinystories", "split": "train", "max_examples": args.max_examples, "mode": "diffusion"}, args.seq_len)
+sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples, "mode": "diffusion"}, args.seq_len)
 
 results = []
 for name, cls, cfg_cls, schedule in VARIANTS:

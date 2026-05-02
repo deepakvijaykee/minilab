@@ -13,6 +13,8 @@ Algorithm (encoding):
 Used by: GPT-2/3/4, Llama, Mistral, RoBERTa
 """
 
+from collections import Counter
+
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
@@ -36,15 +38,12 @@ class BPETokenizer(BaseTokenizer):
         ids = list(text.encode("utf-8"))
 
         for i in range(num_merges):
-            counts: dict[tuple[int, int], int] = {}
-            for j in range(len(ids) - 1):
-                pair = (ids[j], ids[j + 1])
-                counts[pair] = counts.get(pair, 0) + 1
+            counts = Counter(zip(ids, ids[1:]))
 
             if not counts:
                 break
 
-            best = max(counts, key=counts.get)
+            best = max(counts, key=counts.__getitem__)
             new_id = 256 + i
             self.merges[best] = new_id
             self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
@@ -102,6 +101,7 @@ class BPETokenizer(BaseTokenizer):
             ))
             require(type(value) is int and value >= 0, "BPE tokenizer merge values must be token ids")
             merges[(int(parts[0]), int(parts[1]))] = value
+        require(len(set(merges.values())) == len(merges), "BPE tokenizer merge values must be unique")
 
         vocab: dict[int, bytes] = {}
         for key, value in state["vocab"].items():
@@ -110,7 +110,23 @@ class BPETokenizer(BaseTokenizer):
                 "BPE tokenizer vocab values must be byte lists"
             ))
             vocab[int(key)] = bytes(value)
-        require(vocab, "BPE tokenizer state vocab must be non-empty")
+        require(sorted(vocab) == list(range(len(vocab))), "BPE tokenizer vocab ids must be contiguous from 0")
+        require(len(vocab) >= 256, "BPE tokenizer state vocab must include byte-level base vocabulary")
+        require(all(i in vocab and vocab[i] == bytes([i]) for i in range(256)), (
+            "BPE tokenizer state must include the byte-level base vocabulary"
+        ))
+        require(set(vocab) == set(range(256)) | set(merges.values()), (
+            "BPE tokenizer vocab ids must be the byte-level base plus merge outputs"
+        ))
+        require(all(v >= 256 and a < v and b < v for (a, b), v in merges.items()), (
+            "BPE tokenizer merge outputs must be new ids built from earlier ids"
+        ))
+        require(all(a in vocab and b in vocab and v in vocab for (a, b), v in merges.items()), (
+            "BPE tokenizer merge ids must refer to vocabulary ids"
+        ))
+        require(all(vocab[v] == vocab[a] + vocab[b] for (a, b), v in merges.items()), (
+            "BPE tokenizer merge output bytes must match the merged input bytes"
+        ))
         self.merges = merges
         self.vocab = vocab
 

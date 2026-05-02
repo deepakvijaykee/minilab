@@ -102,54 +102,11 @@ def log_linear_alpha_derivative(t):
     return torch.full_like(t, -(1 - 1e-3))
 
 
-class ForwardProcess:
-    """Absorbing noise: each token kept with prob alpha(t), replaced with mask_token_id otherwise."""
-
-    process_type = "absorbing"
-
-    def __init__(self, mask_token_id, num_timesteps=1000, schedule="cosine"):
-        require(mask_token_id >= 0, "mask_token_id must be >= 0")
-        require(num_timesteps > 1, "num_timesteps must be > 1")
-        self.mask_token_id = mask_token_id
-        self.num_timesteps = num_timesteps
-        self.schedule = schedule
-        self.alpha = get_scheduler(schedule)(num_timesteps)
-        self._validate_alpha_schedule()
-
+class _ScheduledForwardProcessMixin:
     def save(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "process_type": self.process_type,
-            "mask_token_id": self.mask_token_id,
-            "num_timesteps": self.num_timesteps,
-            "schedule": self.schedule,
-        }))
-
-    @classmethod
-    def load(cls, path):
-        s = json.loads(Path(path).read_text())
-        require(isinstance(s, dict), "Forward process state must be a JSON object")
-        required = {"process_type", "mask_token_id", "num_timesteps", "schedule"}
-        missing = required - set(s)
-        unknown = set(s) - required
-        require(not missing, f"Missing forward process fields: {sorted(missing)}")
-        require(not unknown, f"Unknown forward process fields: {sorted(unknown)}")
-        require(s["process_type"] == cls.process_type, (
-            f"Unsupported forward process type: {s['process_type']}"
-        ))
-        return cls(s["mask_token_id"], num_timesteps=s["num_timesteps"], schedule=s["schedule"])
-
-    def q_sample(self, x_0, t):
-        B, T = x_0.shape
-        if self.schedule in _SCHEDULE_ALPHA_FUNCTIONS:
-            alpha_t = self.get_alpha_continuous(t).view(B, 1)
-        else:
-            idx = self.time_index(t)
-            alpha_t = self.alpha.to(x_0.device)[idx].view(B, 1)
-        keep = torch.rand(B, T, device=x_0.device) < alpha_t
-        z_t = torch.where(keep, x_0, self.mask_token_id)
-        return z_t, ~keep
+        path.write_text(json.dumps(self.to_state()))
 
     def sample_time(self, batch_size, device, mode="continuous"):
         require(batch_size > 0, f"batch_size must be > 0, got {batch_size}")
@@ -185,6 +142,62 @@ class ForwardProcess:
         ))
         return alpha
 
+    def time_index(self, t, min_index=0, max_index=None):
+        """Map normalized times to schedule indices using nearest-grid lookup."""
+        if max_index is None:
+            max_index = self.num_timesteps
+        require(0 <= min_index <= max_index <= self.num_timesteps, (
+            f"time index clamp must satisfy 0 <= min_index <= max_index <= {self.num_timesteps}, "
+            f"got min_index={min_index}, max_index={max_index}"
+        ))
+        return (t * self.num_timesteps).round().long().clamp(min=min_index, max=max_index)
+
+
+class ForwardProcess(_ScheduledForwardProcessMixin):
+    """Absorbing noise: each token kept with prob alpha(t), replaced with mask_token_id otherwise."""
+
+    process_type = "absorbing"
+
+    def __init__(self, mask_token_id, num_timesteps=1000, schedule="cosine"):
+        require(mask_token_id >= 0, "mask_token_id must be >= 0")
+        require(num_timesteps > 1, "num_timesteps must be > 1")
+        self.mask_token_id = mask_token_id
+        self.num_timesteps = num_timesteps
+        self.schedule = schedule
+        self.alpha = get_scheduler(schedule)(num_timesteps)
+        self._validate_alpha_schedule()
+
+    def to_state(self):
+        return {
+            "process_type": self.process_type,
+            "mask_token_id": self.mask_token_id,
+            "num_timesteps": self.num_timesteps,
+            "schedule": self.schedule,
+        }
+
+    @classmethod
+    def load(cls, path):
+        s = _load_process_state(path, cls.process_type, {"mask_token_id"})
+        require(type(s["mask_token_id"]) is int and s["mask_token_id"] >= 0, (
+            "Forward process mask_token_id must be a non-negative integer"
+        ))
+        return cls(s["mask_token_id"], num_timesteps=s["num_timesteps"], schedule=s["schedule"])
+
+    def q_sample(self, x_0, t):
+        B, T = x_0.shape
+        if self.schedule in _SCHEDULE_ALPHA_FUNCTIONS:
+            alpha_t = self.get_alpha_continuous(t).view(B, 1)
+        else:
+            idx = self.time_index(t)
+            alpha_t = self.alpha.to(x_0.device)[idx].view(B, 1)
+        keep = torch.rand(B, T, device=x_0.device) < alpha_t
+        z_t = torch.where(keep, x_0, self.mask_token_id)
+        return z_t, ~keep
+
+    def has_terminal_mask_prior(self):
+        zero = torch.zeros((), dtype=self.alpha.dtype, device=self.alpha.device)
+        return bool(torch.isclose(self.alpha[-1], zero).item())
+
     def get_sigma(self, t):
         """Continuous-time CTMC noise level for absorbing diffusion, sigma(t) = -log alpha(t)."""
         return -self.get_alpha_continuous(t).clamp(min=1e-12).log()
@@ -204,20 +217,6 @@ class ForwardProcess:
         ))
         return derivative
 
-    def time_index(self, t, min_index=0, max_index=None):
-        """Map normalized times to schedule indices using nearest-grid lookup."""
-        if max_index is None:
-            max_index = self.num_timesteps
-        require(0 <= min_index <= max_index <= self.num_timesteps, (
-            f"time index clamp must satisfy 0 <= min_index <= max_index <= {self.num_timesteps}, "
-            f"got min_index={min_index}, max_index={max_index}"
-        ))
-        return (t * self.num_timesteps).round().long().clamp(min=min_index, max=max_index)
-
-    def has_terminal_mask_prior(self):
-        zero = torch.zeros((), dtype=self.alpha.dtype, device=self.alpha.device)
-        return bool(torch.isclose(self.alpha[-1], zero).item())
-
     def get_sigma_derivative(self, t):
         """Exact d sigma / dt used by SEDD's score-entropy integral."""
         alpha_t = self.get_alpha_continuous(t).clamp(min=1e-12)
@@ -231,16 +230,119 @@ class ForwardProcess:
         return -self.get_alpha_derivative(t) / (1 - alpha_t).clamp(min=1e-5)
 
     def _validate_alpha_schedule(self):
-        require(self.alpha.dim() == 1 and self.alpha.numel() == self.num_timesteps + 1, (
-            f"schedule '{self.schedule}' must return {self.num_timesteps + 1} alpha values"
+        _validate_alpha_schedule(self.alpha, self.num_timesteps, self.schedule)
+
+
+class UniformForwardProcess(_ScheduledForwardProcessMixin):
+    """Categorical corruption: alpha(t) keeps x_0, otherwise sample from the uniform vocabulary prior."""
+
+    process_type = "uniform"
+
+    def __init__(self, vocab_size, num_timesteps=1000, schedule="cosine"):
+        require(vocab_size > 1, "vocab_size must be > 1")
+        require(num_timesteps > 1, "num_timesteps must be > 1")
+        self.vocab_size = vocab_size
+        self.num_timesteps = num_timesteps
+        self.schedule = schedule
+        self.alpha = get_scheduler(schedule)(num_timesteps)
+        _validate_alpha_schedule(self.alpha, num_timesteps, schedule)
+
+    def to_state(self):
+        return {
+            "process_type": self.process_type,
+            "vocab_size": self.vocab_size,
+            "num_timesteps": self.num_timesteps,
+            "schedule": self.schedule,
+        }
+
+    @classmethod
+    def load(cls, path):
+        s = _load_process_state(path, cls.process_type, {"vocab_size"})
+        require(type(s["vocab_size"]) is int and s["vocab_size"] > 1, (
+            "Uniform forward process vocab_size must be an integer > 1"
         ))
-        require(torch.isfinite(self.alpha).all(), f"schedule '{self.schedule}' returned non-finite alpha values")
-        require(((0 <= self.alpha) & (self.alpha <= 1)).all(), (
-            f"schedule '{self.schedule}' alpha values must be probabilities in [0, 1]"
-        ))
-        one = torch.ones((), dtype=self.alpha.dtype, device=self.alpha.device)
-        require(torch.isclose(self.alpha[0], one), f"schedule '{self.schedule}' must start at alpha[0] = 1")
-        require(self.alpha[-1] < self.alpha[0], f"schedule '{self.schedule}' must add noise over time")
-        require((self.alpha[1:] <= self.alpha[:-1]).all(), (
-            f"schedule '{self.schedule}' alpha values must be monotonically non-increasing"
-        ))
+        return cls(s["vocab_size"], num_timesteps=s["num_timesteps"], schedule=s["schedule"])
+
+    def q_sample(self, x_0, t):
+        require(((0 <= x_0) & (x_0 < self.vocab_size)).all(), "uniform diffusion tokens are outside the vocabulary")
+        B, T = x_0.shape
+        alpha_t = self.alpha_at(t).to(x_0.device).view(B, 1)
+        keep = torch.rand(B, T, device=x_0.device) < alpha_t
+        noise = torch.randint(self.vocab_size, x_0.shape, device=x_0.device)
+        return torch.where(keep, x_0, noise), ~keep
+
+    def q_probs(self, x_0, t):
+        require(((0 <= x_0) & (x_0 < self.vocab_size)).all(), "uniform diffusion tokens are outside the vocabulary")
+        B, T = x_0.shape
+        alpha_t = self.alpha_at(t).to(x_0.device).view(B, 1, 1)
+        probs = torch.full((*x_0.shape, self.vocab_size), 1.0, device=x_0.device, dtype=alpha_t.dtype)
+        probs = probs * ((1.0 - alpha_t) / self.vocab_size)
+        probs.scatter_add_(-1, x_0.unsqueeze(-1), alpha_t.expand(B, T, 1))
+        return probs
+
+    def marginal_transition_matrix(self, t):
+        """Return the cumulative uniform corruption kernel q(z_t | x_0).
+
+        This is the D3PM-style forward marginal for the uniform corruption
+        family, not a learned reverse process or one-step posterior.
+        """
+        alpha_t = self.alpha_at(t).view(-1, 1, 1)
+        eye = torch.eye(self.vocab_size, device=t.device, dtype=alpha_t.dtype).unsqueeze(0)
+        uniform = torch.full_like(eye, 1.0 / self.vocab_size)
+        return alpha_t * eye + (1.0 - alpha_t) * uniform
+
+    def transition_matrix(self, t):
+        return self.marginal_transition_matrix(t)
+
+    def has_terminal_mask_prior(self):
+        return False
+
+
+def load_forward_process(path):
+    s = json.loads(Path(path).read_text())
+    require(isinstance(s, dict), "Forward process state must be a JSON object")
+    require("process_type" in s, "Forward process state is missing required field: process_type")
+    process_type = s["process_type"]
+    if process_type == ForwardProcess.process_type:
+        return ForwardProcess.load(path)
+    if process_type == UniformForwardProcess.process_type:
+        return UniformForwardProcess.load(path)
+    raise ValueError(f"Unsupported forward process type: {process_type!r}")
+
+
+def forward_process_signature(forward_process):
+    return json.dumps(forward_process.to_state(), sort_keys=True)
+
+
+def _validate_alpha_schedule(alpha, num_timesteps, schedule):
+    require(alpha.dim() == 1 and alpha.numel() == num_timesteps + 1, (
+        f"schedule '{schedule}' must return {num_timesteps + 1} alpha values"
+    ))
+    require(torch.isfinite(alpha).all(), f"schedule '{schedule}' returned non-finite alpha values")
+    require(((0 <= alpha) & (alpha <= 1)).all(), (
+        f"schedule '{schedule}' alpha values must be probabilities in [0, 1]"
+    ))
+    one = torch.ones((), dtype=alpha.dtype, device=alpha.device)
+    require(torch.isclose(alpha[0], one), f"schedule '{schedule}' must start at alpha[0] = 1")
+    require(alpha[-1] < alpha[0], f"schedule '{schedule}' must add noise over time")
+    require((alpha[1:] <= alpha[:-1]).all(), (
+        f"schedule '{schedule}' alpha values must be monotonically non-increasing"
+    ))
+
+
+def _load_process_state(path, process_type, extra_fields):
+    s = json.loads(Path(path).read_text())
+    require(isinstance(s, dict), "Forward process state must be a JSON object")
+    required = {"process_type", "num_timesteps", "schedule"} | set(extra_fields)
+    missing = required - set(s)
+    unknown = set(s) - required
+    require(not missing, f"Missing forward process fields: {sorted(missing)}")
+    require(not unknown, f"Unknown forward process fields: {sorted(unknown)}")
+    require(s["process_type"] == process_type, f"Unsupported forward process type: {s['process_type']}")
+    require(type(s["num_timesteps"]) is int and s["num_timesteps"] > 1, (
+        "Forward process num_timesteps must be an integer > 1"
+    ))
+    require(type(s["schedule"]) is str and s["schedule"], (
+        "Forward process schedule must be a non-empty string"
+    ))
+    return s

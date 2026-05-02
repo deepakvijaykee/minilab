@@ -6,11 +6,9 @@
 
 import argparse
 import torch
-from common import MODEL_CHOICES, load_model_checkpoint, reject_supplied, resolve_default
+from common import MODEL_CHOICES, build_lm_model, load_model_checkpoint, reject_supplied, resolve_default
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
-from minilab.models.gpt import GPT, GPTConfig
-from minilab.models.mamba import MambaConfig, MambaLM
 from minilab.data import load_alpaca
 from minilab.alignment import SFTTrainer
 from minilab.trainer import TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
@@ -43,8 +41,8 @@ require(not (args.checkpoint and args.resume_from), "SFT accepts --checkpoint or
 
 if args.resume_from or args.checkpoint:
     reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
-elif model_name != "gpt":
-    reject_supplied(args, ("num_heads",), "only applies to --model gpt")
+elif model_name in {"mamba", "mamba2"}:
+    reject_supplied(args, ("num_heads",), "only applies to --model gpt, hybrid, hymba, xlstm, or byte_latent")
 
 set_seed(args.seed)
 
@@ -63,14 +61,15 @@ elif args.checkpoint:
     model_name, model = load_model_checkpoint(args.checkpoint, args.model)
     print(f"Loaded {args.checkpoint} ({model_name}, {model.num_parameters():,} params)")
 else:
-    if model_name == "gpt":
-        config = GPTConfig(vocab_size=tok.vocab_size, dim=dim, num_layers=num_layers,
-                           num_heads=num_heads, max_seq_len=args.seq_len)
-        model = GPT(config)
-    else:
-        config = MambaConfig(vocab_size=tok.vocab_size, dim=dim, num_layers=num_layers,
-                             max_seq_len=args.seq_len)
-        model = MambaLM(config)
+    config_kwargs = {
+        "vocab_size": tok.vocab_size,
+        "dim": dim,
+        "num_layers": num_layers,
+        "max_seq_len": args.seq_len,
+    }
+    if model_name in {"gpt", "hybrid", "hymba", "xlstm", "byte_latent"}:
+        config_kwargs["num_heads"] = num_heads
+    model = build_lm_model(model_name, **config_kwargs)
     print(f"New model ({model.num_parameters():,} params)")
 
 ds = load_alpaca(tok, args.seq_len, max_examples=args.max_examples)

@@ -29,9 +29,10 @@ class SinusoidalTimeEmbedding(nn.Module):
         )
 
     def forward(self, t):
+        require(t.dim() in {1, 2}, "diffusion time tensor must have shape (batch,) or (batch, seq)")
         half = self.dim // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device).float() / half)
-        args = t[:, None] * freqs[None]
+        args = t.float().unsqueeze(-1) * freqs
         return self.mlp(torch.cat([args.sin(), args.cos()], dim=-1))
 
 
@@ -46,7 +47,14 @@ class AdaLN(nn.Module):
 
     def forward(self, x, cond):
         scale, shift = self.proj(cond).chunk(2, dim=-1)
-        return self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        if cond.dim() == 2:
+            scale = scale.unsqueeze(1)
+            shift = shift.unsqueeze(1)
+        elif cond.dim() == 3:
+            require(cond.shape[:2] == x.shape[:2], "token-wise diffusion conditioning must match x batch/seq")
+        else:
+            raise ValueError("diffusion conditioning must have shape (batch, dim) or (batch, seq, dim)")
+        return self.norm(x) * (1 + scale) + shift
 
 
 class DiffusionBlock(nn.Module):
@@ -86,8 +94,8 @@ class DiffusionBlock(nn.Module):
         else:
             self.ffn = get_ffn(ffn)(dim, ffn_hidden)
 
-    def forward(self, x, t_emb, freqs_cis=None):
-        x = x + self.attn(self.norm1(x, t_emb), freqs_cis=freqs_cis, is_causal=False)
+    def forward(self, x, t_emb, freqs_cis=None, attn_bias=None):
+        x = x + self.attn(self.norm1(x, t_emb), freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=False)
         x = x + self.ffn(self.norm2(x, t_emb))
         return x
 

@@ -4,6 +4,8 @@ from minilab.base import BaseModel, unwrap_model
 from minilab.checks import require
 from minilab.diffusion_sampling import (
     d3pm_reverse_timesteps,
+    dream_remask_step,
+    llada_transfer_counts,
     sample_categorical,
     sample_clean_logits,
     sample_logits,
@@ -79,7 +81,18 @@ def _fill_remaining_masks(model, z, mask_id, batch_size):
 
 
 @torch.no_grad()
-def generate(model, prompt_ids, max_new_tokens=100, temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0, stop_texts=None, tokenizer=None):
+def generate(
+    model,
+    prompt_ids,
+    max_new_tokens=100,
+    temperature=1.0,
+    top_k=50,
+    top_p=1.0,
+    repetition_penalty=1.0,
+    stop_texts=None,
+    tokenizer=None,
+    use_cache=True,
+):
     """Autoregressive sampling. temperature=0 for greedy.
     stop_texts: list of strings that trigger early stopping (batch_size=1 only, requires tokenizer)."""
     _require_eval_model(model, "generate")
@@ -96,8 +109,28 @@ def generate(model, prompt_ids, max_new_tokens=100, temperature=1.0, top_k=50, t
     model_core = _require_base_model(model, "generate")
     device = next(model.parameters()).device
     ids = prompt_ids.to(device)
+    if max_new_tokens == 0:
+        return ids
     max_ctx = model_core.config.max_seq_len
     prompt_len = ids.size(1)
+    can_use_cache = (
+        use_cache
+        and model_core.supports_kv_cache()
+        and prompt_len + max_new_tokens <= max_ctx
+    )
+    if can_use_cache:
+        return _generate_cached(
+            model_core,
+            ids,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            stop_texts,
+            tokenizer,
+            prompt_len,
+        )
 
     for _ in range(max_new_tokens):
         logits, _ = model(ids[:, -max_ctx:])
@@ -113,6 +146,35 @@ def generate(model, prompt_ids, max_new_tokens=100, temperature=1.0, top_k=50, t
             if any(s in tail for s in stop_texts):
                 break
 
+    return ids
+
+
+def _generate_cached(
+    model,
+    ids,
+    max_new_tokens,
+    temperature,
+    top_k,
+    top_p,
+    repetition_penalty,
+    stop_texts,
+    tokenizer,
+    prompt_len,
+):
+    logits, cache = model.forward_cached(ids)
+    for _ in range(max_new_tokens):
+        next_logits = logits[:, -1]
+        next_logits = _apply_repetition_penalty(next_logits, ids, repetition_penalty)
+        next_id = _sample_next_token(next_logits, temperature, top_k, top_p)
+        ids = torch.cat([ids, next_id], dim=1)
+
+        if stop_texts:
+            tail = tokenizer.decode(ids[0, prompt_len:].tolist())
+            if any(s in tail for s in stop_texts):
+                break
+        if ids.size(1) == prompt_len + max_new_tokens:
+            break
+        logits, cache = model.forward_cached(next_id, cache)
     return ids
 
 
@@ -269,8 +331,6 @@ def infill(model, fwd, tokens, mask_positions, num_steps=None, temperature=1.0):
     """Fill masked positions while keeping context fixed. Unique to diffusion models."""
     _require_eval_model(model, "infill")
     require(temperature >= 0, "temperature must be >= 0")
-    require(tokens.shape == mask_positions.shape, "tokens and mask_positions must have the same shape")
-    require(mask_positions.dtype == torch.bool, "mask_positions must be a bool tensor")
     parameterization = _reverse_parameterization(model)
     if num_steps is None:
         num_steps = min(128, fwd.num_timesteps)
@@ -288,6 +348,127 @@ def infill(model, fwd, tokens, mask_positions, num_steps=None, temperature=1.0):
     if parameterization == "d3pm_x0_logits":
         return _infill_d3pm(model, fwd, tokens, mask_positions, num_steps, temperature)
     raise ValueError(f"infill does not support reverse parameterization: {parameterization!r}")
+
+
+@register_sampler("semi_ar")
+@torch.no_grad()
+def sample_diffusion_semi_ar(
+    model,
+    fwd,
+    prompt_ids,
+    max_new_tokens,
+    block_size=16,
+    num_steps=None,
+    temperature=1.0,
+):
+    """Semi-autoregressive diffusion sampling by denoising masked blocks.
+
+    Each new block starts as [MASK] while all previous blocks are fixed context.
+    The block itself is denoised with the model-specific infill sampler, so the
+    reverse-process contract remains MDLM/SEDD/D3PM-specific.
+    """
+    _require_eval_model(model, "sample_diffusion_semi_ar")
+    model_config = _require_absorbing_forward_process(model, fwd, "sample_diffusion_semi_ar")
+    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    require(prompt_ids.dtype == torch.long, "prompt_ids must contain integer token ids")
+    require(max_new_tokens >= 0, "max_new_tokens must be >= 0")
+    require(block_size > 0, "block_size must be > 0")
+    require(temperature >= 0, "temperature must be >= 0")
+    require(prompt_ids.size(1) + max_new_tokens <= model_config.max_seq_len, (
+        f"semi-AR sampling supports at most {model_config.max_seq_len} tokens, "
+        f"got {prompt_ids.size(1) + max_new_tokens}"
+    ))
+
+    device = next(model.parameters()).device
+    tokens = prompt_ids.to(device)
+    context_mask = torch.zeros_like(tokens, dtype=torch.bool)
+    validate_infill_tokens(tokens, context_mask, model_config, "sample_diffusion_semi_ar")
+    if max_new_tokens == 0:
+        return tokens
+
+    remaining = max_new_tokens
+    mask_id = fwd.mask_token_id
+    while remaining > 0:
+        current = min(block_size, remaining)
+        block = torch.full((tokens.size(0), current), mask_id, device=device, dtype=torch.long)
+        tokens = torch.cat([tokens, block], dim=1)
+        mask_positions = torch.zeros_like(tokens, dtype=torch.bool)
+        mask_positions[:, -current:] = True
+        tokens = infill(model, fwd, tokens, mask_positions, num_steps=num_steps, temperature=temperature)
+        remaining -= current
+    return tokens
+
+
+@register_sampler("dream")
+@torch.no_grad()
+def sample_diffusion_dream(
+    model,
+    fwd,
+    prompt_ids,
+    max_new_tokens,
+    steps=None,
+    temperature=0.0,
+    top_p=1.0,
+    top_k=0,
+    alg="entropy",
+    alg_temp=0.0,
+):
+    """Dream-style masked generation from a prompt.
+
+    All generation slots start as [MASK]. Each reverse step predicts clean
+    tokens for the whole sequence and transfers a fixed share of still-masked
+    generation slots according to Dream's confidence policy.
+    """
+    _require_eval_model(model, "sample_diffusion_dream")
+    model_config = _require_sampler_contract(model, fwd, "clean_logits", "sample_diffusion_dream")
+    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    require(prompt_ids.dtype == torch.long, "prompt_ids must contain integer token ids")
+    require(max_new_tokens >= 0, "max_new_tokens must be >= 0")
+    require(temperature >= 0, "temperature must be >= 0")
+    require(0 < top_p <= 1, "top_p must be in (0, 1]")
+    require(top_k >= 0, "top_k must be >= 0")
+    require(alg in {"origin", "maskgit_plus", "topk_margin", "entropy"}, f"unknown Dream alg: {alg}")
+    require(alg_temp >= 0, "alg_temp must be >= 0")
+    if steps is None:
+        steps = max(1, max_new_tokens)
+    require(steps > 0, "steps must be > 0")
+    require(prompt_ids.size(1) + max_new_tokens <= model_config.max_seq_len, (
+        f"Dream sampling supports at most {model_config.max_seq_len} tokens, "
+        f"got {prompt_ids.size(1) + max_new_tokens}"
+    ))
+    device = next(model.parameters()).device
+    tokens = prompt_ids.to(device)
+    validate_infill_tokens(tokens, torch.zeros_like(tokens, dtype=torch.bool), model_config, "sample_diffusion_dream")
+    if max_new_tokens == 0:
+        return tokens
+
+    mask_id = fwd.mask_token_id
+    masked = torch.full((tokens.size(0), max_new_tokens), mask_id, device=device, dtype=torch.long)
+    x = torch.cat([tokens, masked], dim=1)
+    prompt_index = torch.zeros_like(x, dtype=torch.bool)
+    prompt_index[:, : tokens.size(1)] = True
+    mask_index = x == mask_id
+    transfer_counts = llada_transfer_counts(mask_index & (~prompt_index), steps)
+    timesteps = torch.linspace(1.0, 0.0, steps, device=device)
+    for i, t_now in enumerate(timesteps):
+        if not ((x == mask_id) & (~prompt_index)).any():
+            break
+        logits = model(x, t_now.expand(x.size(0)))
+        x, _, _ = dream_remask_step(
+            logits,
+            x,
+            mask_id,
+            transfer_counts[:, i],
+            prompt_index=prompt_index,
+            block_end=x.size(1),
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            alg=alg,
+            alg_temp=alg_temp,
+        )
+    require(not ((x == mask_id) & (~prompt_index)).any(), "Dream sampling left masked generation tokens")
+    return x
 
 
 def _require_base_model(model, context):
@@ -313,12 +494,14 @@ def _require_eval_model(model, context):
 
 
 def _require_sampler_contract(model, fwd, expected_parameterization, context):
-    actual = _reverse_parameterization(model, context)
+    model_core = _require_diffusion_model(model, context)
+    actual = model_core.reverse_parameterization
+    require(actual is not None, f"{context} requires model.reverse_parameterization")
     require(
         actual == expected_parameterization,
         f"{context} requires reverse_parameterization={expected_parameterization!r}, got {actual!r}",
     )
-    _require_absorbing_forward_process(model, fwd, context)
+    return _require_absorbing_forward_process(model, fwd, context)
 
 
 def _require_terminal_mask_prior(fwd, context):
@@ -332,6 +515,9 @@ def _require_absorbing_forward_process(model, fwd, context):
     require(fwd.process_type == "absorbing", f"{context} currently supports only the absorbing forward process")
     model = _require_diffusion_model(model, context)
     model_config = model.config
+    require(model.supports_unconditional_diffusion_sampling(), (
+        f"{context} requires a diffusion model that can score reverse steps without clean x_0 context"
+    ))
     require(
         model_config.mask_token_id == fwd.mask_token_id,
         f"{context} model and forward process must use the same mask_token_id",
@@ -363,9 +549,7 @@ def _infill_clean_logits(model, fwd, tokens, mask_positions, num_steps, temperat
         t_now = timesteps[i]
         predictions = sample_clean_logits(model(z, t_now.expand(B)), mask_id, temperature)
 
-        alpha_now = fwd.alpha_at(t_now.unsqueeze(0)).item()
-        alpha_next = fwd.alpha_at(timesteps[i + 1].unsqueeze(0)).item()
-        unmask_prob = (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
+        unmask_prob = _absorbing_unmask_probability(fwd, t_now, timesteps[i + 1])
 
         unmask = torch.rand_like(tokens, dtype=torch.float) < unmask_prob
         z = torch.where(masked & unmask, predictions, z)

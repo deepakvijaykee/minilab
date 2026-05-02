@@ -10,9 +10,10 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from minilab.base import BaseModel, unwrap_model
+from minilab.base import BaseModel, apply_conditional_diffusion_mask, unwrap_model
 from minilab.checks import require
 from minilab.config import BaseConfig
+from minilab.diffusion import forward_process_signature
 from minilab.nn.optimizers import Lion, Muon
 from minilab.registry import register_trainer
 
@@ -87,13 +88,25 @@ def optimizer_decay_groups(model, params, weight_decay):
     core = unwrap_model(model)
     params = list(params)
     no_weight_decay_names = set(core.no_weight_decay_parameter_names())
+    weight_decay_names = set(core.weight_decay_parameter_names())
     no_weight_decay_ids = {
         id(param)
         for name, param in core.named_parameters()
         if name in no_weight_decay_names
     }
-    decay = [p for p in params if p.dim() >= 2 and id(p) not in no_weight_decay_ids]
-    no_decay = [p for p in params if p.dim() < 2 or id(p) in no_weight_decay_ids]
+    weight_decay_ids = {
+        id(param)
+        for name, param in core.named_parameters()
+        if name in weight_decay_names
+    }
+    decay = [
+        p for p in params
+        if id(p) not in no_weight_decay_ids and (p.dim() >= 2 or id(p) in weight_decay_ids)
+    ]
+    no_decay = [
+        p for p in params
+        if id(p) in no_weight_decay_ids or (p.dim() < 2 and id(p) not in weight_decay_ids)
+    ]
     return [
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
@@ -201,6 +214,10 @@ class Trainer:
         model = model.to(self.device)
         if self.config.resume_from:
             model = self._load_model_for_resume(model)
+        if self.config.qk_clip_threshold > 0:
+            require(unwrap_model(model).supports_qk_clip(), (
+                "qk_clip_threshold requires a model with QK-Clip-capable attention"
+            ))
         unwrap_model(model).set_qk_clip_recording(self.config.qk_clip_threshold > 0)
         if self.config.compile:
             model = torch.compile(model)
@@ -299,12 +316,6 @@ class Trainer:
 
     def _build_optimizer(self):
         model = unwrap_model(self.model)
-        groups = optimizer_decay_groups(model, self.model.parameters(), self.config.weight_decay)
-
-        if self.config.optimizer == "adamw":
-            return torch.optim.AdamW(groups, lr=self.config.lr, betas=(0.9, 0.95))
-        if self.config.optimizer == "lion":
-            return Lion(groups, lr=self.config.lr, weight_decay=self.config.weight_decay)
         if self.config.optimizer == "muon":
             hidden, aux_matrices, biases = model.muon_parameter_groups()
             return Muon([
@@ -312,6 +323,11 @@ class Trainer:
                 {"params": aux_matrices, "use_muon": False, "lr": self.config.lr, "weight_decay": self.config.weight_decay},
                 {"params": biases, "use_muon": False, "lr": self.config.lr, "weight_decay": 0.0},
             ], lr=self.config.muon_lr)
+        groups = optimizer_decay_groups(model, self.model.parameters(), self.config.weight_decay)
+        if self.config.optimizer == "adamw":
+            return torch.optim.AdamW(groups, lr=self.config.lr, betas=(0.9, 0.95))
+        if self.config.optimizer == "lion":
+            return Lion(groups, lr=self.config.lr, weight_decay=self.config.weight_decay)
         raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
 
     def _build_scheduler(self):
@@ -450,6 +466,7 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self):
+        require(self.eval_loader is not None, "evaluate requires an eval_dataset")
         self.model.eval()
         total, count = 0.0, 0
         for i, batch in enumerate(self.eval_loader):
@@ -464,7 +481,7 @@ class Trainer:
 
     def save_checkpoint(self):
         path = Path(self.config.save_dir) / f"step_{self.step}"
-        self.model.save(path)
+        unwrap_model(self.model).save(path)
         torch.save(
             {
                 "step": self.step,
@@ -494,8 +511,7 @@ class Trainer:
 @register_trainer("lm")
 class LMTrainer(Trainer):
     def compute_loss(self, batch):
-        _, loss = self.model(batch["input_ids"], batch["labels"])
-        return loss
+        return supervised_lm_batch_loss(self.model, batch)
 
 
 @register_trainer("diffusion")
@@ -505,12 +521,7 @@ class DiffusionTrainer(Trainer):
             _validate_diffusion_trainer_contract(model, forward_process)
         # Bind the forward process into the resume signature so a checkpoint built
         # with one forward process cannot be silently resumed under another.
-        fwd_signature = json.dumps({
-            "process_type": forward_process.process_type,
-            "mask_token_id": forward_process.mask_token_id,
-            "num_timesteps": forward_process.num_timesteps,
-            "schedule": forward_process.schedule,
-        }, sort_keys=True)
+        fwd_signature = forward_process_signature(forward_process)
         signature = hashlib.sha256((signature + fwd_signature).encode()).hexdigest()
         super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
         self.fwd = forward_process
@@ -523,9 +534,8 @@ class DiffusionTrainer(Trainer):
     def compute_loss(self, batch):
         x_0 = batch["input_ids"]
         model = unwrap_model(self.model)
-        t = self.fwd.sample_time(x_0.size(0), self.device, mode=model.config.time_sampling)
-        z_t, mask = self.fwd.q_sample(x_0, t)
-        output = self.model(z_t, t)
+        z_t, mask, t, forward_kwargs = model.diffusion_training_state(self.fwd, x_0, self.device)
+        output = self.model(z_t, t, **forward_kwargs)
         return model.compute_loss(output, x_0, mask, t, self.fwd) + model_aux_loss(self.model)
 
 
@@ -543,9 +553,14 @@ class DiffusionSFTTrainer(DiffusionTrainer):
         loss_mask = batch["loss_mask"]
         valid_mask = batch["valid_mask"]
         model = unwrap_model(self.model)
-        t = self.fwd.sample_time(x_0.size(0), self.device, mode=model.config.time_sampling)
-        z_t, mask = conditional_q_sample(self.fwd, x_0, t, loss_mask, valid_mask=valid_mask)
-        output = self.model(z_t, t)
+        z_t, mask, t, forward_kwargs = model.diffusion_conditional_training_state(
+            self.fwd,
+            x_0,
+            loss_mask,
+            valid_mask,
+            self.device,
+        )
+        output = self.model(z_t, t, **forward_kwargs)
         per_example = model.compute_loss_per_example(
             output,
             x_0,
@@ -559,23 +574,24 @@ class DiffusionSFTTrainer(DiffusionTrainer):
 
 
 def conditional_q_sample(fwd, x_0, t, loss_mask, valid_mask=None):
-    require(loss_mask.shape == x_0.shape, "conditional diffusion loss_mask must match input_ids")
-    require(loss_mask.dtype == torch.bool, "conditional diffusion loss_mask must be bool")
-    require(loss_mask.any(dim=-1).all(), "conditional diffusion requires at least one supervised token per example")
-    if valid_mask is not None:
-        require(valid_mask.shape == x_0.shape, "conditional diffusion valid_mask must match input_ids")
-        require(valid_mask.dtype == torch.bool, "conditional diffusion valid_mask must be bool")
-        require((loss_mask & ~valid_mask).sum().item() == 0, "conditional diffusion loss_mask must be contained in valid_mask")
     z_t, mask = fwd.q_sample(x_0, t)
-    z_t = torch.where(loss_mask, z_t, x_0)
-    if valid_mask is not None:
-        z_t = torch.where(valid_mask, z_t, torch.full_like(z_t, fwd.mask_token_id))
-    mask = mask & loss_mask
-    return z_t, mask
+    return apply_conditional_diffusion_mask(
+        z_t,
+        mask,
+        x_0,
+        loss_mask,
+        valid_mask,
+        fwd.mask_token_id,
+    )
 
 
 def model_aux_loss(model):
     return unwrap_model(model).auxiliary_loss()
+
+
+def supervised_lm_batch_loss(model, batch):
+    _, loss = model(batch["input_ids"], batch["labels"])
+    return loss
 
 
 def commit_post_optimizer_updates(model, qk_clip_threshold, qk_clip_balance):

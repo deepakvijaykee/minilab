@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from minilab.base import BaseModel, unwrap_model
 from minilab.checks import require
@@ -43,6 +44,26 @@ def _trainer_reference_path(ref_model_path, config, algorithm):
             f"caller supplied {ref_path}"
         ))
     return ref_path
+
+
+def _write_reference_path(save_dir, step, ref_model_path):
+    (Path(save_dir) / f"step_{step}" / "ref_path.txt").write_text(ref_model_path)
+
+
+class ReferenceCheckpointMixin:
+    def save_checkpoint(self):
+        super().save_checkpoint()
+        _write_reference_path(self.config.save_dir, self.step, self.ref_model_path)
+
+
+class GRPOSchedulerHorizonMixin:
+    def _configured_scheduler_total_steps(self):
+        return self.config.max_steps * self.config.grpo_inner_epochs
+
+
+class RolloutPolicyTrainMixin:
+    def train(self):
+        _rollout_policy_train_loop(self, self.inner_epochs)
 
 
 def _validate_reference_tokenizer(ref_model_path, tokenizer_sig, algorithm):
@@ -196,7 +217,7 @@ def _model_max_seq_len(model, context):
 
 def _diffusion_loss_per_example(model, fwd, x_0, loss_mask, t, z_t, mask):
     core = unwrap_model(model)
-    output = model(z_t, t)
+    output = model(z_t, t, **core.diffusion_forward_kwargs(x_0))
     return core.compute_loss_per_example(
         output,
         x_0,
@@ -206,3 +227,29 @@ def _diffusion_loss_per_example(model, fwd, x_0, loss_mask, t, z_t, mask):
         loss_mask=loss_mask,
         normalization="none",
     )
+
+
+def _rollout_policy_train_loop(trainer, inner_epochs):
+    trainer.model.eval()
+    pbar = tqdm(range(trainer.step + 1, trainer.config.max_steps + 1), desc="Training")
+    for trainer.step in pbar:
+        batch = trainer._next_batch()
+        rollout = trainer._rollout(batch)
+        total_loss = 0.0
+        for _ in range(inner_epochs):
+            with torch.autocast(trainer.device, dtype=trainer.dtype, enabled=trainer.dtype != torch.float32):
+                loss = trainer._policy_loss(rollout)
+            trainer.scaler.scale(loss).backward()
+            trainer._optimizer_update()
+            total_loss += loss.item()
+
+        lr = trainer.scheduler.get_last_lr()[0]
+        if trainer.step % trainer.config.log_every == 0:
+            avg_loss = total_loss / inner_epochs
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+            if trainer.aim_run:
+                trainer.aim_run.track(avg_loss, name="loss", step=trainer.step)
+                trainer.aim_run.track(lr, name="lr", step=trainer.step)
+        trainer._save_checkpoint_if_due()
+
+    trainer._save_final_checkpoint()

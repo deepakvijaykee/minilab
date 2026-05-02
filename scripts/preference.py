@@ -18,6 +18,8 @@ from minilab.alignment import (
     KTOTrainer,
     ORPOTrainConfig,
     ORPOTrainer,
+    RePOTrainConfig,
+    RePOTrainer,
     SimPOTrainConfig,
     SimPOTrainer,
     resolve_reference_path,
@@ -41,7 +43,7 @@ def _load_dataset(name, algorithm, tok, seq_len, max_examples):
 
 
 p = argparse.ArgumentParser()
-p.add_argument("--algorithm", choices=["dpo", "ipo", "cpo", "simpo", "orpo", "kto"], default="dpo")
+p.add_argument("--algorithm", choices=["dpo", "ipo", "cpo", "simpo", "orpo", "repo", "kto"], default="dpo")
 p.add_argument("--dataset", choices=["hh", "ultrafeedback"], default="hh")
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--checkpoint", default="")
@@ -56,6 +58,7 @@ p.add_argument("--lr", type=float, default=1e-5)
 p.add_argument("--beta", type=float, default=0.1)
 p.add_argument("--cpo-alpha", type=float, default=None, help="defaults to 1.0 for CPO")
 p.add_argument("--simpo-gamma", type=float, default=None, help="defaults to 0.5 for SimPO")
+p.add_argument("--repo-margin", type=float, default=None, help="defaults to 0.5 for RePO")
 p.add_argument("--kto-desirable-weight", type=float, default=None, help="defaults to 1.0 for KTO")
 p.add_argument("--kto-undesirable-weight", type=float, default=None, help="defaults to 1.0 for KTO")
 p.add_argument("--max-examples", type=int, default=5000)
@@ -67,11 +70,14 @@ if args.algorithm != "cpo":
     require(args.cpo_alpha is None, "--cpo-alpha only applies to --algorithm cpo")
 if args.algorithm != "simpo":
     require(args.simpo_gamma is None, "--simpo-gamma only applies to --algorithm simpo")
+if args.algorithm != "repo":
+    require(args.repo_margin is None, "--repo-margin only applies to --algorithm repo")
 if args.algorithm != "kto":
     require(args.kto_desirable_weight is None, "--kto-desirable-weight only applies to --algorithm kto")
     require(args.kto_undesirable_weight is None, "--kto-undesirable-weight only applies to --algorithm kto")
 cpo_alpha = 1.0 if args.cpo_alpha is None else args.cpo_alpha
 simpo_gamma = 0.5 if args.simpo_gamma is None else args.simpo_gamma
+repo_margin = 0.5 if args.repo_margin is None else args.repo_margin
 kto_desirable_weight = 1.0 if args.kto_desirable_weight is None else args.kto_desirable_weight
 kto_undesirable_weight = 1.0 if args.kto_undesirable_weight is None else args.kto_undesirable_weight
 
@@ -129,6 +135,9 @@ elif args.algorithm == "orpo":
 elif args.algorithm == "cpo":
     tc = CPOTrainConfig(dpo_beta=args.beta, cpo_alpha=cpo_alpha, **base_kwargs)
     trainer = CPOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)
+elif args.algorithm == "repo":
+    tc = RePOTrainConfig(repo_margin=repo_margin, **base_kwargs)
+    trainer = RePOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)
 else:
     tc = SimPOTrainConfig(dpo_beta=args.beta, simpo_gamma=simpo_gamma, **base_kwargs)
     trainer = SimPOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)

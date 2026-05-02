@@ -5,6 +5,39 @@ import torch
 import torch.nn as nn
 
 from minilab.checks import require
+from minilab.losses import causal_lm_cross_entropy
+from minilab.nn.norm import ZeroCenteredRMSNorm
+
+
+def apply_conditional_diffusion_mask(
+    z_t,
+    noised_mask,
+    x_0,
+    loss_mask,
+    valid_mask,
+    mask_token_id,
+    context="conditional diffusion",
+):
+    require(z_t.shape == x_0.shape, f"{context} noised tokens must match input_ids")
+    require(noised_mask.shape == x_0.shape, f"{context} noised mask must match input_ids")
+    require(noised_mask.dtype == torch.bool, f"{context} noised mask must be bool")
+    require(loss_mask is not None, f"{context} loss_mask is required")
+    require(loss_mask.shape == x_0.shape, f"{context} loss_mask must match input_ids")
+    require(loss_mask.dtype == torch.bool, f"{context} loss_mask must be bool")
+    loss_mask = loss_mask.to(x_0.device)
+    require(loss_mask.any(dim=-1).all(), f"{context} requires at least one supervised token per example")
+    if valid_mask is not None:
+        require(valid_mask.shape == x_0.shape, f"{context} valid_mask must match input_ids")
+        require(valid_mask.dtype == torch.bool, f"{context} valid_mask must be bool")
+        valid_mask = valid_mask.to(x_0.device)
+        require((loss_mask & ~valid_mask).sum().item() == 0, (
+            f"{context} loss_mask must be contained in valid_mask"
+        ))
+
+    z_t = torch.where(loss_mask, z_t, x_0)
+    if valid_mask is not None:
+        z_t = torch.where(valid_mask, z_t, torch.full_like(z_t, mask_token_id))
+    return z_t, noised_mask.to(x_0.device) & loss_mask
 
 
 class BaseModel(nn.Module):
@@ -40,6 +73,13 @@ class BaseModel(nn.Module):
     def no_weight_decay_parameter_names(self):
         return ()
 
+    def weight_decay_parameter_names(self):
+        return tuple(
+            f"{module_name}.weight"
+            for module_name, module in self.named_modules()
+            if isinstance(module, ZeroCenteredRMSNorm)
+        )
+
     def auxiliary_loss(self):
         for param in self.parameters():
             return torch.tensor(0.0, device=param.device)
@@ -53,6 +93,40 @@ class BaseModel(nn.Module):
     def set_qk_clip_recording(self, enabled):
         return None
 
+    def supports_qk_clip(self):
+        return False
+
+    def supports_kv_cache(self):
+        return False
+
+    def supports_unconditional_diffusion_sampling(self):
+        return True
+
+    def diffusion_forward_kwargs(self, x_0):
+        return {}
+
+    def diffusion_training_state(self, forward_process, x_0, device):
+        t = forward_process.sample_time(x_0.size(0), device, mode=self.config.time_sampling)
+        z_t, mask = forward_process.q_sample(x_0, t)
+        return z_t, mask, t, self.diffusion_forward_kwargs(x_0)
+
+    def diffusion_conditional_training_state(self, forward_process, x_0, loss_mask, valid_mask, device, t=None):
+        if t is None:
+            t = forward_process.sample_time(x_0.size(0), device, mode=self.config.time_sampling)
+        else:
+            t = t.to(device)
+            require(t.shape == (x_0.size(0),), "generic conditional diffusion time must have shape (batch,)")
+        z_t, mask = forward_process.q_sample(x_0, t)
+        z_t, mask = apply_conditional_diffusion_mask(
+            z_t,
+            mask,
+            x_0,
+            loss_mask,
+            valid_mask,
+            forward_process.mask_token_id,
+        )
+        return z_t, mask, t, self.diffusion_forward_kwargs(x_0)
+
     def muon_parameter_groups(self):
         auxiliary_ids = {
             id(param)
@@ -64,6 +138,11 @@ class BaseModel(nn.Module):
             for name, param in self.named_parameters()
             if name in self.no_weight_decay_parameter_names()
         }
+        weight_decay_ids = {
+            id(param)
+            for name, param in self.named_parameters()
+            if name in self.weight_decay_parameter_names()
+        }
         hidden, auxiliary, biases = [], [], []
         seen = set()
         for param in self.parameters():
@@ -71,12 +150,12 @@ class BaseModel(nn.Module):
             if param_id in seen:
                 continue
             seen.add(param_id)
-            if param.dim() < 2:
+            if param_id in no_decay_ids:
                 biases.append(param)
-            elif param_id in no_decay_ids:
-                biases.append(param)
-            elif param_id in auxiliary_ids:
+            elif param_id in auxiliary_ids or param_id in weight_decay_ids:
                 auxiliary.append(param)
+            elif param.dim() < 2:
+                biases.append(param)
             else:
                 hidden.append(param)
         return hidden, auxiliary, biases
@@ -115,6 +194,15 @@ class BaseModel(nn.Module):
             return x.to(torch.get_autocast_dtype(x.device.type))
         return x
 
+    def _causal_lm_forward(self, idx, targets=None, include_auxiliary_loss=False):
+        logits, _ = self.forward_hidden(idx)
+        loss = None
+        if targets is not None:
+            loss = causal_lm_cross_entropy(logits, targets)
+            if include_auxiliary_loss:
+                loss = loss + self.auxiliary_loss()
+        return logits, loss
+
 
 def unwrap_model(model):
     """Return the real module behind torch.compile's optimized wrapper."""
@@ -135,10 +223,11 @@ class BaseTokenizer:
         tok = cls()
         state = json.loads(Path(path).read_text())
         require(isinstance(state, dict), "Tokenizer state must be a JSON object")
-        expected_type = tok._get_state().get("type")
-        if expected_type is not None:
-            require(state.get("type") == expected_type, (
-                f"Tokenizer state was saved as {state.get('type')!r}, cannot load as {cls.__name__}."
+        expected_state = tok._get_state()
+        if "type" in expected_state:
+            require("type" in state, "Tokenizer state is missing required field: type")
+            require(state["type"] == expected_state["type"], (
+                f"Tokenizer state was saved as {state['type']!r}, cannot load as {cls.__name__}."
             ))
         tok._set_state(state)
         return tok

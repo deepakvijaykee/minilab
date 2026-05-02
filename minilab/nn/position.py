@@ -28,15 +28,17 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
-    def forward(self, seq_len):
-        if seq_len > self.cos_cached.size(0):
-            self._build_cache(seq_len)
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, seq_len, offset=0):
+        require(offset >= 0, "RoPE offset must be >= 0")
+        end = offset + seq_len
+        if end > self.cos_cached.size(0):
+            self._build_cache(end)
+        return self.cos_cached[offset:end], self.sin_cached[offset:end]
 
 
 @register_position("proportional_rope")
 class ProportionalRotaryEmbedding(RotaryEmbedding):
-    """Gemma 4 proportional RoPE.
+    """Gemma-style proportional RoPE.
 
     Frequencies use the full attention head dimension as the denominator even
     when only a partial rotary fraction is active.

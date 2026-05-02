@@ -10,10 +10,12 @@ Key difference from BPE:
 Used by: BERT, DistilBERT, Electra
 """
 
+from collections import Counter
+
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
-from minilab.tokenizers._state import require_tokenizer_state
+from minilab.tokenizers._state import require_id_map, require_tokenizer_state
 
 
 @register_tokenizer("wordpiece")
@@ -30,9 +32,7 @@ class WordPieceTokenizer(BaseTokenizer):
         require(isinstance(text, str) and len(text) > 0, "WordPiece training text must be a non-empty string")
         words = text.split()
         require(words, "WordPiece training text must contain at least one word")
-        word_freqs: dict[str, int] = {}
-        for w in words:
-            word_freqs[w] = word_freqs.get(w, 0) + 1
+        word_freqs = Counter(words)
 
         # Initialize with characters (## prefix for non-initial)
         vocab: set[str] = {self.UNK}
@@ -46,15 +46,15 @@ class WordPieceTokenizer(BaseTokenizer):
 
         # Iteratively merge pair with highest likelihood: score(a,b) = freq(ab) / (freq(a) * freq(b))
         while len(vocab) < vocab_size:
-            symbol_freqs: dict[str, int] = {}
-            pair_freqs: dict[tuple[str, str], int] = {}
+            symbol_freqs: Counter[str] = Counter()
+            pair_freqs: Counter[tuple[str, str]] = Counter()
             for word, freq in word_freqs.items():
                 symbols = self._split_word(word, vocab)
                 for s in symbols:
-                    symbol_freqs[s] = symbol_freqs.get(s, 0) + freq
+                    symbol_freqs[s] += freq
                 for i in range(len(symbols) - 1):
                     pair = (symbols[i], symbols[i + 1])
-                    pair_freqs[pair] = pair_freqs.get(pair, 0) + freq
+                    pair_freqs[pair] += freq
 
             if not pair_freqs:
                 break
@@ -94,10 +94,9 @@ class WordPieceTokenizer(BaseTokenizer):
     def encode(self, text: str) -> list[int]:
         require(self.UNK in self.token_to_id, "WordPiece tokenizer must be trained or loaded before encoding")
         ids = []
-        unk_id = self.token_to_id[self.UNK]
         for word in text.split():
-            tokens = self._split_word(word, set(self.token_to_id.keys()))
-            ids.extend(self.token_to_id.get(t, unk_id) for t in tokens)
+            tokens = self._split_word(word, set(self.token_to_id))
+            ids.extend(self.token_to_id[t] for t in tokens)
         return ids
 
     def decode(self, ids: list[int]) -> str:
@@ -128,9 +127,7 @@ class WordPieceTokenizer(BaseTokenizer):
         require(all(type(token) is str and token for token in state["token_to_id"]), (
             "WordPiece tokenizer state tokens must be non-empty strings"
         ))
-        require(all(type(idx) is int and idx >= 0 for idx in state["token_to_id"].values()), (
-            "WordPiece tokenizer state ids must be non-negative integers"
-        ))
+        require_id_map(state["token_to_id"].values(), "WordPiece")
         self.token_to_id = state["token_to_id"]
         require(self.UNK in self.token_to_id, f"WordPiece tokenizer state is missing {self.UNK}")
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}

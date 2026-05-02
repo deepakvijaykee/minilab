@@ -3,7 +3,7 @@
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
-from minilab.tokenizers._state import require_tokenizer_state
+from minilab.tokenizers._state import require_id_map, require_tokenizer_state
 
 
 @register_tokenizer("character")
@@ -45,11 +45,10 @@ class CharacterTokenizer(BaseTokenizer):
 
     def _set_state(self, state):
         require_tokenizer_state(state, "Character", "character", ("char_to_id",))
+        require(state["char_to_id"], "Character tokenizer state vocab must be non-empty")
         require(all(type(char) is str and len(char) == 1 for char in state["char_to_id"]), (
             "Character tokenizer state keys must be single characters"
         ))
-        require(all(type(idx) is int and idx >= 0 for idx in state["char_to_id"].values()), (
-            "Character tokenizer state ids must be non-negative integers"
-        ))
+        require_id_map(state["char_to_id"].values(), "Character")
         self.char_to_id = state["char_to_id"]
         self.id_to_char = {i: c for c, i in self.char_to_id.items()}

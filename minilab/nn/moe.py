@@ -1,9 +1,10 @@
 """Sparse Mixture of Experts FFNs.
 
-The registry includes several routing families used by modern sparse LMs:
+The registry includes compact routing families used by modern sparse LMs:
 token-choice top-k MoE, Switch top-1 routing, Mixtral top-2 routing,
-expert-choice routing, DeepSeek-style shared+routed experts, auxiliary-loss-free
-biased routing, and BASE-style balanced assignment.
+expert-choice routing, DeepSeek-style shared+routed experts, Qwen3-Next-style
+gated shared experts, auxiliary-loss-free biased routing, and BASE-style
+balanced assignment.
 """
 
 import math
@@ -27,6 +28,7 @@ class MoEFFN(nn.Module):
         self.aux_loss_coef = aux_loss_coef
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -73,6 +75,8 @@ class SwitchMoEFFN(nn.Module):
         self.capacity_factor = capacity_factor
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
+        self.register_buffer("dropped_fraction", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -119,6 +123,7 @@ class ExpertChoiceMoEFFN(nn.Module):
         self.capacity_factor = capacity_factor
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -168,6 +173,7 @@ class DeepSeekMoEFFN(nn.Module):
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.routed_experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
         self.shared_experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_shared_experts)])
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -180,6 +186,50 @@ class DeepSeekMoEFFN(nn.Module):
         shared = torch.zeros_like(x_flat)
         for expert in self.shared_experts:
             shared = shared + expert(x_flat)
+
+        self.aux_loss = _load_balancing_loss(logits, indices, self.num_experts, self.aux_loss_coef)
+        return (routed + shared).reshape(B, T, C)
+
+
+@register_ffn("qwen3_next_moe")
+class Qwen3NextMoEFFN(nn.Module):
+    """Qwen3-Next-style sparse MoE with a gated shared expert.
+
+    The released configs route each token to a small top-k subset of many
+    experts, renormalize the selected probabilities, and add a separate shared
+    expert path with a learned scalar gate.
+    """
+
+    def __init__(
+        self,
+        dim,
+        hidden_dim,
+        num_experts=8,
+        top_k=2,
+        aux_loss_coef=0.001,
+    ):
+        super().__init__()
+        _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, "Qwen3NextMoEFFN")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.aux_loss_coef = aux_loss_coef
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.routed_experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
+        self.shared_expert = _Expert(dim, hidden_dim)
+        self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.reshape(-1, C)
+        logits = self.gate(x_flat)
+        probs = F.softmax(logits, dim=-1)
+        weights, indices = probs.topk(self.top_k, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=torch.finfo(weights.dtype).tiny)
+
+        routed = _combine_token_choice(x_flat, self.routed_experts, weights, indices)
+        shared_gate = torch.sigmoid(self.shared_expert_gate(x_flat))
+        shared = shared_gate * self.shared_expert(x_flat)
 
         self.aux_loss = _load_balancing_loss(logits, indices, self.num_experts, self.aux_loss_coef)
         return (routed + shared).reshape(B, T, C)
@@ -210,6 +260,7 @@ class AuxFreeMoEFFN(nn.Module):
         self.register_buffer("routing_bias", torch.zeros(num_experts))
         self.register_buffer("_routing_load_sum", torch.zeros(num_experts))
         self.register_buffer("_routing_load_count", torch.zeros(()))
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -267,6 +318,7 @@ class BaseMoEFFN(nn.Module):
         self.capacity_factor = capacity_factor
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -283,7 +335,7 @@ class BaseMoEFFN(nn.Module):
 
 @register_ffn("gemma4_moe")
 class Gemma4MoEFFN(nn.Module):
-    """Gemma 4 sparse FFN: RMS-normalized router, top-k softmax weights, GELU experts."""
+    """Gemma-style sparse FFN: RMS-normalized router, top-k weights, GELU experts."""
 
     def __init__(
         self,
@@ -302,6 +354,7 @@ class Gemma4MoEFFN(nn.Module):
         self.per_expert_scale = nn.Parameter(torch.ones(num_experts))
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList([_GELUTanhExpert(dim, hidden_dim) for _ in range(num_experts)])
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -317,20 +370,19 @@ class Gemma4MoEFFN(nn.Module):
         return out.reshape(B, T, C)
 
 
-class _Expert(nn.Module):
+class _ExpertBase(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.w1, self.w2, self.w3 = _expert_projections(dim, hidden_dim)
+
+
+class _Expert(_ExpertBase):
 
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
-class _GELUTanhExpert(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.w1, self.w2, self.w3 = _expert_projections(dim, hidden_dim)
-
+class _GELUTanhExpert(_ExpertBase):
     def forward(self, x):
         return self.w3(F.gelu(self.w1(x), approximate="tanh") * self.w2(x))
 
@@ -383,61 +435,77 @@ def _load_balancing_loss(logits, indices, num_experts, aux_loss_coef):
 def _balanced_assignment(scores, capacity):
     """Assign every token to one expert with bounded expert capacity.
 
-    This is an auction solver for the balanced rectangular assignment problem
-    where each expert contributes `capacity` identical slots.
+    This solves the rectangular balanced assignment exactly with a small
+    min-cost-flow reference path. BASE routing depends on the capacity
+    constraint being real; if the graph cannot route all tokens we fail at the
+    boundary instead of substituting an approximate assignment.
     """
     num_tokens, num_experts = scores.shape
     require(capacity * num_experts >= num_tokens, "balanced assignment capacity cannot cover all tokens")
+    require(torch.isfinite(scores).all(), "balanced assignment scores must be finite")
     device = scores.device
     values = scores.float().cpu()
-    slot_expert = torch.arange(num_experts).repeat_interleave(capacity)
-    values_by_slot = values[:, slot_expert]
-    num_slots = values_by_slot.size(1)
-    prices = torch.zeros(num_slots)
-    owner = torch.full((num_slots,), -1, dtype=torch.long)
-    assignment_slot = torch.full((num_tokens,), -1, dtype=torch.long)
-    unassigned = list(range(num_tokens - 1, -1, -1))
-    epsilon = 1e-4
-    max_steps = max(1, num_tokens * num_slots * 20)
-    steps = 0
+    source = 0
+    token_offset = 1
+    expert_offset = token_offset + num_tokens
+    sink = expert_offset + num_experts
+    graph = [[] for _ in range(sink + 1)]
 
-    while unassigned:
-        steps += 1
-        if steps > max_steps:
-            return _greedy_balanced_assignment(values, capacity).to(device)
-        token = unassigned.pop()
-        net = values_by_slot[token] - prices
-        best = int(torch.argmax(net).item())
-        best_value = net[best].item()
-        if num_slots == 1:
-            second_value = best_value - epsilon
-        else:
-            net_without_best = net.clone()
-            net_without_best[best] = -float("inf")
-            second_value = net_without_best.max().item()
-        prices[best] += best_value - second_value + epsilon
-        previous = int(owner[best].item())
-        owner[best] = token
-        assignment_slot[token] = best
-        if previous != -1:
-            assignment_slot[previous] = -1
-            unassigned.append(previous)
+    def add_edge(src, dst, cap, cost):
+        graph[src].append([dst, len(graph[dst]), cap, cost])
+        graph[dst].append([src, len(graph[src]) - 1, 0, -cost])
+        return graph[src][-1]
 
-    return slot_expert[assignment_slot].to(device)
+    token_expert_edges = []
+    for token in range(num_tokens):
+        add_edge(source, token_offset + token, 1, 0.0)
+        edges = []
+        for expert in range(num_experts):
+            edge = add_edge(token_offset + token, expert_offset + expert, 1, -float(values[token, expert].item()))
+            edges.append(edge)
+        token_expert_edges.append(edges)
+    for expert in range(num_experts):
+        add_edge(expert_offset + expert, sink, capacity, 0.0)
 
+    for _ in range(num_tokens):
+        parent_node = [-1] * len(graph)
+        parent_edge = [-1] * len(graph)
+        dist = [float("inf")] * len(graph)
+        in_queue = [False] * len(graph)
+        queue = [source]
+        dist[source] = 0.0
+        in_queue[source] = True
 
-def _greedy_balanced_assignment(scores, capacity):
-    num_tokens, num_experts = scores.shape
+        while queue:
+            node = queue.pop(0)
+            in_queue[node] = False
+            for edge_idx, edge in enumerate(graph[node]):
+                dst, _, cap, cost = edge
+                if cap <= 0:
+                    continue
+                candidate = dist[node] + cost
+                if candidate < dist[dst]:
+                    dist[dst] = candidate
+                    parent_node[dst] = node
+                    parent_edge[dst] = edge_idx
+                    if not in_queue[dst]:
+                        queue.append(dst)
+                        in_queue[dst] = True
+
+        require(parent_node[sink] != -1, "balanced assignment failed to route every token")
+        node = sink
+        while node != source:
+            prev = parent_node[node]
+            edge = graph[prev][parent_edge[node]]
+            edge[2] -= 1
+            graph[node][edge[1]][2] += 1
+            node = prev
+
     assignment = torch.full((num_tokens,), -1, dtype=torch.long)
-    load = torch.zeros(num_experts, dtype=torch.long)
-    edges = torch.argsort(scores.reshape(-1), descending=True)
-    for edge in edges.tolist():
-        token = edge // num_experts
-        expert = edge % num_experts
-        if assignment[token] == -1 and load[expert] < capacity:
-            assignment[token] = expert
-            load[expert] += 1
-            if (assignment != -1).all():
+    for token, edges in enumerate(token_expert_edges):
+        for expert, edge in enumerate(edges):
+            if edge[2] == 0:
+                assignment[token] = expert
                 break
     require((assignment != -1).all(), "balanced assignment failed to route every token")
-    return assignment
+    return assignment.to(device)

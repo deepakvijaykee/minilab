@@ -8,6 +8,7 @@ import torch
 
 from minilab.checks import require
 from minilab.evaluation import accuracy_reward
+from minilab.registry import register_task
 
 DELIMITER = "####"
 _NUMBER = r"(?<!\d)-?\d[\d,]*(?:\.\d+)?"
@@ -58,3 +59,14 @@ def batch_reward(tokenizer, answers, batch, completions, completion_mask):
         for b in range(completions.size(0))
     ]
     return torch.tensor(rewards)
+
+
+@register_task("gsm8k")
+class GSM8KTask:
+    delimiter = DELIMITER
+    format_prompt = staticmethod(format_prompt)
+    prompt_parts = staticmethod(prompt_parts)
+    extract_answer = staticmethod(extract_answer)
+    parse_gold_answer = staticmethod(parse_gold_answer)
+    reward = staticmethod(reward)
+    batch_reward = staticmethod(batch_reward)

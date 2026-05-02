@@ -8,6 +8,7 @@ import argparse
 import torch
 
 from minilab.alignment import DiffusionGRPOTrainConfig, DiffusionGRPOTrainer, resolve_reference_path
+from minilab.checks import require
 from minilab.data import load_gsm8k_diffusion
 from minilab.diffusion import ForwardProcess
 from minilab.generation import infill
@@ -51,6 +52,10 @@ validate_checkpoint_tokenizer(ref_path, tok)
 
 model_name, model = load_diffusion_model_checkpoint(model_path, args.model)
 fwd = ForwardProcess.load(f"{model_path}/forward_process.json")
+require(model.supports_unconditional_diffusion_sampling(), (
+    "Diffusion GRPO reverse rollouts require a model that can score denoising "
+    "steps without clean x_0 context"
+))
 print(f"Trainable: {model_path} ({model_name}, {model.num_parameters():,} params, schedule={fwd.schedule})")
 print(f"Frozen reference: {ref_path}")
 

@@ -11,11 +11,12 @@ Used by: T5, XLNet, ALBERT, mBART (via SentencePiece)
 """
 
 import math
+from collections import Counter
 
 from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.registry import register_tokenizer
-from minilab.tokenizers._state import require_tokenizer_state
+from minilab.tokenizers._state import require_id_map, require_tokenizer_state
 
 
 @register_tokenizer("unigram")
@@ -56,7 +57,7 @@ class UnigramTokenizer(BaseTokenizer):
                 len(self.scores) - vocab_size,
                 max(1, int(len(optional) * self.PRUNE_FRACTION)),
             )
-            for piece in sorted(optional, key=lambda p: (counts.get(p, 0.0), len(p), p))[:remove_count]:
+            for piece in sorted(optional, key=lambda p: (counts[p], len(p), p))[:remove_count]:
                 del self.scores[piece]
 
             if verbose:
@@ -73,27 +74,25 @@ class UnigramTokenizer(BaseTokenizer):
     def _word_frequencies(self, text: str) -> dict[str, int]:
         words = text.split()
         require(words, "Unigram training text must contain at least one non-whitespace word")
-        freqs: dict[str, int] = {}
-        for word in words:
-            freqs[word] = freqs.get(word, 0) + 1
-        return freqs
+        return dict(Counter(words))
 
     def _seed_piece_counts(self, word_freqs: dict[str, int], required: set[str], vocab_size: int) -> dict[str, float]:
-        counts: dict[str, float] = {}
+        counts: Counter[str] = Counter()
         for word, freq in word_freqs.items():
             for length in range(1, min(len(word), self.MAX_PIECE_LEN) + 1):
                 for start in range(len(word) - length + 1):
                     piece = word[start : start + length]
-                    counts[piece] = counts.get(piece, 0.0) + freq
+                    counts[piece] += freq
 
         optional_budget = max(0, vocab_size * self.SEED_MULTIPLIER - len(required))
         optional = sorted(
             ((p, c) for p, c in counts.items() if p not in required),
             key=lambda item: (-item[1], -len(item[0]), item[0]),
         )[:optional_budget]
-        seed_counts = {p: c for p, c in optional}
+        seed_counts = {p: float(c) for p, c in optional}
         for piece in required:
-            seed_counts[piece] = max(seed_counts.get(piece, 0.0), self.SMOOTHING)
+            current = seed_counts[piece] if piece in seed_counts else 0.0
+            seed_counts[piece] = max(current, self.SMOOTHING)
         return seed_counts
 
     def _expected_counts(self, word_freqs: dict[str, int], scores: dict[str, float]):
@@ -146,7 +145,10 @@ class UnigramTokenizer(BaseTokenizer):
     def _scores_from_counts(self, counts: dict[str, float], required: set[str] | None = None):
         adjusted = {piece: count + self.SMOOTHING for piece, count in counts.items()}
         for piece in required or ():
-            adjusted[piece] = adjusted.get(piece, 0.0) + self.SMOOTHING
+            if piece in adjusted:
+                adjusted[piece] += self.SMOOTHING
+            else:
+                adjusted[piece] = self.SMOOTHING
         total = sum(adjusted.values())
         return {piece: math.log(count / total) for piece, count in adjusted.items()}
 
@@ -154,13 +156,13 @@ class UnigramTokenizer(BaseTokenizer):
         require(self.UNK in self.token_to_id, "Unigram tokenizer must be trained or loaded before encoding")
         ids = []
         unk_id = self.token_to_id[self.UNK]
-        space_id = self.token_to_id.get(" ")
+        space_id = self.token_to_id[" "] if " " in self.token_to_id else None
         for i, word in enumerate(text.split(" ")):
             if i > 0:
                 ids.append(space_id if space_id is not None else unk_id)
             if word:
                 tokens = self._viterbi(word)
-                ids.extend(self.token_to_id.get(t, unk_id) for t in tokens)
+                ids.extend(self.token_to_id[t] if t in self.token_to_id else unk_id for t in tokens)
         return ids
 
     def _viterbi(self, word: str) -> list[str]:
@@ -179,7 +181,7 @@ class UnigramTokenizer(BaseTokenizer):
                     if score > best[end][0]:
                         best[end] = (score, start)
 
-        # Fallback to characters if no path found
+        # Unseen words are emitted as characters so encode can map missing pieces to [UNK].
         if best[n][0] == NEG_INF:
             return list(word)
 
@@ -209,14 +211,15 @@ class UnigramTokenizer(BaseTokenizer):
         require(all(type(token) is str and token for token in state["token_to_id"]), (
             "Unigram tokenizer state tokens must be non-empty strings"
         ))
-        require(all(type(idx) is int and idx >= 0 for idx in state["token_to_id"].values()), (
-            "Unigram tokenizer state ids must be non-negative integers"
-        ))
+        require_id_map(state["token_to_id"].values(), "Unigram")
         require(all(type(token) is str and token for token in state["scores"]), (
             "Unigram tokenizer state score keys must be non-empty strings"
         ))
         require(all(type(score) in (int, float) and math.isfinite(score) for score in state["scores"].values()), (
             "Unigram tokenizer state scores must be finite numbers"
+        ))
+        require(set(state["scores"]) == set(state["token_to_id"]), (
+            "Unigram tokenizer state scores must match token_to_id keys"
         ))
         self.token_to_id = state["token_to_id"]
         require(self.UNK in self.token_to_id, f"Unigram tokenizer state is missing {self.UNK}")

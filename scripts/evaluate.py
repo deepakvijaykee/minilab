@@ -6,18 +6,21 @@
 import argparse
 import torch
 from torch.utils.data import DataLoader
+from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
-from minilab.data import load_tinystories
-from minilab.evaluation import perplexity, distinct_n, self_bleu
+from minilab.tokenizers.byte import ByteTokenizer
+from minilab.tokenizers.character import CharacterTokenizer
+from minilab.evaluation import bits_per_character, perplexity, distinct_n, self_bleu
 from minilab.generation import generate
 from minilab.trainer import validate_checkpoint_tokenizer
-from common import MODEL_CHOICES, load_model_checkpoint
+from common import MODEL_CHOICES, PRETRAIN_DATASET_CHOICES, load_model_checkpoint, load_pretrain_eval_dataset
 
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--checkpoint", required=True)
 p.add_argument("--model", choices=MODEL_CHOICES, default=None, help="override checkpoint model family")
+p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
 p.add_argument("--seq-len", type=int, default=256)
 p.add_argument("--num-samples", type=int, default=50)
 args = p.parse_args()
@@ -29,11 +32,21 @@ model_name, model = load_model_checkpoint(args.checkpoint, args.model, device=de
 model.eval()
 print(f"Loaded {args.checkpoint} ({model_name}) on {device} ({model.num_parameters():,} params)")
 
-eval_ds = load_tinystories(tok, args.seq_len, split="validation", max_examples=2000)
+eval_ds = load_pretrain_eval_dataset(args.dataset, tok, args.seq_len, 2000, "lm")
 ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))
-print(f"Perplexity: {ppl:.1f}")
+print(f"{args.dataset} validation perplexity: {ppl:.1f}")
+if args.dataset == "text8":
+    require(isinstance(tok, (CharacterTokenizer, ByteTokenizer)), (
+        "text8 bits/char reporting requires a character or byte tokenizer"
+    ))
+    bpc = bits_per_character(model, DataLoader(eval_ds, batch_size=32))
+    print(f"text8 validation bits/char: {bpc:.4f}")
 
-prompts = ["Once upon a time", "The little", "She was", "One day", "There was a"]
+prompts = (
+    ["once upon a time", "the little", "she was", "one day", "there was a"]
+    if args.dataset == "text8"
+    else ["Once upon a time", "The little", "She was", "One day", "There was a"]
+)
 texts = []
 for i in range(args.num_samples):
     prompt_text = prompts[i % len(prompts)]

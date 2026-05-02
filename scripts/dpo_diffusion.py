@@ -7,7 +7,14 @@ import argparse
 
 import torch
 
-from minilab.alignment import DPOTrainConfig, DiffusionDPOTrainer, resolve_reference_path
+from minilab.alignment import (
+    DPOTrainConfig,
+    DiffusionDPOTrainer,
+    DiffusionVRPOTrainConfig,
+    DiffusionVRPOTrainer,
+    resolve_reference_path,
+)
+from minilab.checks import require
 from minilab.data import load_hh_rlhf_diffusion, load_ultrafeedback_diffusion
 from minilab.diffusion import ForwardProcess
 from minilab.generation import infill
@@ -23,6 +30,7 @@ from common import (
 DATASETS = {"hh-rlhf": load_hh_rlhf_diffusion, "ultrafeedback": load_ultrafeedback_diffusion}
 
 p = argparse.ArgumentParser()
+p.add_argument("--algorithm", choices=["dpo", "vrpo"], default="dpo")
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--checkpoint", default="")
 p.add_argument("--save-dir", default="checkpoints/diffusion_dpo")
@@ -35,11 +43,16 @@ p.add_argument("--save-every", type=int, default=0, help="periodic save interval
 p.add_argument("--batch-size", type=int, default=8)
 p.add_argument("--lr", type=float, default=1e-5)
 p.add_argument("--beta", type=float, default=0.1)
+p.add_argument("--vrpo-num-samples", type=int, default=None, help="defaults to 4 for VRPO")
+p.add_argument("--no-vrpo-antithetic", action="store_true", help="disable VRPO antithetic t,1-t pairing")
 p.add_argument("--max-examples", type=int, default=5000)
 p.add_argument("--sample-new-tokens", type=int, default=80)
 p.add_argument("--resume-from", default="")
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
+if args.algorithm != "vrpo":
+    require(args.vrpo_num_samples is None, "--vrpo-num-samples only applies to --algorithm vrpo")
+    require(not args.no_vrpo_antithetic, "--no-vrpo-antithetic only applies to --algorithm vrpo")
 set_seed(args.seed)
 
 tok = load_tokenizer(args.tokenizer)
@@ -56,7 +69,7 @@ print(f"Frozen reference: {ref_path}")
 ds = DATASETS[args.dataset](tok, args.seq_len, max_examples=args.max_examples)
 print(f"{args.dataset}: {len(ds)} diffusion preference pairs")
 
-tc = DPOTrainConfig(
+base_kwargs = dict(
     max_steps=args.max_steps,
     warmup_steps=args.warmup_steps,
     batch_size=args.batch_size,
@@ -71,37 +84,57 @@ tc = DPOTrainConfig(
 )
 sig = run_signature(
     tok,
-    {"name": args.dataset, "split": "train", "max_examples": args.max_examples, "mode": "diffusion_dpo"},
+    {"name": args.dataset, "split": "train", "max_examples": args.max_examples, "mode": f"diffusion_{args.algorithm}"},
     args.seq_len,
 )
-trainer = DiffusionDPOTrainer(
-    model,
-    fwd,
-    ds,
-    tc,
-    ref_model_path=ref_path,
-    signature=sig,
-    tokenizer_sig=tokenizer_signature(tok),
-)
+if args.algorithm == "dpo":
+    tc = DPOTrainConfig(**base_kwargs)
+    trainer = DiffusionDPOTrainer(
+        model,
+        fwd,
+        ds,
+        tc,
+        ref_model_path=ref_path,
+        signature=sig,
+        tokenizer_sig=tokenizer_signature(tok),
+    )
+else:
+    tc = DiffusionVRPOTrainConfig(
+        vrpo_num_samples=4 if args.vrpo_num_samples is None else args.vrpo_num_samples,
+        vrpo_antithetic=not args.no_vrpo_antithetic,
+        **base_kwargs,
+    )
+    trainer = DiffusionVRPOTrainer(
+        model,
+        fwd,
+        ds,
+        tc,
+        ref_model_path=ref_path,
+        signature=sig,
+        tokenizer_sig=tokenizer_signature(tok),
+    )
 trainer.train()
 model = trainer.model
 
 print("\n--- After Diffusion DPO ---")
 model.eval()
 sample_steps = min(128, fwd.num_timesteps)
-for q in ["What makes a good friend?", "How do I learn to cook?", "Tell me about dogs."]:
-    prompt = tok.encode(q)[: max(1, args.seq_len - args.sample_new_tokens)]
-    gen_len = min(args.sample_new_tokens, args.seq_len - len(prompt))
-    tokens = prompt + [fwd.mask_token_id] * gen_len
-    mask = [False] * len(prompt) + [True] * gen_len
-    filled = infill(
-        model,
-        fwd,
-        torch.tensor([tokens], dtype=torch.long),
-        torch.tensor([mask], dtype=torch.bool),
-        num_steps=sample_steps,
-        temperature=0.7,
-    )[0]
-    answer = [t for t in filled[len(prompt) : len(prompt) + gen_len].tolist() if t < tok.vocab_size]
-    print(f"  Q: {q}")
-    print(f"  A: {tok.decode(answer)[:120]}\n")
+if not model.supports_unconditional_diffusion_sampling():
+    print("  skipped: model requires clean x_0 context for reverse scoring")
+else:
+    for q in ["What makes a good friend?", "How do I learn to cook?", "Tell me about dogs."]:
+        prompt = tok.encode(q)[: max(1, args.seq_len - args.sample_new_tokens)]
+        gen_len = min(args.sample_new_tokens, args.seq_len - len(prompt))
+        tokens = prompt + [fwd.mask_token_id] * gen_len
+        mask = [False] * len(prompt) + [True] * gen_len
+        filled = infill(
+            model,
+            fwd,
+            torch.tensor([tokens], dtype=torch.long),
+            torch.tensor([mask], dtype=torch.bool),
+            num_steps=sample_steps,
+            temperature=0.7,
+        )[0]
+        answer = [t for t in filled[len(prompt) : len(prompt) + gen_len].tolist() if t < tok.vocab_size]
+        print(f"  Q: {q}")
+        print(f"  A: {tok.decode(answer)[:120]}\n")

@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from minilab.alignment_common import (
+    GRPOSchedulerHorizonMixin,
+    ReferenceCheckpointMixin,
+    RolloutPolicyTrainMixin,
     _generation_context_token_logp,
     _load_reference_model,
     _masked_response_mean,
@@ -420,7 +423,7 @@ class PPOTrainer(Trainer):
 
 
 @register_trainer("grpo")
-class GRPOTrainer(Trainer):
+class GRPOTrainer(RolloutPolicyTrainMixin, GRPOSchedulerHorizonMixin, ReferenceCheckpointMixin, Trainer):
     """Per step: sample K completions per prompt under the current (old) policy,
     freeze their log-probs, then run grpo_inner_epochs clipped-surrogate updates
     against those frozen old log-probs. This is what makes the PPO-style ratio
@@ -455,47 +458,12 @@ class GRPOTrainer(Trainer):
         self.clip_ratio = config.grpo_clip_ratio
         self.kl_coef = config.grpo_kl_coef
 
-    def _configured_scheduler_total_steps(self):
-        return self.config.max_steps * self.config.grpo_inner_epochs
-
-    def save_checkpoint(self):
-        super().save_checkpoint()
-        (Path(self.config.save_dir) / f"step_{self.step}" / "ref_path.txt").write_text(self.ref_model_path)
-
     def compute_loss(self, batch):
         # Unused — GRPO overrides train() because old_logps must be frozen once
         # per rollout and reused across inner epochs. compute_loss takes a single
         # batch with no notion of "rollout vs. update", which does not match the
         # PPO-style update structure.
         raise NotImplementedError("GRPO runs its own train loop; compute_loss is not called")
-
-    def train(self):
-        # GRPO samples and scores the policy in eval mode. Gradients still flow
-        # during the update pass, while train-time stochastic layers stay out of
-        # the PPO ratio.
-        self.model.eval()
-        pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
-        for self.step in pbar:
-            batch = self._next_batch()
-            rollout = self._rollout(batch)
-            total_loss = 0.0
-            for _ in range(self.inner_epochs):
-                with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-                    loss = self._policy_loss(rollout)
-                self.scaler.scale(loss).backward()
-                self._optimizer_update()
-                total_loss += loss.item()
-
-            lr = self.scheduler.get_last_lr()[0]
-            if self.step % self.config.log_every == 0:
-                avg_loss = total_loss / self.inner_epochs
-                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
-                if self.aim_run:
-                    self.aim_run.track(avg_loss, name="loss", step=self.step)
-                    self.aim_run.track(lr, name="lr", step=self.step)
-            self._save_checkpoint_if_due()
-
-        self._save_final_checkpoint()
 
     def _rollout(self, batch):
         """Sample K completions per prompt under the current policy, compute

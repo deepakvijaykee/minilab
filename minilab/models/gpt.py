@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from minilab.base import BaseModel
 from minilab.checks import require
 from minilab.config import BaseConfig
+from minilab.losses import causal_lm_cross_entropy
 from minilab.nn.architecture import (
     GQA_ATTENTIONS,
     MOE_FFNS,
@@ -21,6 +22,29 @@ from minilab.registry import get_attention, get_connection, get_ffn, get_norm, g
 
 _ROPE_POSITIONS = {"rope", "gemma3_rope", "gemma4_rope", "yarn_rope", "qwen3_next_rope"}
 _BIAS_POSITIONS = {"alibi", "t5_relative", "kerple_log", "kerple_power"}
+_DEFAULT_ROPE_BASE = 10000.0
+_DEFAULT_ROPE_LOCAL_BASE = 10000.0
+_DEFAULT_ROPE_GLOBAL_BASE = 1000000.0
+_DEFAULT_ROPE_SCALING_FACTOR = 1.0
+_DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN = 4096
+_DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR = 0.25
+_DEFAULT_YARN_BETA_FAST = 32.0
+_DEFAULT_YARN_BETA_SLOW = 1.0
+_DEFAULT_LOCAL_ATTENTION_WINDOW = 1024
+_DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL = 4
+_DEFAULT_NUM_EXPERTS = 8
+_DEFAULT_TOP_K_EXPERTS = 2
+_LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
+_PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
+_CACHE_ATTENTIONS = {
+    "mha",
+    "gqa",
+    "mqa",
+    "mha_qknorm",
+    "gqa_qknorm",
+    "gqa_qknorm_partial_rope",
+    "gqa_qknorm_kv_tied",
+}
 
 
 @dataclass
@@ -39,19 +63,19 @@ class GPTConfig(BaseConfig):
     ffn: str = "swiglu"
     connection: str = "residual"
     connection_expansion: int = 4
-    num_experts: int = 8
-    top_k_experts: int = 2
+    num_experts: int = _DEFAULT_NUM_EXPERTS
+    top_k_experts: int = _DEFAULT_TOP_K_EXPERTS
     post_norm: bool = False
-    rope_base: float = 10000.0
-    rope_local_base: float = 10000.0
-    rope_global_base: float = 1000000.0
-    rope_scaling_factor: float = 1.0
-    rope_original_max_seq_len: int = 4096
-    rope_partial_rotary_factor: float = 0.25
-    yarn_beta_fast: float = 32.0
-    yarn_beta_slow: float = 1.0
-    local_attention_window: int = 1024
-    qwen3_next_full_attention_interval: int = 4
+    rope_base: float = _DEFAULT_ROPE_BASE
+    rope_local_base: float = _DEFAULT_ROPE_LOCAL_BASE
+    rope_global_base: float = _DEFAULT_ROPE_GLOBAL_BASE
+    rope_scaling_factor: float = _DEFAULT_ROPE_SCALING_FACTOR
+    rope_original_max_seq_len: int = _DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
+    rope_partial_rotary_factor: float = _DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR
+    yarn_beta_fast: float = _DEFAULT_YARN_BETA_FAST
+    yarn_beta_slow: float = _DEFAULT_YARN_BETA_SLOW
+    local_attention_window: int = _DEFAULT_LOCAL_ATTENTION_WINDOW
+    qwen3_next_full_attention_interval: int = _DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
     attention_k_eq_v: bool = False
     per_layer_embedding_dim: int = 0
     final_logit_softcap: float = 0.0
@@ -90,6 +114,8 @@ class GPTConfig(BaseConfig):
         ))
         if _attention_uses_gqa(self.attention):
             require(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
+        else:
+            require(self.num_kv_heads == self.num_heads, "num_kv_heads only applies to GQA attention variants")
         if self.position in _ROPE_POSITIONS:
             require((self.dim // self.num_heads) % 2 == 0, "RoPE requires even head dimension")
         if self.position == "sinusoidal":
@@ -99,13 +125,29 @@ class GPTConfig(BaseConfig):
         if self.attention == "lightning":
             require(self.position == "none", "Lightning Attention owns positional decay; set position='none'")
         if self.attention == "gemma3":
-            require(self.position == "gemma3_rope", "Gemma 3 attention schedule requires position='gemma3_rope'")
+            require(self.position == "gemma3_rope", "Gemma-style attention schedule requires position='gemma3_rope'")
         if self.attention == "gemma4":
-            require(self.position == "gemma4_rope", "Gemma 4 attention schedule requires position='gemma4_rope'")
+            require(self.position == "gemma4_rope", "Gemma-style attention schedule requires position='gemma4_rope'")
         if self.attention == "qwen3_next":
             require(self.position in {"qwen3_next_rope", "yarn_rope"}, (
-                "Qwen3-Next schedule requires position='qwen3_next_rope' or 'yarn_rope'"
+                "Qwen3-Next-style schedule requires position='qwen3_next_rope' or 'yarn_rope'"
             ))
+        resolved_attention = resolve_deepseek_v4_attention(self.attention, 0)
+        qwen_rope_attention = (
+            self.attention == "qwen3_next"
+            or self.attention in _PARTIAL_ROPE_ATTENTIONS
+            or resolved_attention in _PARTIAL_ROPE_ATTENTIONS
+        )
+        require(self.position != "gemma3_rope" or self.attention == "gemma3", (
+            "Gemma/Qwen local-global position='gemma3_rope' requires attention='gemma3'"
+        ))
+        require(self.position != "gemma4_rope" or self.attention == "gemma4", (
+            "Gemma/Qwen local-global position='gemma4_rope' requires attention='gemma4'"
+        ))
+        require(self.position != "qwen3_next_rope" or qwen_rope_attention, (
+            "Gemma/Qwen local-global position='qwen3_next_rope' requires Qwen3-Next or partial-RoPE attention"
+        ))
+        self._reject_unused_variant_knobs()
         if self.per_layer_embedding_dim > 0:
             require(self.connection == "residual", "per-layer embeddings require residual connections")
         if self.ffn in MOE_FFNS:
@@ -113,6 +155,69 @@ class GPTConfig(BaseConfig):
             require(1 <= self.top_k_experts <= self.num_experts, "top_k_experts must be in [1, num_experts]")
             if self.ffn in TOP_ONE_MOE_FFNS:
                 require(self.top_k_experts == 1, f"{self.ffn} requires top_k_experts=1")
+        else:
+            require(
+                self.num_experts == _DEFAULT_NUM_EXPERTS and self.top_k_experts == _DEFAULT_TOP_K_EXPERTS,
+                "num_experts and top_k_experts only apply to MoE FFNs",
+            )
+
+    def _reject_unused_variant_knobs(self):
+        resolved_attention = resolve_deepseek_v4_attention(self.attention, 0)
+        uses_local_window = (
+            self.attention in _LOCAL_WINDOW_ATTENTIONS
+            or resolved_attention in {"sliding_window", "sliding_window_gqa_qknorm"}
+        )
+        uses_partial_rope = (
+            self.attention in _PARTIAL_ROPE_ATTENTIONS
+            or resolved_attention in _PARTIAL_ROPE_ATTENTIONS
+            or self.position in {"gemma4_rope", "qwen3_next_rope"}
+        )
+        require(
+            self.rope_base == _DEFAULT_ROPE_BASE or self.position in {"rope", "yarn_rope"},
+            "rope_base only applies to position='rope' or position='yarn_rope'",
+        )
+        require(
+            self.rope_local_base == _DEFAULT_ROPE_LOCAL_BASE
+            or self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
+            "rope_local_base only applies to Gemma/Qwen local-global RoPE positions",
+        )
+        require(
+            self.rope_global_base == _DEFAULT_ROPE_GLOBAL_BASE
+            or self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
+            "rope_global_base only applies to Gemma/Qwen local-global RoPE positions",
+        )
+        require(
+            self.rope_scaling_factor == _DEFAULT_ROPE_SCALING_FACTOR
+            or self.position in {"yarn_rope", "gemma4_rope"},
+            "rope_scaling_factor only applies to YaRN RoPE or Gemma 4 proportional RoPE",
+        )
+        require(
+            self.rope_original_max_seq_len == _DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
+            or self.position == "yarn_rope",
+            "rope_original_max_seq_len only applies to position='yarn_rope'",
+        )
+        require(
+            self.yarn_beta_fast == _DEFAULT_YARN_BETA_FAST and self.yarn_beta_slow == _DEFAULT_YARN_BETA_SLOW
+            or self.position == "yarn_rope",
+            "yarn_beta_fast and yarn_beta_slow only apply to position='yarn_rope'",
+        )
+        require(
+            self.rope_partial_rotary_factor == _DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR or uses_partial_rope,
+            "rope_partial_rotary_factor only applies to partial-RoPE attention or Gemma/Qwen proportional RoPE",
+        )
+        require(
+            self.local_attention_window == _DEFAULT_LOCAL_ATTENTION_WINDOW or uses_local_window,
+            "local_attention_window only applies to local/sliding-window attention",
+        )
+        require(
+            self.qwen3_next_full_attention_interval == _DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
+            or self.attention == "qwen3_next",
+            "qwen3_next_full_attention_interval only applies to attention='qwen3_next'",
+        )
+        require(
+            not self.attention_k_eq_v or self.attention == "gemma4",
+            "attention_k_eq_v only applies to attention='gemma4'",
+        )
 
 
 PRESETS = {
@@ -164,6 +269,13 @@ def _build_transformer_attention(config, block_id):
         if attention == "sliding_window_gqa_qknorm":
             attn.window_size = config.local_attention_window
         return attention, attn
+    if attention == "sliding_window":
+        return attention, attn_cls(
+            config.dim,
+            config.num_heads,
+            config.dropout,
+            window_size=config.local_attention_window,
+        )
     return attention, attn_cls(config.dim, config.num_heads, config.dropout)
 
 
@@ -235,6 +347,7 @@ class TransformerBlock(nn.Module):
 
         self.ffn = _build_transformer_ffn(config)
         self.attention_name, self.attn = _build_transformer_attention(config, block_id)
+        self.uses_residual_connection = config.connection == "residual"
 
         conn_cls = get_connection(config.connection)
         if config.connection == "residual":
@@ -266,12 +379,36 @@ class TransformerBlock(nn.Module):
             x = residual + self.post_per_layer_input_norm(self.per_layer_projection(ple))
         return x
 
+    def forward_cached(self, x, freqs_cis=None, is_causal=True, past_kv=None):
+        require(self.uses_residual_connection, "cached GPT blocks require residual connections")
+        require(self.per_layer_embedding_dim == 0, "cached GPT blocks do not support per-layer embeddings")
+        require(self.attention_name in _CACHE_ATTENTIONS, (
+            f"cached GPT generation does not support attention={self.attention_name!r}"
+        ))
+        attn_out, next_kv = self.attn(
+            self.attn_norm(x),
+            freqs_cis=freqs_cis,
+            attn_bias=None,
+            is_causal=is_causal,
+            past_kv=past_kv,
+            return_kv=True,
+        )
+        if self.post_norm:
+            attn_out = self.attn_post_norm(attn_out)
+        x = x + self.drop(attn_out)
+
+        ffn_out = self.ffn(self.ffn_norm(x))
+        if self.post_norm:
+            ffn_out = self.ffn_post_norm(ffn_out)
+        x = x + self.drop(ffn_out)
+        return x, next_kv
+
 
 def _resolve_attention_name(config, block_id):
     if config.attention == "gemma3":
-        return "gqa_qknorm" if _is_gemma3_global_layer(block_id) else "sliding_window_gqa_qknorm"
+        return "gqa_qknorm" if _is_gemma_global_layer(block_id) else "sliding_window_gqa_qknorm"
     if config.attention == "gemma4":
-        if _is_gemma4_global_layer(block_id):
+        if _is_gemma_global_layer(block_id):
             return "gqa_qknorm_kv_tied" if config.attention_k_eq_v else "gqa_qknorm"
         return "sliding_window_gqa_qknorm"
     if config.attention == "qwen3_next":
@@ -287,16 +424,12 @@ def _attention_uses_gqa(attention):
     return resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
 
 
-def _is_gemma3_global_layer(block_id):
-    return (block_id + 1) % 6 == 0
-
-
-def _is_gemma4_global_layer(block_id):
+def _is_gemma_global_layer(block_id):
     return (block_id + 1) % 6 == 0
 
 
 class MultiTokenPredictionModule(nn.Module):
-    """DeepSeek-V3 sequential MTP module with shared token embedding and LM head."""
+    """DeepSeek-style sequential MTP module with shared token embedding and LM head."""
 
     def __init__(self, config, block_id):
         super().__init__()
@@ -382,12 +515,15 @@ class GPT(BaseModel):
             if block.attention_name in QK_CLIP_ATTENTIONS:
                 block.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
 
+    def supports_qk_clip(self):
+        return any(block.attention_name in QK_CLIP_ATTENTIONS for block in self.blocks)
+
     def forward(self, idx, targets=None):
         logits, _, main_hidden = self.forward_hidden(idx, return_residual=True)
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
+            loss = causal_lm_cross_entropy(logits, targets)
             loss = loss + self._mtp_loss(main_hidden, idx, targets)
             loss = loss + self._ffn_auxiliary_loss()
 
@@ -439,25 +575,82 @@ class GPT(BaseModel):
             return logits, x, main_hidden
         return logits, x
 
-    def _position_inputs(self, seq_len):
+    def forward_cached(self, idx, past_kv=None):
+        require(not self.training, "forward_cached expects model.eval() at the call boundary")
+        require(idx.dim() == 2, "forward_cached idx must have shape (batch, seq)")
+        require(idx.size(1) > 0, "forward_cached requires a non-empty input")
+        require(self.config.connection == "residual", "forward_cached currently supports residual GPT blocks")
+        require(self.config.per_layer_embedding_dim == 0, "forward_cached does not support per-layer embeddings")
+        require(not self._gradient_checkpointing, "forward_cached does not use gradient checkpointing")
+        require(self.pos_enc is None or self.pos_enc.kind in {"rotary", "none"}, (
+            "forward_cached supports rotary or no positional encoding"
+        ))
+        for block in self.blocks:
+            require(block.attention_name in _CACHE_ATTENTIONS, (
+                f"forward_cached does not support attention={block.attention_name!r}"
+            ))
+
+        B, T = idx.shape
+        past_len = 0
+        if past_kv is None:
+            past_kv = [None] * len(self.blocks)
+        else:
+            require(len(past_kv) == len(self.blocks), "past_kv must have one entry per GPT block")
+            past_len = past_kv[0][0].size(2)
+            for key, value in past_kv:
+                require(key.size(0) == B and value.size(0) == B, "past_kv batch size must match idx")
+                require(key.size(2) == past_len and value.size(2) == past_len, (
+                    "all cached GPT layers must have the same sequence length"
+                ))
+        require(past_len + T <= self.config.max_seq_len, (
+            f"GPT cache supports at most {self.config.max_seq_len} tokens, got {past_len + T}"
+        ))
+
+        x = self._cast_hidden(self.tok_emb(idx))
+        freqs_cis, attn_bias, is_causal = self._position_inputs(T, offset=past_len)
+        require(attn_bias is None, "forward_cached does not support additive attention bias")
+        x = self.drop(x)
+
+        next_kv = []
+        for block, block_past in zip(self.blocks, past_kv, strict=True):
+            block_freqs = self._block_freqs(block, T, freqs_cis, offset=past_len)
+            x, block_kv = block.forward_cached(
+                x,
+                freqs_cis=block_freqs,
+                is_causal=is_causal,
+                past_kv=block_past,
+            )
+            next_kv.append(block_kv)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        if self.config.final_logit_softcap > 0:
+            logits = torch.tanh(logits / self.config.final_logit_softcap) * self.config.final_logit_softcap
+        return logits, next_kv
+
+    def _position_inputs(self, seq_len, offset=0):
         freqs_cis, attn_bias, is_causal = None, None, True
         if self.pos_enc is not None:
             if self.pos_enc.kind == "rotary":
-                freqs_cis = self.pos_enc(seq_len)
+                freqs_cis = self.pos_enc(seq_len, offset=offset)
             elif self.pos_enc.kind == "bias":
+                require(offset == 0, "relative position bias does not support cached offset scoring")
                 attn_bias = self.pos_enc(seq_len).unsqueeze(0)
                 is_causal = False
             else:
                 require(self.pos_enc.kind in {"additive", "none"}, f"Unknown position kind: {self.pos_enc.kind}")
+                require(offset == 0 or self.pos_enc.kind == "none", (
+                    "cached offset scoring supports rotary or no positional encoding"
+                ))
         return freqs_cis, attn_bias, is_causal
 
-    def _block_freqs(self, block, seq_len, default_freqs=None):
+    def _block_freqs(self, block, seq_len, default_freqs=None, offset=0):
         if block.attention_name == "gated_deltanet":
             return None
         if self.config.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"}:
             if _is_global_attention_name(block.attention_name):
-                return self.global_pos_enc(seq_len)
-            return self.local_pos_enc(seq_len)
+                return self.global_pos_enc(seq_len, offset=offset)
+            return self.local_pos_enc(seq_len, offset=offset)
         return default_freqs
 
     def _per_layer_inputs(self, idx, inputs_embeds):
@@ -491,13 +684,15 @@ class GPT(BaseModel):
         for depth, module in enumerate(self.mtp_modules, start=1):
             if idx.size(1) <= depth:
                 break
+            mtp_target = targets[:, depth:]
+            if not (mtp_target != -100).any():
+                break
             current_hidden = hidden[:, : idx.size(1) - depth]
             future_emb = self._cast_hidden(self.tok_emb(idx[:, depth:]))
             seq_len = current_hidden.size(1)
             freqs_cis, attn_bias, is_causal = self._mtp_position_inputs(module.block, seq_len)
             hidden = module(current_hidden, future_emb, freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=is_causal)
             mtp_logits = self._mtp_logits(hidden)
-            mtp_target = targets[:, depth:]
             mtp_losses.append(F.cross_entropy(
                 mtp_logits.reshape(-1, mtp_logits.size(-1)),
                 mtp_target.reshape(-1),
@@ -516,6 +711,15 @@ class GPT(BaseModel):
         for block in self.blocks:
             loss = loss + block.ffn.aux_loss
         return loss
+
+    def supports_kv_cache(self):
+        if self.training:
+            return False
+        if self.config.connection != "residual" or self.config.per_layer_embedding_dim > 0:
+            return False
+        if self.pos_enc is not None and self.pos_enc.kind not in {"rotary", "none"}:
+            return False
+        return all(block.attention_name in _CACHE_ATTENTIONS for block in self.blocks)
 
 
 def _is_global_attention_name(attention_name):

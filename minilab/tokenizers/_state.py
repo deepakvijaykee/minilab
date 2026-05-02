@@ -11,3 +11,13 @@ def require_tokenizer_state(state, tokenizer_name: str, expected_type: str, fiel
     require(state["type"] == expected_type, f"{tokenizer_name} tokenizer state has wrong type")
     for field in fields:
         require(type(state[field]) is dict, f"{tokenizer_name} tokenizer state field '{field}' must be an object")
+
+
+def require_id_map(ids, tokenizer_name: str) -> None:
+    require(all(type(idx) is int and idx >= 0 for idx in ids), (
+        f"{tokenizer_name} tokenizer state ids must be non-negative integers"
+    ))
+    require(len(set(ids)) == len(ids), f"{tokenizer_name} tokenizer state ids must be unique")
+    require(sorted(ids) == list(range(len(ids))), (
+        f"{tokenizer_name} tokenizer state ids must be contiguous from 0"
+    ))

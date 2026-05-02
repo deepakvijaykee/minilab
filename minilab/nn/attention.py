@@ -20,9 +20,13 @@ def apply_rotary_emb(q, k, cos, sin):
     sin = sin[None, None]
     cos = torch.cat([cos, cos], dim=-1)
     sin = torch.cat([sin, sin], dim=-1)
+    q_cos = cos.to(device=q.device, dtype=q.dtype)
+    q_sin = sin.to(device=q.device, dtype=q.dtype)
+    k_cos = cos.to(device=k.device, dtype=k.dtype)
+    k_sin = sin.to(device=k.device, dtype=k.dtype)
     return (
-        q * cos + rotate_half(q) * sin,
-        k * cos + rotate_half(k) * sin,
+        q * q_cos + rotate_half(q) * q_sin,
+        k * k_cos + rotate_half(k) * k_sin,
     )
 
 
@@ -84,9 +88,55 @@ class _QKClipMixin:
         self._qk_clip_seen.zero_()
 
 
+class _QKNormClipMixin:
+    @torch.no_grad()
+    def commit_qk_clip_update(self, threshold, balance=0.5):
+        require(0.0 <= balance <= 1.0, "qk_clip balance must be in [0, 1]")
+        gammas = self._qk_clip_gammas(threshold)
+        if gammas is None:
+            return
+        gamma = gammas.amin()
+        self.q_norm.weight.mul_(gamma.pow(balance).to(self.q_norm.weight.device, self.q_norm.weight.dtype))
+        self.k_norm.weight.mul_(gamma.pow(1.0 - balance).to(self.k_norm.weight.device, self.k_norm.weight.dtype))
+        self._reset_qk_clip_stats()
+
+
+class _PartialRoPEAttentionMixin:
+    default_rope_fraction = 0.25
+
+    def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0, rope_fraction=None):
+        super().__init__(dim, num_heads, num_kv_heads, dropout)
+        if rope_fraction is None:
+            rope_fraction = self.default_rope_fraction
+        self.rope_dim = _partial_rope_dim(self.head_dim, rope_fraction)
+
+    def _apply_position(self, q, k, freqs_cis):
+        return _apply_partial_rope(q, k, freqs_cis, self.rope_dim)
+
+
 def _scale_linear_heads(linear, num_heads, head_dim, scales):
     weight = linear.weight.view(num_heads, head_dim, linear.weight.size(1))
     weight.mul_(scales.to(device=weight.device, dtype=weight.dtype).view(num_heads, 1, 1))
+
+
+def _append_kv_cache(k, v, past_kv):
+    if past_kv is None:
+        return k, v, 0
+    past_k, past_v = past_kv
+    require(past_k.shape[:2] == k.shape[:2], "cached keys must match batch and heads")
+    require(past_v.shape[:2] == v.shape[:2], "cached values must match batch and heads")
+    require(past_k.size(-1) == k.size(-1), "cached keys must match head dim")
+    require(past_v.size(-1) == v.size(-1), "cached values must match head dim")
+    require(past_k.size(2) == past_v.size(2), "cached keys and values must have the same sequence length")
+    past_len = past_k.size(2)
+    return torch.cat([past_k, k], dim=2), torch.cat([past_v, v], dim=2), past_len
+
+
+def _cached_causal_bias(q_len, kv_len, past_len, device, dtype):
+    require(kv_len == past_len + q_len, "cached causal attention expects contiguous KV cache")
+    query_pos = torch.arange(past_len, past_len + q_len, device=device).view(q_len, 1)
+    key_pos = torch.arange(kv_len, device=device).view(1, kv_len)
+    return _bool_to_additive_bias(key_pos <= query_pos, dtype)
 
 
 @register_attention("mha")
@@ -107,7 +157,7 @@ class MultiHeadAttention(_QKClipMixin, nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self._init_qk_clip(num_heads)
 
-    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
+    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False, past_kv=None, return_kv=False):
         B, T, C = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim)
         k = self.k_proj(x).reshape(B, T, self.num_heads, self.head_dim)
@@ -116,14 +166,23 @@ class MultiHeadAttention(_QKClipMixin, nn.Module):
 
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
+        k, v, past_len = _append_kv_cache(k, v, past_kv)
         self._record_qk_clip_logits(q, k)
+        causal = is_causal and attn_bias is None
+        if past_len > 0:
+            require(attn_bias is None, "cached MHA does not support external attention bias")
+            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
+            causal = False
 
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_bias,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal and attn_bias is None,
+            is_causal=causal,
         )
-        return self.out(out.transpose(1, 2).reshape(B, T, C))
+        out = self.out(out.transpose(1, 2).reshape(B, T, C))
+        if return_kv:
+            return out, (k, v)
+        return out
 
     @torch.no_grad()
     def commit_qk_clip_update(self, threshold, balance=0.5):
@@ -159,7 +218,7 @@ class GroupedQueryAttention(_QKClipMixin, nn.Module):
         self.out = nn.Linear(dim, dim, bias=False)
         self._init_qk_clip(num_heads)
 
-    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
+    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False, past_kv=None, return_kv=False):
         B, T, C = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -168,16 +227,26 @@ class GroupedQueryAttention(_QKClipMixin, nn.Module):
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
 
-        k = k.repeat_interleave(self.kv_group_size, dim=1)
-        v = v.repeat_interleave(self.kv_group_size, dim=1)
-        self._record_qk_clip_logits(q, k)
+        k, v, past_len = _append_kv_cache(k, v, past_kv)
+        cache = (k, v)
+        k_attn = k.repeat_interleave(self.kv_group_size, dim=1)
+        v_attn = v.repeat_interleave(self.kv_group_size, dim=1)
+        self._record_qk_clip_logits(q, k_attn)
+        causal = is_causal and attn_bias is None
+        if past_len > 0:
+            require(attn_bias is None, "cached GQA does not support external attention bias")
+            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
+            causal = False
 
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_bias,
+            q, k_attn, v_attn, attn_mask=attn_bias,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal and attn_bias is None,
+            is_causal=causal,
         )
-        return self.out(out.transpose(1, 2).reshape(B, T, C))
+        out = self.out(out.transpose(1, 2).reshape(B, T, C))
+        if return_kv:
+            return out, cache
+        return out
 
     @torch.no_grad()
     def commit_qk_clip_update(self, threshold, balance=0.5):
@@ -192,7 +261,7 @@ class GroupedQueryAttention(_QKClipMixin, nn.Module):
 
 
 @register_attention("mha_qknorm")
-class MultiHeadQKNormAttention(MultiHeadAttention):
+class MultiHeadQKNormAttention(_QKNormClipMixin, MultiHeadAttention):
     """MHA with per-head RMSNorm on queries and keys before RoPE/SDPA."""
 
     def __init__(self, dim, num_heads, dropout=0.0):
@@ -200,7 +269,7 @@ class MultiHeadQKNormAttention(MultiHeadAttention):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
+    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False, past_kv=None, return_kv=False):
         B, T, C = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
@@ -209,28 +278,26 @@ class MultiHeadQKNormAttention(MultiHeadAttention):
         k = self.k_norm(k)
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
+        k, v, past_len = _append_kv_cache(k, v, past_kv)
         self._record_qk_clip_logits(q, k)
+        causal = is_causal and attn_bias is None
+        if past_len > 0:
+            require(attn_bias is None, "cached QK-Norm MHA does not support external attention bias")
+            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
+            causal = False
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_bias,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal and attn_bias is None,
+            is_causal=causal,
         )
-        return self.out(out.transpose(1, 2).reshape(B, T, C))
-
-    @torch.no_grad()
-    def commit_qk_clip_update(self, threshold, balance=0.5):
-        require(0.0 <= balance <= 1.0, "qk_clip balance must be in [0, 1]")
-        gammas = self._qk_clip_gammas(threshold)
-        if gammas is None:
-            return
-        gamma = gammas.amin()
-        self.q_norm.weight.mul_(gamma.pow(balance).to(self.q_norm.weight.device, self.q_norm.weight.dtype))
-        self.k_norm.weight.mul_(gamma.pow(1.0 - balance).to(self.k_norm.weight.device, self.k_norm.weight.dtype))
-        self._reset_qk_clip_stats()
+        out = self.out(out.transpose(1, 2).reshape(B, T, C))
+        if return_kv:
+            return out, (k, v)
+        return out
 
 
 @register_attention("gqa_qknorm")
-class GroupedQueryQKNormAttention(GroupedQueryAttention):
+class GroupedQueryQKNormAttention(_QKNormClipMixin, GroupedQueryAttention):
     """Qwen3/Gemma/GLM-style GQA with per-head RMSNorm on Q and K."""
 
     def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0):
@@ -250,35 +317,34 @@ class GroupedQueryQKNormAttention(GroupedQueryAttention):
             return q, k
         return apply_rotary_emb(q, k, *freqs_cis)
 
-    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
+    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False, past_kv=None, return_kv=False):
         B, T, C = x.shape
         q, k, v = self._project_qkv(x)
         q, k = self._apply_position(q, k, freqs_cis)
-        k = k.repeat_interleave(self.kv_group_size, dim=1)
-        v = v.repeat_interleave(self.kv_group_size, dim=1)
-        self._record_qk_clip_logits(q, k)
+        k, v, past_len = _append_kv_cache(k, v, past_kv)
+        cache = (k, v)
+        k_attn = k.repeat_interleave(self.kv_group_size, dim=1)
+        v_attn = v.repeat_interleave(self.kv_group_size, dim=1)
+        self._record_qk_clip_logits(q, k_attn)
+        causal = is_causal and attn_bias is None
+        if past_len > 0:
+            require(attn_bias is None, "cached QK-Norm GQA does not support external attention bias")
+            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
+            causal = False
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_bias,
+            q, k_attn, v_attn, attn_mask=attn_bias,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal and attn_bias is None,
+            is_causal=causal,
         )
-        return self.out(out.transpose(1, 2).reshape(B, T, C))
-
-    @torch.no_grad()
-    def commit_qk_clip_update(self, threshold, balance=0.5):
-        require(0.0 <= balance <= 1.0, "qk_clip balance must be in [0, 1]")
-        gammas = self._qk_clip_gammas(threshold)
-        if gammas is None:
-            return
-        gamma = gammas.amin()
-        self.q_norm.weight.mul_(gamma.pow(balance).to(self.q_norm.weight.device, self.q_norm.weight.dtype))
-        self.k_norm.weight.mul_(gamma.pow(1.0 - balance).to(self.k_norm.weight.device, self.k_norm.weight.dtype))
-        self._reset_qk_clip_stats()
+        out = self.out(out.transpose(1, 2).reshape(B, T, C))
+        if return_kv:
+            return out, cache
+        return out
 
 
 @register_attention("gated_gqa_qknorm")
 class GatedGroupedQueryQKNormAttention(GroupedQueryQKNormAttention):
-    """Qwen3-Next full attention: QK-Norm GQA with a learned output gate."""
+    """Qwen3-Next-style full attention: QK-Norm GQA with a learned output gate."""
 
     def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0):
         super().__init__(dim, num_heads, num_kv_heads, dropout)
@@ -301,20 +367,13 @@ class GatedGroupedQueryQKNormAttention(GroupedQueryQKNormAttention):
 
 
 @register_attention("gated_gqa_qknorm_partial_rope")
-class GatedGroupedQueryQKNormPartialRoPEAttention(GatedGroupedQueryQKNormAttention):
-    """Qwen3-Next full attention with gated output and partial RoPE."""
-
-    def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0, rope_fraction=0.25):
-        super().__init__(dim, num_heads, num_kv_heads, dropout)
-        self.rope_dim = _partial_rope_dim(self.head_dim, rope_fraction)
-
-    def _apply_position(self, q, k, freqs_cis):
-        return _apply_partial_rope(q, k, freqs_cis, self.rope_dim)
+class GatedGroupedQueryQKNormPartialRoPEAttention(_PartialRoPEAttentionMixin, GatedGroupedQueryQKNormAttention):
+    """Qwen3-Next-style full attention with gated output and partial RoPE."""
 
 
 @register_attention("gqa_qknorm_kv_tied")
 class KeyValueTiedGroupedQueryQKNormAttention(GroupedQueryQKNormAttention):
-    """Gemma 4 MoE global attention option where value states reuse key projection."""
+    """Gemma-style global attention option where value states reuse key projection."""
 
     def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0):
         super().__init__(dim, num_heads, num_kv_heads, dropout)
@@ -329,20 +388,15 @@ class KeyValueTiedGroupedQueryQKNormAttention(GroupedQueryQKNormAttention):
 
 
 @register_attention("gqa_qknorm_partial_rope")
-class GroupedQueryQKNormPartialRoPEAttention(GroupedQueryQKNormAttention):
+class GroupedQueryQKNormPartialRoPEAttention(_PartialRoPEAttentionMixin, GroupedQueryQKNormAttention):
     """GLM-style GQA with QK-Norm and partial RoPE on the tail of each head."""
 
-    def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0, rope_fraction=0.5):
-        super().__init__(dim, num_heads, num_kv_heads, dropout)
-        self.rope_dim = _partial_rope_dim(self.head_dim, rope_fraction)
-
-    def _apply_position(self, q, k, freqs_cis):
-        return _apply_partial_rope(q, k, freqs_cis, self.rope_dim)
+    default_rope_fraction = 0.5
 
 
 @register_attention("sliding_window_gqa_qknorm")
 class SlidingWindowGroupedQueryQKNormAttention(GroupedQueryQKNormAttention):
-    """Gemma 3 local GQA layer: QK-Norm plus causal sliding-window attention."""
+    """Gemma-style local GQA layer: QK-Norm plus causal sliding-window attention."""
 
     def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0, window_size=1024):
         super().__init__(dim, num_heads, num_kv_heads, dropout)
@@ -648,7 +702,7 @@ class LightningAttention2(nn.Module):
 
 @register_attention("gated_deltanet")
 class GatedDeltaNetAttention(nn.Module):
-    """Qwen3-Next Gated DeltaNet token mixer, using the recurrent reference rule."""
+    """Qwen3-Next-style Gated DeltaNet mixer using a recurrent reference rule."""
 
     def __init__(self, dim, num_heads, dropout=0.0, conv_kernel_size=4):
         super().__init__()
@@ -942,7 +996,7 @@ def _compress_csa(entries_a, entries_b, weights_a, weights_b, pos_bias_a, pos_bi
 
 @register_attention("csa")
 class CompressedSparseAttention(_CompressedAttentionBase):
-    """DeepSeek-V4-inspired compressed sparse attention reference path."""
+    """DeepSeek-V4-style compressed sparse attention reference path."""
 
     def __init__(self, dim, num_heads, dropout=0.0):
         super().__init__(dim, num_heads, dropout, compress_ratio=4, window_size=128)
@@ -998,7 +1052,7 @@ class CompressedSparseAttention(_CompressedAttentionBase):
 
 @register_attention("hca")
 class HeavilyCompressedAttention(_CompressedAttentionBase):
-    """DeepSeek-V4-inspired heavily compressed dense attention reference path."""
+    """DeepSeek-V4-style heavily compressed dense attention reference path."""
 
     def __init__(self, dim, num_heads, dropout=0.0):
         super().__init__(dim, num_heads, dropout, compress_ratio=128, window_size=128)
@@ -1103,8 +1157,12 @@ def _merge_attention_bias(base_bias, extra_bias):
 
 def _expand_external_bias(attn_bias, batch_size, num_heads, T):
     if attn_bias.dim() == 2:
+        require(attn_bias.shape == (T, T), "2D attn_bias must have shape (T, T)")
         return attn_bias.view(1, 1, T, T)
     if attn_bias.dim() == 3:
+        require(attn_bias.size(-2) == T and attn_bias.size(-1) == T, (
+            "3D attn_bias must end with shape (T, T)"
+        ))
         if attn_bias.size(0) == num_heads:
             return attn_bias.view(1, num_heads, T, T)
         require(attn_bias.size(0) == batch_size, (

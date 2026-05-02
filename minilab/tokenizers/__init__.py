@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from minilab.tokenizers import byte as _byte
 from minilab.tokenizers import bpe as _bpe
 from minilab.tokenizers import character as _character
 from minilab.tokenizers import unigram as _unigram
@@ -8,7 +9,7 @@ from minilab.tokenizers import wordpiece as _wordpiece
 from minilab.checks import require
 from minilab.registry import get_tokenizer, list_available
 
-_TOKENIZER_MODULES = (_bpe, _character, _unigram, _wordpiece)
+_TOKENIZER_MODULES = (_byte, _bpe, _character, _unigram, _wordpiece)
 
 
 def available_tokenizers():

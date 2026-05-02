@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from pathlib import Path
-
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from minilab.alignment_common import (
+    ReferenceCheckpointMixin,
     _kto_kl_batch,
     _load_reference_model,
     _log1mexp,
@@ -17,7 +16,7 @@ from minilab.alignment_common import (
 from minilab.checks import require
 from minilab.data import KTOBalancedBatchSampler, KTODataset
 from minilab.registry import register_trainer
-from minilab.trainer import TrainConfig, Trainer, model_aux_loss
+from minilab.trainer import TrainConfig, Trainer, model_aux_loss, supervised_lm_batch_loss
 
 
 @dataclass
@@ -48,6 +47,15 @@ class SimPOTrainConfig(DPOTrainConfig):
 
 
 @dataclass
+class RePOTrainConfig(TrainConfig):
+    repo_margin: float = 0.5
+
+    def __post_init__(self):
+        super().__post_init__()
+        require(self.repo_margin >= 0, "repo_margin must be >= 0")
+
+
+@dataclass
 class ORPOTrainConfig(TrainConfig):
     orpo_beta: float = 0.1
 
@@ -72,12 +80,11 @@ class KTOTrainConfig(DPOTrainConfig):
 @register_trainer("sft")
 class SFTTrainer(Trainer):
     def compute_loss(self, batch):
-        _, loss = self.model(batch["input_ids"], batch["labels"])
-        return loss
+        return supervised_lm_batch_loss(self.model, batch)
 
 
 @register_trainer("dpo")
-class DPOTrainer(Trainer):
+class DPOTrainer(ReferenceCheckpointMixin, Trainer):
     _extra_critical_fields = ("dpo_beta",)
 
     def __init__(self, model, train_dataset, config, ref_model_path, *, signature, tokenizer_sig="", eval_dataset=None):
@@ -90,10 +97,6 @@ class DPOTrainer(Trainer):
         super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
         self.ref_model = _load_reference_model(self.model, self.ref_model_path, self.device, "DPO")
         self.beta = config.dpo_beta
-
-    def save_checkpoint(self):
-        super().save_checkpoint()
-        (Path(self.config.save_dir) / f"step_{self.step}" / "ref_path.txt").write_text(self.ref_model_path)
 
     def compute_loss(self, batch):
         chosen_logp = _seq_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
@@ -111,7 +114,7 @@ class DPOTrainer(Trainer):
 
 
 @register_trainer("ipo")
-class IPOTrainer(Trainer):
+class IPOTrainer(ReferenceCheckpointMixin, Trainer):
     """Identity Preference Optimization with sequence log-probability margins."""
 
     _extra_critical_fields = ("dpo_beta",)
@@ -123,10 +126,6 @@ class IPOTrainer(Trainer):
         super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
         self.ref_model = _load_reference_model(self.model, self.ref_model_path, self.device, "IPO")
         self.beta = config.dpo_beta
-
-    def save_checkpoint(self):
-        super().save_checkpoint()
-        (Path(self.config.save_dir) / f"step_{self.step}" / "ref_path.txt").write_text(self.ref_model_path)
 
     def compute_loss(self, batch):
         chosen_logp = _seq_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
@@ -204,8 +203,32 @@ class ORPOTrainer(Trainer):
         return chosen_nll + odds_loss + 0.5 * aux_loss
 
 
+@register_trainer("repo")
+class RePOTrainer(Trainer):
+    """ReLU-based Preference Optimization.
+
+    RePO is the max-margin, reference-free limiting case of SimPO: it optimizes
+    the length-normalized chosen-vs-rejected log-probability gap with one margin
+    hyperparameter and a ReLU loss.
+    """
+
+    _extra_critical_fields = ("repo_margin",)
+
+    def __init__(self, model, train_dataset, config, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, RePOTrainConfig), "RePOTrainer requires RePOTrainConfig")
+        super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+        self.margin = config.repo_margin
+
+    def compute_loss(self, batch):
+        chosen_avg = _seq_avg_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
+        aux_loss = model_aux_loss(self.model)
+        rejected_avg = _seq_avg_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
+        aux_loss = aux_loss + model_aux_loss(self.model)
+        return F.relu(self.margin - (chosen_avg - rejected_avg)).mean() + 0.5 * aux_loss
+
+
 @register_trainer("kto")
-class KTOTrainer(Trainer):
+class KTOTrainer(ReferenceCheckpointMixin, Trainer):
     """Kahneman-Tversky Optimization from binary desirable/undesirable examples."""
 
     _extra_critical_fields = ("dpo_beta", "kto_desirable_weight", "kto_undesirable_weight")
@@ -243,10 +266,6 @@ class KTOTrainer(Trainer):
                 ),
             )
         return train_loader, eval_loader
-
-    def save_checkpoint(self):
-        super().save_checkpoint()
-        (Path(self.config.save_dir) / f"step_{self.step}" / "ref_path.txt").write_text(self.ref_model_path)
 
     def compute_loss(self, batch):
         labels = batch["preference_label"].bool()
