@@ -105,6 +105,11 @@ def generation_task_accuracy(
 ):
     """Evaluate PromptDataset-like rows with `answers` and a task reward function."""
     require(not model.training, "generation_task_accuracy expects model.eval() at the call boundary")
+    from minilab.data import AnsweredPromptDataset
+
+    require(isinstance(dataset, AnsweredPromptDataset), (
+        "generation_task_accuracy requires an AnsweredPromptDataset"
+    ))
     answers = dataset.answers
     require(len(answers) == len(dataset), "generation_task_accuracy answers must match dataset length")
     from minilab.generation import generate

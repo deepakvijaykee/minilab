@@ -51,7 +51,15 @@ _BYTE_LATENT_BUILD_FLAGS = ("dim", "num_layers", "num_heads", "attention", "norm
 _MAMBA_ONLY_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _MAMBA_BUILD_FLAGS)
 _XLSTM_ONLY_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _XLSTM_BUILD_FLAGS)
 _BYTE_LATENT_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _BYTE_LATENT_BUILD_FLAGS)
-_MTP_FLAGS = ("mtp_depth", "mtp_loss_weight")
+_GPT_ONLY_BUILD_FLAGS = (
+    "rope_local_base",
+    "rope_global_base",
+    "attention_k_eq_v",
+    "per_layer_embedding_dim",
+    "connection",
+    "mtp_depth",
+    "mtp_loss_weight",
+)
 _QK_CLIP_FLAGS = ("qk_clip_threshold", "qk_clip_balance")
 _QK_CLIP_MODEL_CHOICES = {"gpt", "hybrid", "hymba", "byte_latent"}
 _LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
@@ -117,7 +125,7 @@ if args.resume_from:
 elif model_name in {"mamba", "mamba2"}:
     reject_supplied(args, _MAMBA_ONLY_REJECTED_FLAGS, "only applies to --model gpt, hymba, hybrid, or xlstm")
 elif model_name in {"hybrid", "hymba"}:
-    reject_supplied(args, _MTP_FLAGS, "only applies to --model gpt")
+    reject_supplied(args, _GPT_ONLY_BUILD_FLAGS, "only applies to --model gpt")
 elif model_name == "xlstm":
     reject_supplied(args, _XLSTM_ONLY_REJECTED_FLAGS, "only applies to --model gpt")
 elif model_name == "byte_latent":

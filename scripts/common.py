@@ -88,7 +88,7 @@ def lm_model_kwargs(
     mtp_loss_weight=None,
 ):
     kwargs = _base_lm_kwargs(vocab_size, dim, num_layers, max_seq_len)
-    if model_name in {"gpt", "hybrid", "hymba"}:
+    if model_name == "gpt":
         kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
         _update_supplied(kwargs, {
             "num_kv_heads": num_kv_heads,
@@ -115,6 +115,27 @@ def lm_model_kwargs(
             "final_logit_softcap": final_logit_softcap,
             "mtp_depth": mtp_depth,
             "mtp_loss_weight": mtp_loss_weight,
+        })
+    elif model_name in {"hybrid", "hymba"}:
+        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
+        _update_supplied(kwargs, {
+            "num_kv_heads": num_kv_heads,
+            "attention": attention,
+            "position": position,
+            "norm": norm,
+            "ffn": ffn,
+            "num_experts": num_experts,
+            "top_k_experts": top_k_experts,
+            "post_norm": post_norm,
+            "rope_base": rope_base,
+            "rope_scaling_factor": rope_scaling_factor,
+            "rope_original_max_seq_len": rope_original_max_seq_len,
+            "rope_partial_rotary_factor": rope_partial_rotary_factor,
+            "yarn_beta_fast": yarn_beta_fast,
+            "yarn_beta_slow": yarn_beta_slow,
+            "local_attention_window": local_attention_window,
+            "qwen3_next_full_attention_interval": qwen3_next_full_attention_interval,
+            "final_logit_softcap": final_logit_softcap,
         })
     elif model_name in {"mamba", "mamba2"}:
         return kwargs

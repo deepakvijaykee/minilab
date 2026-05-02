@@ -74,6 +74,12 @@ def apply_simple_position(pos_enc, x, seq_len, owner):
     return x, freqs_cis, attn_bias, is_causal
 
 
+def attention_freqs_for_attention(attention_name, freqs_cis):
+    if attention_name == "gated_deltanet":
+        return None
+    return freqs_cis
+
+
 def apply_logit_softcap(logits, softcap):
     if softcap <= 0:
         return logits
