@@ -4,7 +4,7 @@
 """
 
 import argparse
-from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path
+from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path, resolve_default
 from minilab.tokenizers import load_tokenizer
 from minilab.data import load_gsm8k
 from minilab.alignment import (
@@ -78,16 +78,16 @@ if args.algorithm != "dapo":
     require(args.length_penalty is None, "--length-penalty only applies to --algorithm dapo")
     require(args.max_resample is None, "--max-resample only applies to --algorithm dapo")
 
-num_generations = 4 if args.num_generations is None else args.num_generations
-value_clip = 0.2 if args.value_clip is None else args.value_clip
-value_coef = 0.5 if args.value_coef is None else args.value_coef
-entropy_coef = 0.0 if args.entropy_coef is None else args.entropy_coef
-gae_lambda = 0.95 if args.gae_lambda is None else args.gae_lambda
-clip_ratio_low = 0.2 if args.clip_ratio_low is None else args.clip_ratio_low
-clip_ratio_high = 0.28 if args.clip_ratio_high is None else args.clip_ratio_high
-safe_length = 0 if args.safe_length is None else args.safe_length
-length_penalty = 0.0 if args.length_penalty is None else args.length_penalty
-max_resample = 5 if args.max_resample is None else args.max_resample
+num_generations = resolve_default(args.num_generations, 4)
+value_clip = resolve_default(args.value_clip, 0.2)
+value_coef = resolve_default(args.value_coef, 0.5)
+entropy_coef = resolve_default(args.entropy_coef, 0.0)
+gae_lambda = resolve_default(args.gae_lambda, 0.95)
+clip_ratio_low = resolve_default(args.clip_ratio_low, 0.2)
+clip_ratio_high = resolve_default(args.clip_ratio_high, 0.28)
+safe_length = resolve_default(args.safe_length, 0)
+length_penalty = resolve_default(args.length_penalty, 0.0)
+max_resample = resolve_default(args.max_resample, 5)
 inner_epochs = args.inner_epochs
 if inner_epochs is None:
     inner_epochs = 1 if args.algorithm == "rloo" else 4
@@ -100,7 +100,7 @@ if args.algorithm == "dapo":
 if args.algorithm == "rloo":
     require(args.clip_ratio is None, "RLOO is an unclipped REINFORCE estimator; do not set --clip-ratio")
 clip_ratio_default = 4e-4 if args.algorithm == "gspo" else 0.2
-clip_ratio = clip_ratio_default if args.clip_ratio is None else args.clip_ratio
+clip_ratio = resolve_default(args.clip_ratio, clip_ratio_default)
 
 tok = load_tokenizer(args.tokenizer)
 

@@ -17,8 +17,16 @@ from torch.utils.data import Dataset
 from minilab.base import BaseModel
 from minilab.checks import require
 from minilab.config import BaseConfig
-from minilab.models.gpt import GPTConfig, TransformerBlock
-from minilab.nn.architecture import MOE_FFNS, QK_CLIP_ATTENTIONS
+from minilab.models.transformer_utils import (
+    commit_transformer_block_updates,
+    set_transformer_qk_clip_recording,
+    transformer_auxiliary_loss,
+    transformer_supports_qk_clip,
+)
+from minilab.models.gpt import (
+    GPTConfig,
+    TransformerBlock,
+)
 from minilab.registry import get_norm, get_position, register_model
 
 
@@ -188,53 +196,56 @@ class OutcomeVerifier(BaseModel):
         self.score_head = nn.Linear(config.dim, 1)
         self.apply(self._init_weights)
 
+    def set_qk_clip_recording(self, enabled):
+        set_transformer_qk_clip_recording(self.blocks, enabled)
+
+    def supports_qk_clip(self):
+        return transformer_supports_qk_clip(self.blocks)
+
+    def auxiliary_loss(self):
+        return transformer_auxiliary_loss(self.blocks, self.config.ffn, next(self.parameters()))
+
+    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
+        commit_transformer_block_updates(
+            self.blocks,
+            self.config.ffn,
+            qk_clip_threshold,
+            qk_clip_balance,
+        )
+
     def forward(self, input_ids, attention_mask=None, labels=None):
         require(input_ids.size(1) <= self.config.max_seq_len, (
             f"OutcomeVerifier supports at most {self.config.max_seq_len} tokens, got {input_ids.size(1)}"
         ))
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            require(attention_mask.shape == input_ids.shape, "OutcomeVerifier attention_mask must match input_ids")
+            require(attention_mask.dtype == torch.bool, "OutcomeVerifier attention_mask must be bool")
+            attention_mask = attention_mask.to(input_ids.device)
+        require(attention_mask.any(dim=-1).all(), "OutcomeVerifier attention_mask must include at least one token")
+        expected_mask = (
+            torch.arange(input_ids.size(1), device=input_ids.device).unsqueeze(0)
+            < attention_mask.long().sum(dim=-1, keepdim=True)
+        )
+        require(torch.equal(attention_mask, expected_mask), (
+            "OutcomeVerifier attention_mask must be a right-padded prefix mask"
+        ))
         x = self._cast_hidden(self.tok_emb(input_ids))
         x = self.drop(x)
         freqs_cis = self.pos_enc(input_ids.size(1))
         for block in self.blocks:
-            x = block(x, freqs_cis=freqs_cis, is_causal=True)
+            x = self._checkpointed_forward(block, x, freqs_cis=freqs_cis, is_causal=True)
         x = self.ln_f(x)
         lengths = attention_mask.long().sum(dim=-1).clamp(min=1) - 1
         pooled = x[torch.arange(x.size(0), device=x.device), lengths]
         logits = self.score_head(pooled).squeeze(-1)
         loss = None
         if labels is not None:
+            require(labels.shape == logits.shape, "OutcomeVerifier labels must have shape (batch,)")
             loss = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
             loss = loss + self.auxiliary_loss()
         return logits, loss
-
-    def auxiliary_loss(self):
-        loss = next(self.parameters()).sum() * 0.0
-        if self.config.ffn not in MOE_FFNS:
-            return loss
-        for block in self.blocks:
-            loss = loss + block.ffn.aux_loss
-        return loss
-
-    def set_qk_clip_recording(self, enabled):
-        for block in self.blocks:
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.set_qk_clip_recording(enabled)
-
-    def supports_qk_clip(self):
-        return any(block.attention_name in QK_CLIP_ATTENTIONS for block in self.blocks)
-
-    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
-        if self.config.ffn == "aux_free_moe":
-            for block in self.blocks:
-                block.ffn.commit_routing_bias_update()
-        if qk_clip_threshold <= 0:
-            return
-        for block in self.blocks:
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
-
 
 def verifier_accuracy(logits, labels):
     preds = logits.sigmoid() >= 0.5

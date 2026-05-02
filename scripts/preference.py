@@ -7,7 +7,7 @@ import argparse
 
 import torch
 
-from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path
+from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path, resolve_default
 from minilab.alignment import (
     CPOTrainConfig,
     CPOTrainer,
@@ -75,11 +75,11 @@ if args.algorithm != "repo":
 if args.algorithm != "kto":
     require(args.kto_desirable_weight is None, "--kto-desirable-weight only applies to --algorithm kto")
     require(args.kto_undesirable_weight is None, "--kto-undesirable-weight only applies to --algorithm kto")
-cpo_alpha = 1.0 if args.cpo_alpha is None else args.cpo_alpha
-simpo_gamma = 0.5 if args.simpo_gamma is None else args.simpo_gamma
-repo_margin = 0.5 if args.repo_margin is None else args.repo_margin
-kto_desirable_weight = 1.0 if args.kto_desirable_weight is None else args.kto_desirable_weight
-kto_undesirable_weight = 1.0 if args.kto_undesirable_weight is None else args.kto_undesirable_weight
+cpo_alpha = resolve_default(args.cpo_alpha, 1.0)
+simpo_gamma = resolve_default(args.simpo_gamma, 0.5)
+repo_margin = resolve_default(args.repo_margin, 0.5)
+kto_desirable_weight = resolve_default(args.kto_desirable_weight, 1.0)
+kto_undesirable_weight = resolve_default(args.kto_undesirable_weight, 1.0)
 
 set_seed(args.seed)
 

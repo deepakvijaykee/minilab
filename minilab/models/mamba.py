@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 
 from minilab.base import BaseModel
@@ -81,11 +80,7 @@ class MambaLM(BaseModel):
         return (self.tok_emb, self.lm_head)
 
     def no_weight_decay_parameter_names(self):
-        return tuple(
-            name
-            for name, _ in self.named_parameters()
-            if name.endswith(".A_log")
-        )
+        return self._parameter_names_ending_with(".A_log")
 
     def forward(self, idx, targets=None):
         return self._causal_lm_forward(idx, targets)
@@ -97,10 +92,7 @@ class MambaLM(BaseModel):
         x = self._cast_hidden(self.tok_emb(idx))
         x = self.drop(x)
         for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
-            else:
-                x = block(x)
+            x = self._checkpointed_forward(block, x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
 

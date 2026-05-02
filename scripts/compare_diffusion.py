@@ -6,15 +6,13 @@
 import argparse
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
-from minilab.models.mdlm import MDLM, MDLMConfig
-from minilab.models.sedd import SEDD, SEDDConfig
-from minilab.models.d3pm import D3PM, D3PMConfig
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
 from minilab.nn.architecture import MOE_FFNS
 from common import (
-    PRETRAIN_DATASET_CHOICES,
+    PRETRAIN_EVAL_DATASET_CHOICES,
     attention_uses_gqa,
+    build_diffusion_model,
     load_pretrain_dataset,
     load_pretrain_eval_dataset,
     resolve_pretrain_max_examples,
@@ -22,15 +20,15 @@ from common import (
 )
 
 VARIANTS = [
-    ("MDLM", MDLM, MDLMConfig, "cosine"),
-    ("SEDD", SEDD, SEDDConfig, "log_linear"),
-    ("D3PM", D3PM, D3PMConfig, "cosine"),
+    ("MDLM", "mdlm", "cosine"),
+    ("SEDD", "sedd", "log_linear"),
+    ("D3PM", "d3pm", "cosine"),
 ]
 
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
-p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
+p.add_argument("--dataset", choices=PRETRAIN_EVAL_DATASET_CHOICES, default="tinystories")
 p.add_argument("--dim", type=int, default=128)
 p.add_argument("--num-layers", type=int, default=4)
 p.add_argument("--num-heads", type=int, default=8)
@@ -64,14 +62,23 @@ tc = TrainConfig(max_steps=args.max_steps, batch_size=args.batch_size, lr=3e-4,
 sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples, "mode": "diffusion"}, args.seq_len)
 
 results = []
-for name, cls, cfg_cls, schedule in VARIANTS:
+for name, model_name, schedule in VARIANTS:
     print(f"\n=== {name} (schedule={schedule}) ===")
     set_seed(args.seed)
-    cfg = cfg_cls(vocab_size=tok.vocab_size + 1, dim=args.dim, num_layers=args.num_layers,
-                  num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, max_seq_len=args.seq_len,
-                  attention=args.attention, ffn=args.ffn, num_experts=num_experts,
-                  top_k_experts=top_k_experts, mask_token_id=mask_id)
-    model = cls(cfg)
+    model = build_diffusion_model(
+        model_name,
+        vocab_size=tok.vocab_size + 1,
+        dim=args.dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        max_seq_len=args.seq_len,
+        attention=args.attention,
+        ffn=args.ffn,
+        num_experts=num_experts,
+        top_k_experts=top_k_experts,
+        mask_token_id=mask_id,
+    )
     fwd = ForwardProcess(mask_id, schedule=schedule)
     print(f"  {model.num_parameters():,} params")
     trainer = DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)

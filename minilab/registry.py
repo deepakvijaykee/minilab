@@ -2,6 +2,33 @@ from minilab.checks import require
 
 
 _REGISTRIES: dict[str, dict[str, type]] = {}
+__all__ = [
+    "get",
+    "get_attention",
+    "get_connection",
+    "get_ffn",
+    "get_model",
+    "get_norm",
+    "get_position",
+    "get_sampler",
+    "get_scheduler",
+    "get_task",
+    "get_tokenizer",
+    "get_trainer",
+    "list_available",
+    "register",
+    "register_attention",
+    "register_connection",
+    "register_ffn",
+    "register_model",
+    "register_norm",
+    "register_position",
+    "register_sampler",
+    "register_scheduler",
+    "register_task",
+    "register_tokenizer",
+    "register_trainer",
+]
 
 
 def register(kind, name):
@@ -27,26 +54,89 @@ def list_available(kind):
     return sorted(_REGISTRIES[kind].keys())
 
 
-def register_model(name): return register("model", name)
-def register_attention(name): return register("attention", name)
-def register_position(name): return register("position", name)
-def register_norm(name): return register("norm", name)
-def register_ffn(name): return register("ffn", name)
-def register_connection(name): return register("connection", name)
-def register_tokenizer(name): return register("tokenizer", name)
-def register_scheduler(name): return register("scheduler", name)
-def register_sampler(name): return register("sampler", name)
-def register_trainer(name): return register("trainer", name)
-def register_task(name): return register("task", name)
+def register_model(name):
+    return register("model", name)
 
-def get_model(name): return get("model", name)
-def get_attention(name): return get("attention", name)
-def get_position(name): return get("position", name)
-def get_norm(name): return get("norm", name)
-def get_ffn(name): return get("ffn", name)
-def get_connection(name): return get("connection", name)
-def get_tokenizer(name): return get("tokenizer", name)
-def get_scheduler(name): return get("scheduler", name)
-def get_sampler(name): return get("sampler", name)
-def get_trainer(name): return get("trainer", name)
-def get_task(name): return get("task", name)
+
+def register_attention(name):
+    return register("attention", name)
+
+
+def register_position(name):
+    return register("position", name)
+
+
+def register_norm(name):
+    return register("norm", name)
+
+
+def register_ffn(name):
+    return register("ffn", name)
+
+
+def register_connection(name):
+    return register("connection", name)
+
+
+def register_tokenizer(name):
+    return register("tokenizer", name)
+
+
+def register_scheduler(name):
+    return register("scheduler", name)
+
+
+def register_sampler(name):
+    return register("sampler", name)
+
+
+def register_trainer(name):
+    return register("trainer", name)
+
+
+def register_task(name):
+    return register("task", name)
+
+
+def get_model(name):
+    return get("model", name)
+
+
+def get_attention(name):
+    return get("attention", name)
+
+
+def get_position(name):
+    return get("position", name)
+
+
+def get_norm(name):
+    return get("norm", name)
+
+
+def get_ffn(name):
+    return get("ffn", name)
+
+
+def get_connection(name):
+    return get("connection", name)
+
+
+def get_tokenizer(name):
+    return get("tokenizer", name)
+
+
+def get_scheduler(name):
+    return get("scheduler", name)
+
+
+def get_sampler(name):
+    return get("sampler", name)
+
+
+def get_trainer(name):
+    return get("trainer", name)
+
+
+def get_task(name):
+    return get("task", name)

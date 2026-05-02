@@ -3,55 +3,36 @@ from pathlib import Path
 from minilab.checks import require
 from minilab.data import load_openwebtext, load_text8, load_tinystories, load_wikitext
 from minilab.evaluation import perplexity
-from minilab.generation import sample_d3pm, sample_diffusion, sample_sedd
-from minilab.models.block_diffusion import BlockDiffusionLM
-from minilab.models.byte_latent import ByteLatentLM
-from minilab.models.hymba import HymbaLM
-from minilab.models.gpt import GPT, GPTConfig
-from minilab.models.hybrid import HybridLM
-from minilab.models.mamba import MambaLM
-from minilab.models.mamba2 import Mamba2LM
-from minilab.models.xlstm import XLSTMLM
-from minilab.models.d3pm import D3PM
-from minilab.models.mdlm import MDLM
-from minilab.models.sedd import SEDD
+from minilab import generation as _generation
+from minilab import models as _models
 from minilab.nn.architecture import GQA_ATTENTIONS, resolve_deepseek_v4_attention
+from minilab.registry import get_model, get_sampler
 from minilab.trainer import LMTrainer, set_seed, tokenizer_signature
 from torch.utils.data import DataLoader
 
 
-_MODEL_CLASSES = {
-    "gpt": GPT,
-    "hymba": HymbaLM,
-    "hybrid": HybridLM,
-    "mamba": MambaLM,
-    "mamba2": Mamba2LM,
-    "xlstm": XLSTMLM,
-    "byte_latent": ByteLatentLM,
+# These imports execute model and sampler decorators before registry lookups below.
+_REGISTRY_IMPORTS = (_models, _generation)
+
+MODEL_CHOICES = ("gpt", "hymba", "hybrid", "mamba", "mamba2", "xlstm", "byte_latent")
+DIFFUSION_MODEL_CHOICES = ("mdlm", "sedd", "d3pm", "block_diffusion")
+_DIFFUSION_SAMPLER_NAMES = {
+    "mdlm": "ancestral",
+    "sedd": "sedd_analytical",
+    "d3pm": "d3pm_ancestral",
+    "block_diffusion": "ancestral",
 }
-_DIFFUSION_MODEL_CLASSES = {"mdlm": MDLM, "sedd": SEDD, "d3pm": D3PM, "block_diffusion": BlockDiffusionLM}
-_DIFFUSION_SAMPLER_BY_MODEL = {
-    "mdlm": sample_diffusion,
-    "sedd": sample_sedd,
-    "d3pm": sample_d3pm,
-    "block_diffusion": sample_diffusion,
-}
-MODEL_CHOICES = tuple(_MODEL_CLASSES)
-DIFFUSION_MODEL_CHOICES = tuple(_DIFFUSION_MODEL_CLASSES)
 PRETRAIN_DATASET_CHOICES = ("tinystories", "text8", "wikitext", "openwebtext")
-_MODEL_NAME_BY_CHECKPOINT_TYPE = {cls.__name__: name for name, cls in _MODEL_CLASSES.items()}
-_DIFFUSION_NAME_BY_CHECKPOINT_TYPE = {
-    cls.__name__: name for name, cls in _DIFFUSION_MODEL_CLASSES.items()
-}
+PRETRAIN_EVAL_DATASET_CHOICES = ("tinystories", "text8", "wikitext")
 
 
-def _lookup(table, name, kind):
-    require(name in table, f"Unknown {kind}: {name}. Available: {tuple(table)}")
-    return table[name]
+def _require_choice(name, choices, kind):
+    require(name in choices, f"Unknown {kind}: {name}. Available: {choices}")
 
 
 def model_class(name):
-    return _lookup(_MODEL_CLASSES, name, "model")
+    _require_choice(name, MODEL_CHOICES, "model")
+    return get_model(name)
 
 
 def build_lm_model(name, **config_kwargs):
@@ -59,8 +40,105 @@ def build_lm_model(name, **config_kwargs):
     return cls(cls.config_class(**config_kwargs))
 
 
+def _base_lm_kwargs(vocab_size, dim, num_layers, max_seq_len):
+    return {
+        "vocab_size": vocab_size,
+        "dim": dim,
+        "num_layers": num_layers,
+        "max_seq_len": max_seq_len,
+    }
+
+
+def _require_num_heads(model_name, num_heads):
+    require(num_heads is not None, f"{model_name} requires num_heads")
+    return num_heads
+
+
+def lm_model_kwargs(
+    model_name,
+    *,
+    vocab_size,
+    dim,
+    num_layers,
+    max_seq_len,
+    num_heads=None,
+    num_kv_heads=None,
+    attention=None,
+    position=None,
+    norm=None,
+    rope_base=None,
+    rope_local_base=None,
+    rope_global_base=None,
+    rope_scaling_factor=None,
+    rope_original_max_seq_len=None,
+    rope_partial_rotary_factor=None,
+    yarn_beta_fast=None,
+    yarn_beta_slow=None,
+    local_attention_window=None,
+    qwen3_next_full_attention_interval=None,
+    attention_k_eq_v=None,
+    per_layer_embedding_dim=None,
+    final_logit_softcap=None,
+    connection=None,
+    ffn=None,
+    num_experts=None,
+    top_k_experts=None,
+    post_norm=None,
+    mtp_depth=None,
+    mtp_loss_weight=None,
+):
+    kwargs = _base_lm_kwargs(vocab_size, dim, num_layers, max_seq_len)
+    if model_name in {"gpt", "hybrid", "hymba"}:
+        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
+        _update_supplied(kwargs, {
+            "num_kv_heads": num_kv_heads,
+            "attention": attention,
+            "position": position,
+            "norm": norm,
+            "connection": connection,
+            "ffn": ffn,
+            "num_experts": num_experts,
+            "top_k_experts": top_k_experts,
+            "post_norm": post_norm,
+            "rope_base": rope_base,
+            "rope_local_base": rope_local_base,
+            "rope_global_base": rope_global_base,
+            "rope_scaling_factor": rope_scaling_factor,
+            "rope_original_max_seq_len": rope_original_max_seq_len,
+            "rope_partial_rotary_factor": rope_partial_rotary_factor,
+            "yarn_beta_fast": yarn_beta_fast,
+            "yarn_beta_slow": yarn_beta_slow,
+            "local_attention_window": local_attention_window,
+            "qwen3_next_full_attention_interval": qwen3_next_full_attention_interval,
+            "attention_k_eq_v": attention_k_eq_v,
+            "per_layer_embedding_dim": per_layer_embedding_dim,
+            "final_logit_softcap": final_logit_softcap,
+            "mtp_depth": mtp_depth,
+            "mtp_loss_weight": mtp_loss_weight,
+        })
+    elif model_name in {"mamba", "mamba2"}:
+        return kwargs
+    elif model_name == "byte_latent":
+        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
+        _update_supplied(kwargs, {
+            "attention": attention,
+            "norm": norm,
+            "ffn": ffn,
+        })
+    elif model_name == "xlstm":
+        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
+    else:
+        raise ValueError(f"Unhandled model family: {model_name}")
+    return kwargs
+
+
+def _update_supplied(target, fields):
+    target.update({name: value for name, value in fields.items() if value is not None})
+
+
 def diffusion_model_class(name):
-    return _lookup(_DIFFUSION_MODEL_CLASSES, name, "diffusion model")
+    _require_choice(name, DIFFUSION_MODEL_CHOICES, "diffusion model")
+    return get_model(name)
 
 
 def build_diffusion_model(name, **config_kwargs):
@@ -109,7 +187,8 @@ def diffusion_model_kwargs(
 
 
 def diffusion_sampler(name):
-    return _lookup(_DIFFUSION_SAMPLER_BY_MODEL, name, "diffusion model")
+    _require_choice(name, DIFFUSION_MODEL_CHOICES, "diffusion model")
+    return get_sampler(_DIFFUSION_SAMPLER_NAMES[name])
 
 
 def flag_name(name):
@@ -166,10 +245,15 @@ def require_checkpoint_path(checkpoint, resume_from, context):
     return path
 
 
-def _checkpoint_model_name(path, name_by_type, kind):
+def _checkpoint_name_by_type(choices):
+    return {get_model(name).__name__: name for name in choices}
+
+
+def _checkpoint_model_name(path, choices, kind):
     type_path = Path(path) / "model_type.txt"
     require(type_path.exists(), f"Missing {type_path}; checkpoint must declare its model family")
     saved_type = type_path.read_text().strip()
+    name_by_type = _checkpoint_name_by_type(choices)
     require(
         saved_type in name_by_type,
         f"Checkpoint declares unsupported {kind} family {saved_type!r}; expected one of {tuple(name_by_type)}",
@@ -178,14 +262,14 @@ def _checkpoint_model_name(path, name_by_type, kind):
 
 
 def load_model_checkpoint(path, requested_model=None, device="cpu"):
-    model_name = requested_model or _checkpoint_model_name(path, _MODEL_NAME_BY_CHECKPOINT_TYPE, "language model")
+    model_name = requested_model or _checkpoint_model_name(path, MODEL_CHOICES, "language model")
     return model_name, model_class(model_name).load(path, device=device)
 
 
 def load_diffusion_model_checkpoint(path, requested_model=None, device="cpu"):
     model_name = requested_model or _checkpoint_model_name(
         path,
-        _DIFFUSION_NAME_BY_CHECKPOINT_TYPE,
+        DIFFUSION_MODEL_CHOICES,
         "diffusion model",
     )
     return model_name, diffusion_model_class(model_name).load(path, device=device)
@@ -206,10 +290,11 @@ def compare_lm_variants(
     seq_len,
 ):
     results = []
+    gpt_cls = model_class("gpt")
     for name, config_fields in variants:
         print(f"\n=== {name} ===")
         set_seed(seed)
-        cfg = GPTConfig(
+        cfg = gpt_cls.config_class(
             vocab_size=tok.vocab_size,
             dim=dim,
             num_layers=num_layers,
@@ -217,7 +302,7 @@ def compare_lm_variants(
             max_seq_len=seq_len,
             **config_fields,
         )
-        model = GPT(cfg)
+        model = gpt_cls(cfg)
         print(f"  {model.num_parameters():,} params")
         trainer = LMTrainer(
             model,

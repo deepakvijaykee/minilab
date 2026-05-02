@@ -5,7 +5,7 @@
 
 import argparse
 from common import (
-    PRETRAIN_DATASET_CHOICES,
+    PRETRAIN_EVAL_DATASET_CHOICES,
     compare_lm_variants,
     load_pretrain_dataset,
     load_pretrain_eval_dataset,
@@ -22,7 +22,7 @@ VARIANTS = [
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
-p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
+p.add_argument("--dataset", choices=PRETRAIN_EVAL_DATASET_CHOICES, default="tinystories")
 p.add_argument("--dim", type=int, default=128)
 p.add_argument("--num-layers", type=int, default=4)
 p.add_argument("--num-heads", type=int, default=8)

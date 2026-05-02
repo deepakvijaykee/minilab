@@ -10,6 +10,7 @@ from minilab.checks import require
 from minilab.registry import get_tokenizer, list_available
 
 _TOKENIZER_MODULES = (_byte, _bpe, _character, _unigram, _wordpiece)
+__all__ = ["available_tokenizers", "build_tokenizer", "load_tokenizer"]
 
 
 def available_tokenizers():

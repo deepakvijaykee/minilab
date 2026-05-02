@@ -20,6 +20,7 @@ from minilab.models.diffusion_base import (
     DiffusionBackboneMixin,
     DiffusionModelConfig,
     loss_normalizer,
+    supervised_diffusion_mask,
     validate_clean_tokens,
     validate_loss_mask,
 )
@@ -204,12 +205,7 @@ class BlockDiffusionLM(DiffusionBackboneMixin, BaseModel):
             t_emb = torch.cat([t_emb, t_emb], dim=1)
         freqs_cis = self.pos_enc(tokens.size(1))
         for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, t_emb, freqs_cis, attn_bias, use_reentrant=False
-                )
-            else:
-                x = block(x, t_emb, freqs_cis=freqs_cis, attn_bias=attn_bias)
+            x = self._checkpointed_forward(block, x, t_emb, freqs_cis=freqs_cis, attn_bias=attn_bias)
         x = self.ln_f(x[:, : z_t.size(1)])
         return apply_subs_clean_logits(self.lm_head(x), z_t, self.mask_token_id)
 
@@ -219,7 +215,7 @@ class BlockDiffusionLM(DiffusionBackboneMixin, BaseModel):
         require(fwd.process_type == self.forward_process_type, (
             "BlockDiffusionLM loss requires the absorbing forward process"
         ))
-        target_mask = mask if loss_mask is None else (mask & loss_mask)
+        target_mask = supervised_diffusion_mask(mask, loss_mask)
         log_probs = F.log_softmax(logits, dim=-1)
         log_p_x0 = log_probs.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)
         target_mask_f = target_mask.float()

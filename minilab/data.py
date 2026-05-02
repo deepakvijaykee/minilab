@@ -62,10 +62,7 @@ class SFTDataset(Dataset):
         require(seq_len > 1, f"SFTDataset requires seq_len > 1, got {seq_len}")
         self.data = []
         for ex in examples:
-            p = tokenizer.encode(ex["prompt"])
-            r = tokenizer.encode(ex["response"])
-            require(len(p) > 0, "SFT example has empty prompt")
-            require(len(r) > 0, "SFT example has empty response")
+            p, r = _prompt_response_tokens(ex, tokenizer, "SFT")
             prompt_len = min(len(p), seq_len - 1)
 
             self.data.append({
@@ -93,10 +90,7 @@ class DiffusionSFTDataset(Dataset):
         require(seq_len > 1, f"DiffusionSFTDataset requires seq_len > 1, got {seq_len}")
         self.data = []
         for ex in examples:
-            p = tokenizer.encode(ex["prompt"])
-            r = tokenizer.encode(ex["response"])
-            require(len(p) > 0, "Diffusion SFT example has empty prompt")
-            require(len(r) > 0, "Diffusion SFT example has empty response")
+            p, r = _prompt_response_tokens(ex, tokenizer, "Diffusion SFT")
             prompt_len = min(len(p), seq_len - 1)
             input_ids, loss_mask, valid_mask = _diffusion_pack(p, r, prompt_len, seq_len)
 
@@ -120,12 +114,7 @@ class PreferenceDataset(Dataset):
         require(seq_len > 1, f"PreferenceDataset requires seq_len > 1, got {seq_len}")
         self.data = []
         for ex in examples:
-            p = tokenizer.encode(ex["prompt"])
-            c = tokenizer.encode(ex["chosen"])
-            r = tokenizer.encode(ex["rejected"])
-            require(len(p) > 0, "Preference example has empty prompt")
-            require(len(c) > 0, "Preference example has empty chosen response")
-            require(len(r) > 0, "Preference example has empty rejected response")
+            p, c, r = _preference_tokens(ex, tokenizer, "Preference")
             prompt_len = min(len(p), seq_len - 1)
 
             self.data.append({
@@ -155,12 +144,7 @@ class KTODataset(Dataset):
         require(seq_len > 1, f"KTODataset requires seq_len > 1, got {seq_len}")
         self.data = []
         for ex in examples:
-            p = tokenizer.encode(ex["prompt"])
-            c = tokenizer.encode(ex["chosen"])
-            r = tokenizer.encode(ex["rejected"])
-            require(len(p) > 0, "KTO example has empty prompt")
-            require(len(c) > 0, "KTO example has empty chosen response")
-            require(len(r) > 0, "KTO example has empty rejected response")
+            p, c, r = _preference_tokens(ex, tokenizer, "KTO")
             prompt_len = min(len(p), seq_len - 1)
             self.data.append(_kto_row(p, c, prompt_len, seq_len, True))
             self.data.append(_kto_row(p, r, prompt_len, seq_len, False))
@@ -218,12 +202,7 @@ class DiffusionPreferenceDataset(Dataset):
         require(seq_len > 1, f"DiffusionPreferenceDataset requires seq_len > 1, got {seq_len}")
         self.data = []
         for ex in examples:
-            p = tokenizer.encode(ex["prompt"])
-            c = tokenizer.encode(ex["chosen"])
-            r = tokenizer.encode(ex["rejected"])
-            require(len(p) > 0, "Diffusion preference example has empty prompt")
-            require(len(c) > 0, "Diffusion preference example has empty chosen response")
-            require(len(r) > 0, "Diffusion preference example has empty rejected response")
+            p, c, r = _preference_tokens(ex, tokenizer, "Diffusion preference")
             prompt_len = min(len(p), seq_len - 1)
             chosen_ids, chosen_mask, chosen_valid = _diffusion_pack(p, c, prompt_len, seq_len)
             rejected_ids, rejected_mask, rejected_valid = _diffusion_pack(p, r, prompt_len, seq_len)
@@ -456,6 +435,53 @@ def _ultrafeedback_examples(max_examples):
         rejected = row["rejected"][-1]["content"]
         examples.append({"prompt": row["prompt"], "chosen": chosen, "rejected": rejected})
     return examples
+
+
+def _encoded_field(example, tokenizer, field, message):
+    require(field in example, f"example is missing required field: {field}")
+    ids = tokenizer.encode(example[field])
+    require(len(ids) > 0, message)
+    return ids
+
+
+def _prompt_response_tokens(example, tokenizer, context):
+    return (
+        _encoded_field(
+            tokenizer=tokenizer,
+            example=example,
+            field="prompt",
+            message=f"{context} example has empty prompt",
+        ),
+        _encoded_field(
+            tokenizer=tokenizer,
+            example=example,
+            field="response",
+            message=f"{context} example has empty response",
+        ),
+    )
+
+
+def _preference_tokens(example, tokenizer, context):
+    return (
+        _encoded_field(
+            tokenizer=tokenizer,
+            example=example,
+            field="prompt",
+            message=f"{context} example has empty prompt",
+        ),
+        _encoded_field(
+            tokenizer=tokenizer,
+            example=example,
+            field="chosen",
+            message=f"{context} example has empty chosen response",
+        ),
+        _encoded_field(
+            tokenizer=tokenizer,
+            example=example,
+            field="rejected",
+            message=f"{context} example has empty rejected response",
+        ),
+    )
 
 
 def _pack(prompt, response, prompt_len, seq_len):

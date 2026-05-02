@@ -6,7 +6,7 @@
 
 import argparse
 import torch
-from common import MODEL_CHOICES, build_lm_model, load_model_checkpoint, reject_supplied, resolve_default
+from common import MODEL_CHOICES, build_lm_model, lm_model_kwargs, load_model_checkpoint, reject_supplied, resolve_default
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.data import load_alpaca
@@ -61,14 +61,14 @@ elif args.checkpoint:
     model_name, model = load_model_checkpoint(args.checkpoint, args.model)
     print(f"Loaded {args.checkpoint} ({model_name}, {model.num_parameters():,} params)")
 else:
-    config_kwargs = {
-        "vocab_size": tok.vocab_size,
-        "dim": dim,
-        "num_layers": num_layers,
-        "max_seq_len": args.seq_len,
-    }
-    if model_name in {"gpt", "hybrid", "hymba", "xlstm", "byte_latent"}:
-        config_kwargs["num_heads"] = num_heads
+    config_kwargs = lm_model_kwargs(
+        model_name,
+        vocab_size=tok.vocab_size,
+        dim=dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        max_seq_len=args.seq_len,
+    )
     model = build_lm_model(model_name, **config_kwargs)
     print(f"New model ({model.num_parameters():,} params)")
 

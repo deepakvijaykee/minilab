@@ -94,8 +94,9 @@ class WordPieceTokenizer(BaseTokenizer):
     def encode(self, text: str) -> list[int]:
         require(self.UNK in self.token_to_id, "WordPiece tokenizer must be trained or loaded before encoding")
         ids = []
+        vocab = set(self.token_to_id)
         for word in text.split():
-            tokens = self._split_word(word, set(self.token_to_id))
+            tokens = self._split_word(word, vocab)
             ids.extend(self.token_to_id[t] for t in tokens)
         return ids
 

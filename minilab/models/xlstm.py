@@ -215,10 +215,7 @@ class XLSTMLM(BaseModel):
         x = self._cast_hidden(self.tok_emb(idx))
         x = self.drop(x)
         for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
-            else:
-                x = block(x)
+            x = self._checkpointed_forward(block, x)
         x = self.ln_f(x)
         logits = _soft_cap(self.lm_head(x), self.config.output_logit_soft_cap)
         return logits, x

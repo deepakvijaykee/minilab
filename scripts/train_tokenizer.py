@@ -7,7 +7,7 @@
 
 import argparse
 
-from common import PRETRAIN_DATASET_CHOICES
+from common import PRETRAIN_DATASET_CHOICES, resolve_default
 from minilab.checks import require
 from minilab.data import _example_limit, load_dataset, text8_standard_split
 from minilab.tokenizers import available_tokenizers, build_tokenizer
@@ -57,16 +57,16 @@ if args.type == "byte":
     ))
     dataset = "fixed-byte"
     num_texts = 0
-    vocab_size = 0 if args.vocab_size is None else args.vocab_size
+    vocab_size = resolve_default(args.vocab_size, 0)
     corpus = ""
     units = "the fixed UTF-8 byte vocabulary"
 else:
-    dataset = args.dataset or "tinystories"
-    vocab_size = 4096 if args.vocab_size is None else args.vocab_size
+    dataset = resolve_default(args.dataset, "tinystories")
+    vocab_size = resolve_default(args.vocab_size, 4096)
     if dataset == "text8":
-        num_texts = 0 if args.num_texts is None else args.num_texts
+        num_texts = resolve_default(args.num_texts, 0)
     else:
-        num_texts = 5000 if args.num_texts is None else args.num_texts
+        num_texts = resolve_default(args.num_texts, 5000)
     require(num_texts >= 0, "--num-texts must be >= 0")
     corpus, units = _load_tokenizer_corpus(dataset, num_texts)
 print(f"Corpus: {len(corpus):,} chars from {units}")

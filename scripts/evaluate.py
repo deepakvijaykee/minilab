@@ -13,14 +13,14 @@ from minilab.tokenizers.character import CharacterTokenizer
 from minilab.evaluation import bits_per_character, perplexity, distinct_n, self_bleu
 from minilab.generation import generate
 from minilab.trainer import validate_checkpoint_tokenizer
-from common import MODEL_CHOICES, PRETRAIN_DATASET_CHOICES, load_model_checkpoint, load_pretrain_eval_dataset
+from common import MODEL_CHOICES, PRETRAIN_EVAL_DATASET_CHOICES, load_model_checkpoint, load_pretrain_eval_dataset
 
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--checkpoint", required=True)
 p.add_argument("--model", choices=MODEL_CHOICES, default=None, help="override checkpoint model family")
-p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
+p.add_argument("--dataset", choices=PRETRAIN_EVAL_DATASET_CHOICES, default="tinystories")
 p.add_argument("--seq-len", type=int, default=256)
 p.add_argument("--num-samples", type=int, default=50)
 args = p.parse_args()

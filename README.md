@@ -198,7 +198,13 @@ minilab/
 ├── config.py            # BaseConfig with JSON serialization
 ├── base.py              # BaseModel (save/load/grad ckpt), BaseTokenizer
 ├── nn/
-│   ├── attention.py     # MHA/MQA/GQA/QK-Norm, Gemma/Qwen/Lightning-style paths, sparse, MLA, CSA/HCA
+│   ├── attention.py     # Public attention import surface and registration trigger
+│   ├── attention_standard.py   # MHA/MQA/GQA/QK-Norm, Gemma/Qwen GQA paths
+│   ├── attention_sparse.py     # IHA, sliding-window, block-sparse reference paths
+│   ├── attention_linear.py     # cosFormer, Lightning Attention-2, Gated DeltaNet
+│   ├── attention_latent.py     # MLA reference path
+│   ├── attention_compressed.py # CSA/HCA compressed attention reference paths
+│   ├── attention_common.py     # Rotary, masks, QK-Clip, and shared attention helpers
 │   ├── position.py      # RoPE, proportional RoPE, YaRN, ALiBi, T5/KERPLE, learned, none
 │   ├── ssm.py           # Mamba selective scan and Mamba-2 SSD reference paths
 │   ├── norm.py          # RMSNorm, zero-centered RMSNorm, LayerNorm

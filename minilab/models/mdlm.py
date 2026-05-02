@@ -15,6 +15,7 @@ from minilab.models.diffusion_base import (
     DiffusionBackboneMixin,
     DiffusionModelConfig,
     loss_normalizer,
+    supervised_diffusion_mask,
     validate_clean_tokens,
     validate_loss_mask,
 )
@@ -53,7 +54,7 @@ class MDLM(DiffusionBackboneMixin, BaseModel):
         validate_clean_tokens(x_0, self.config, "MDLM loss")
         loss_mask = validate_loss_mask(loss_mask, x_0, "MDLM loss")
         require(fwd.process_type == self.forward_process_type, "MDLM loss requires the absorbing forward process")
-        target_mask = mask if loss_mask is None else (mask & loss_mask)
+        target_mask = supervised_diffusion_mask(mask, loss_mask)
         log_probs = F.log_softmax(logits, dim=-1)
         log_p_x0 = log_probs.gather(-1, x_0.unsqueeze(-1)).squeeze(-1)
         per_ex_loglik = (log_p_x0 * target_mask.float()).sum(dim=-1)

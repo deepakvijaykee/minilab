@@ -15,8 +15,16 @@ from minilab.base import BaseModel
 from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
-from minilab.models.gpt import GPTConfig, TransformerBlock
-from minilab.nn.architecture import MOE_FFNS, QK_CLIP_ATTENTIONS
+from minilab.models.transformer_utils import (
+    commit_transformer_block_updates,
+    set_transformer_qk_clip_recording,
+    transformer_auxiliary_loss,
+    transformer_supports_qk_clip,
+)
+from minilab.models.gpt import (
+    GPTConfig,
+    TransformerBlock,
+)
 from minilab.registry import get_norm, get_position, register_model
 from minilab.tokenizers.byte import BYTE_VOCAB_SIZE
 
@@ -137,12 +145,21 @@ class ByteLatentLM(BaseModel):
         return (self.byte_emb, self.lm_head)
 
     def set_qk_clip_recording(self, enabled):
-        for block in self.blocks:
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.set_qk_clip_recording(enabled)
+        set_transformer_qk_clip_recording(self.blocks, enabled)
 
     def supports_qk_clip(self):
-        return any(block.attention_name in QK_CLIP_ATTENTIONS for block in self.blocks)
+        return transformer_supports_qk_clip(self.blocks)
+
+    def auxiliary_loss(self):
+        return transformer_auxiliary_loss(self.blocks, self.config.ffn, next(self.parameters()))
+
+    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
+        commit_transformer_block_updates(
+            self.blocks,
+            self.config.ffn,
+            qk_clip_threshold,
+            qk_clip_balance,
+        )
 
     def forward(self, input_ids, targets=None, patch_start_mask=None):
         logits, _ = self.forward_hidden(input_ids, patch_start_mask=patch_start_mask)
@@ -178,36 +195,17 @@ class ByteLatentLM(BaseModel):
         freqs_cis = self.pos_enc(num_patches)
         global_hidden = self.drop(pooled)
         for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                def run_block(h, block=block):
-                    return block(h, freqs_cis=freqs_cis, is_causal=True)
-                global_hidden = torch.utils.checkpoint.checkpoint(run_block, global_hidden, use_reentrant=False)
-            else:
-                global_hidden = block(global_hidden, freqs_cis=freqs_cis, is_causal=True)
+            global_hidden = self._checkpointed_forward(
+                block,
+                global_hidden,
+                freqs_cis=freqs_cis,
+                is_causal=True,
+            )
         prev_patch_ids = (patch_ids - 1).clamp(min=0)
         expanded = global_hidden.gather(1, prev_patch_ids.unsqueeze(-1).expand(-1, -1, self.config.dim))
         expanded = torch.where((patch_ids > 0).unsqueeze(-1), expanded, torch.zeros_like(expanded))
         hidden = self.ln_f(local + expanded)
         return self.lm_head(hidden), hidden
-
-    def auxiliary_loss(self):
-        loss = next(self.parameters()).sum() * 0.0
-        if self.config.ffn not in MOE_FFNS:
-            return loss
-        for block in self.blocks:
-            loss = loss + block.ffn.aux_loss
-        return loss
-
-    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
-        if self.config.ffn == "aux_free_moe":
-            for block in self.blocks:
-                block.ffn.commit_routing_bias_update()
-        if qk_clip_threshold <= 0:
-            return
-        for block in self.blocks:
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
-
 
 class _CausalConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):

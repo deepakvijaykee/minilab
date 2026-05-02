@@ -14,6 +14,7 @@ from minilab.models.diffusion_base import (
     DiffusionBackboneMixin,
     DiffusionModelConfig,
     loss_normalizer,
+    supervised_diffusion_mask,
     validate_clean_tokens,
     validate_loss_mask,
 )
@@ -56,7 +57,7 @@ class SEDD(DiffusionBackboneMixin, BaseModel):
         validate_clean_tokens(x_0, self.config, "SEDD loss")
         loss_mask = validate_loss_mask(loss_mask, x_0, "SEDD loss")
         require(fwd.process_type == self.forward_process_type, "SEDD loss requires the absorbing forward process")
-        target_mask = mask if loss_mask is None else (mask & loss_mask)
+        target_mask = supervised_diffusion_mask(mask, loss_mask)
 
         log_score = scores.double()
         sigma = fwd.get_sigma(t.to(scores.device)).double().view(-1, 1)

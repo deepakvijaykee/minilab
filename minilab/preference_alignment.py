@@ -83,6 +83,15 @@ class SFTTrainer(Trainer):
         return supervised_lm_batch_loss(self.model, batch)
 
 
+def _preference_pair_logps(model, batch, *, average=False):
+    score = _seq_avg_logp if average else _seq_logp
+    chosen = score(model, batch["chosen_ids"], batch["chosen_labels"])
+    aux_loss = model_aux_loss(model)
+    rejected = score(model, batch["rejected_ids"], batch["rejected_labels"])
+    aux_loss = aux_loss + model_aux_loss(model)
+    return chosen, rejected, 0.5 * aux_loss
+
+
 @register_trainer("dpo")
 class DPOTrainer(ReferenceCheckpointMixin, Trainer):
     _extra_critical_fields = ("dpo_beta",)
@@ -99,10 +108,7 @@ class DPOTrainer(ReferenceCheckpointMixin, Trainer):
         self.beta = config.dpo_beta
 
     def compute_loss(self, batch):
-        chosen_logp = _seq_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
-        aux_loss = model_aux_loss(self.model)
-        rejected_logp = _seq_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
-        aux_loss = aux_loss + model_aux_loss(self.model)
+        chosen_logp, rejected_logp, aux_loss = _preference_pair_logps(self.model, batch)
 
         with torch.no_grad():
             ref_chosen_logp = _seq_logp(self.ref_model, batch["chosen_ids"], batch["chosen_labels"])
@@ -110,7 +116,7 @@ class DPOTrainer(ReferenceCheckpointMixin, Trainer):
 
         chosen_reward = self.beta * (chosen_logp - ref_chosen_logp)
         rejected_reward = self.beta * (rejected_logp - ref_rejected_logp)
-        return -F.logsigmoid(chosen_reward - rejected_reward).mean() + 0.5 * aux_loss
+        return -F.logsigmoid(chosen_reward - rejected_reward).mean() + aux_loss
 
 
 @register_trainer("ipo")
@@ -128,15 +134,12 @@ class IPOTrainer(ReferenceCheckpointMixin, Trainer):
         self.beta = config.dpo_beta
 
     def compute_loss(self, batch):
-        chosen_logp = _seq_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
-        aux_loss = model_aux_loss(self.model)
-        rejected_logp = _seq_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
-        aux_loss = aux_loss + model_aux_loss(self.model)
+        chosen_logp, rejected_logp, aux_loss = _preference_pair_logps(self.model, batch)
         with torch.no_grad():
             ref_chosen = _seq_logp(self.ref_model, batch["chosen_ids"], batch["chosen_labels"])
             ref_rejected = _seq_logp(self.ref_model, batch["rejected_ids"], batch["rejected_labels"])
         logit = (chosen_logp - rejected_logp) - (ref_chosen - ref_rejected)
-        return (logit - 1.0 / (2.0 * self.beta)).square().mean() + 0.5 * aux_loss
+        return (logit - 1.0 / (2.0 * self.beta)).square().mean() + aux_loss
 
 
 @register_trainer("cpo")
@@ -152,13 +155,10 @@ class CPOTrainer(Trainer):
         self.alpha = config.cpo_alpha
 
     def compute_loss(self, batch):
-        chosen_logp = _seq_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
-        aux_loss = model_aux_loss(self.model)
-        rejected_logp = _seq_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
-        aux_loss = aux_loss + model_aux_loss(self.model)
+        chosen_logp, rejected_logp, aux_loss = _preference_pair_logps(self.model, batch)
         pref_loss = -F.logsigmoid(self.beta * (chosen_logp - rejected_logp)).mean()
         bc_loss = -chosen_logp.mean()
-        return pref_loss + self.alpha * bc_loss + 0.5 * aux_loss
+        return pref_loss + self.alpha * bc_loss + aux_loss
 
 
 @register_trainer("simpo")
@@ -174,11 +174,8 @@ class SimPOTrainer(Trainer):
         self.gamma = config.simpo_gamma
 
     def compute_loss(self, batch):
-        chosen_avg = _seq_avg_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
-        aux_loss = model_aux_loss(self.model)
-        rejected_avg = _seq_avg_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
-        aux_loss = aux_loss + model_aux_loss(self.model)
-        return -F.logsigmoid(self.beta * (chosen_avg - rejected_avg) - self.gamma).mean() + 0.5 * aux_loss
+        chosen_avg, rejected_avg, aux_loss = _preference_pair_logps(self.model, batch, average=True)
+        return -F.logsigmoid(self.beta * (chosen_avg - rejected_avg) - self.gamma).mean() + aux_loss
 
 
 @register_trainer("orpo")
@@ -193,14 +190,11 @@ class ORPOTrainer(Trainer):
         self.beta = config.orpo_beta
 
     def compute_loss(self, batch):
-        chosen_avg = _seq_avg_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
-        aux_loss = model_aux_loss(self.model)
-        rejected_avg = _seq_avg_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
-        aux_loss = aux_loss + model_aux_loss(self.model)
+        chosen_avg, rejected_avg, aux_loss = _preference_pair_logps(self.model, batch, average=True)
         log_odds = (chosen_avg - rejected_avg) - (_log1mexp(chosen_avg) - _log1mexp(rejected_avg))
         odds_loss = -self.beta * F.logsigmoid(log_odds).mean()
         chosen_nll = -chosen_avg.mean()
-        return chosen_nll + odds_loss + 0.5 * aux_loss
+        return chosen_nll + odds_loss + aux_loss
 
 
 @register_trainer("repo")
@@ -220,11 +214,8 @@ class RePOTrainer(Trainer):
         self.margin = config.repo_margin
 
     def compute_loss(self, batch):
-        chosen_avg = _seq_avg_logp(self.model, batch["chosen_ids"], batch["chosen_labels"])
-        aux_loss = model_aux_loss(self.model)
-        rejected_avg = _seq_avg_logp(self.model, batch["rejected_ids"], batch["rejected_labels"])
-        aux_loss = aux_loss + model_aux_loss(self.model)
-        return F.relu(self.margin - (chosen_avg - rejected_avg)).mean() + 0.5 * aux_loss
+        chosen_avg, rejected_avg, aux_loss = _preference_pair_logps(self.model, batch, average=True)
+        return F.relu(self.margin - (chosen_avg - rejected_avg)).mean() + aux_loss
 
 
 @register_trainer("kto")

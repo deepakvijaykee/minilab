@@ -117,6 +117,10 @@ def validate_loss_mask(loss_mask, x_0, context):
     return loss_mask.to(x_0.device)
 
 
+def supervised_diffusion_mask(noised_mask, loss_mask):
+    return noised_mask if loss_mask is None else (noised_mask & loss_mask)
+
+
 def loss_normalizer(x_0, loss_mask=None, normalization="sequence"):
     require(normalization in {"sequence", "target", "none"}, "normalization must be 'sequence', 'target', or 'none'")
     if normalization == "none":
@@ -170,10 +174,7 @@ class DiffusionBackboneMixin:
         t_emb = self.time_emb(t)
         freqs_cis = self.pos_enc(z_t.size(1))
         for block in self.blocks:
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, t_emb, freqs_cis, use_reentrant=False)
-            else:
-                x = block(x, t_emb, freqs_cis=freqs_cis)
+            x = self._checkpointed_forward(block, x, t_emb, freqs_cis=freqs_cis)
         return self.ln_f(x)
 
     def muon_auxiliary_modules(self):

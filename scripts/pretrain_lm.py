@@ -16,6 +16,7 @@ from common import (
     PRETRAIN_DATASET_CHOICES,
     attention_uses_gqa,
     build_lm_model,
+    lm_model_kwargs,
     load_pretrain_dataset,
     load_pretrain_eval_dataset,
     load_model_checkpoint,
@@ -227,64 +228,38 @@ if args.resume_from:
     model_name, model = load_model_checkpoint(args.resume_from, args.model)
     print(f"Resuming from {args.resume_from} ({model_name})")
 else:
-    if model_name in {"gpt", "hybrid", "hymba"}:
-        config_kwargs = {
-            "vocab_size": tok.vocab_size,
-            "dim": dim,
-            "num_layers": num_layers,
-            "num_heads": num_heads,
-            "num_kv_heads": args.num_kv_heads,
-            "max_seq_len": args.seq_len,
-            "attention": attention,
-            "position": position,
-            "norm": norm,
-            "connection": connection,
-            "ffn": ffn,
-            "num_experts": num_experts,
-            "top_k_experts": top_k_experts,
-            "post_norm": post_norm,
-            "rope_base": rope_base,
-            "rope_local_base": rope_local_base,
-            "rope_global_base": rope_global_base,
-            "rope_scaling_factor": rope_scaling_factor,
-            "rope_original_max_seq_len": rope_original_max_seq_len,
-            "rope_partial_rotary_factor": rope_partial_rotary_factor,
-            "yarn_beta_fast": yarn_beta_fast,
-            "yarn_beta_slow": yarn_beta_slow,
-            "local_attention_window": local_attention_window,
-            "qwen3_next_full_attention_interval": qwen3_next_full_attention_interval,
-            "attention_k_eq_v": attention_k_eq_v,
-            "per_layer_embedding_dim": per_layer_embedding_dim,
-            "final_logit_softcap": final_logit_softcap,
-            "mtp_depth": mtp_depth,
-            "mtp_loss_weight": mtp_loss_weight,
-        }
-    elif model_name in {"mamba", "mamba2"}:
-        config_kwargs = {
-            "vocab_size": tok.vocab_size,
-            "dim": dim,
-            "num_layers": num_layers,
-            "max_seq_len": args.seq_len,
-        }
-    elif model_name == "byte_latent":
-        config_kwargs = {
-            "vocab_size": tok.vocab_size,
-            "dim": dim,
-            "num_layers": num_layers,
-            "num_heads": num_heads,
-            "max_seq_len": args.seq_len,
-            "attention": attention,
-            "norm": norm,
-            "ffn": ffn,
-        }
-    else:
-        config_kwargs = {
-            "vocab_size": tok.vocab_size,
-            "dim": dim,
-            "num_layers": num_layers,
-            "num_heads": num_heads,
-            "max_seq_len": args.seq_len,
-        }
+    config_kwargs = lm_model_kwargs(
+        model_name,
+        vocab_size=tok.vocab_size,
+        dim=dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        num_kv_heads=args.num_kv_heads,
+        max_seq_len=args.seq_len,
+        attention=attention,
+        position=position,
+        norm=norm,
+        connection=connection,
+        ffn=ffn,
+        num_experts=num_experts,
+        top_k_experts=top_k_experts,
+        post_norm=post_norm,
+        rope_base=rope_base,
+        rope_local_base=rope_local_base,
+        rope_global_base=rope_global_base,
+        rope_scaling_factor=rope_scaling_factor,
+        rope_original_max_seq_len=rope_original_max_seq_len,
+        rope_partial_rotary_factor=rope_partial_rotary_factor,
+        yarn_beta_fast=yarn_beta_fast,
+        yarn_beta_slow=yarn_beta_slow,
+        local_attention_window=local_attention_window,
+        qwen3_next_full_attention_interval=qwen3_next_full_attention_interval,
+        attention_k_eq_v=attention_k_eq_v,
+        per_layer_embedding_dim=per_layer_embedding_dim,
+        final_logit_softcap=final_logit_softcap,
+        mtp_depth=mtp_depth,
+        mtp_loss_weight=mtp_loss_weight,
+    )
     model = build_lm_model(model_name, **config_kwargs)
 if args.qk_clip_threshold is not None:
     require(_uses_qk_clip(model), "--qk-clip-threshold requires QK-Clip-capable attention")

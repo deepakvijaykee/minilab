@@ -16,6 +16,7 @@ from minilab.models.diffusion_base import (
     DiffusionBackboneMixin,
     DiffusionModelConfig,
     loss_normalizer,
+    supervised_diffusion_mask,
     validate_clean_tokens,
     validate_loss_mask,
 )
@@ -62,7 +63,7 @@ class D3PM(DiffusionBackboneMixin, BaseModel):
         require(fwd.process_type == self.forward_process_type == self.transition, (
             "D3PM loss requires the absorbing forward process"
         ))
-        target_mask = mask if loss_mask is None else (mask & loss_mask)
+        target_mask = supervised_diffusion_mask(mask, loss_mask)
         idx = fwd.time_index(t, min_index=1, max_index=fwd.num_timesteps)
         t_now = idx.to(device=logits.device, dtype=torch.float32) / fwd.num_timesteps
         t_prev = (idx - 1).to(device=logits.device, dtype=torch.float32) / fwd.num_timesteps

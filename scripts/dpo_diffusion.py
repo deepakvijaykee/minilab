@@ -24,6 +24,7 @@ from common import (
     DIFFUSION_MODEL_CHOICES,
     load_diffusion_model_checkpoint,
     require_checkpoint_path,
+    resolve_default,
 )
 
 
@@ -100,7 +101,7 @@ if args.algorithm == "dpo":
     )
 else:
     tc = DiffusionVRPOTrainConfig(
-        vrpo_num_samples=4 if args.vrpo_num_samples is None else args.vrpo_num_samples,
+        vrpo_num_samples=resolve_default(args.vrpo_num_samples, 4),
         vrpo_antithetic=not args.no_vrpo_antithetic,
         **base_kwargs,
     )

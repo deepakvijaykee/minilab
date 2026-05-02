@@ -56,16 +56,6 @@ class ReferenceCheckpointMixin:
         _write_reference_path(self.config.save_dir, self.step, self.ref_model_path)
 
 
-class GRPOSchedulerHorizonMixin:
-    def _configured_scheduler_total_steps(self):
-        return self.config.max_steps * self.config.grpo_inner_epochs
-
-
-class RolloutPolicyTrainMixin:
-    def train(self):
-        _rollout_policy_train_loop(self, self.inner_epochs)
-
-
 def _validate_reference_tokenizer(ref_model_path, tokenizer_sig, algorithm):
     require(tokenizer_sig, f"{algorithm} requires tokenizer_sig to validate the frozen reference tokenizer")
     meta_path = Path(ref_model_path) / "run_meta.json"
@@ -103,13 +93,13 @@ def _load_reference_model(model, ref_model_path, device, algorithm):
 
 def _seq_logp(model, input_ids, labels):
     token_logp, mask = _token_logp(model, input_ids, labels)
+    _require_supervised_tokens(mask, "sequence log-probability")
     return (token_logp * mask).sum(dim=-1)
 
 
 def _seq_avg_logp(model, input_ids, labels):
     token_logp, mask = _token_logp(model, input_ids, labels)
-    counts = mask.sum(dim=-1)
-    require((counts > 0).all(), "sequence average log-probability requires at least one supervised token")
+    counts = _require_supervised_tokens(mask, "sequence average log-probability")
     return (token_logp * mask).sum(dim=-1) / counts
 
 
@@ -120,6 +110,12 @@ def _token_logp(model, input_ids, labels):
     safe_targets = labels.where(mask.bool(), torch.zeros_like(labels))
     token_logp = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
     return token_logp, mask
+
+
+def _require_supervised_tokens(mask, context):
+    counts = mask.sum(dim=-1)
+    require((counts > 0).all(), f"{context} requires at least one supervised token per sequence")
+    return counts
 
 
 def _log1mexp(logp):
@@ -164,6 +160,12 @@ def _whiten_masked(values, mask, eps=1e-8):
     std = selected.std(unbiased=False)
     whitened = (values - mean) / (std + eps)
     return whitened * mask
+
+
+def _group_normalized_advantages(rewards):
+    centered = rewards - rewards.mean(dim=1, keepdim=True)
+    std = rewards.std(dim=1, keepdim=True, unbiased=False)
+    return torch.where(std > 0, centered / std, torch.zeros_like(centered))
 
 
 def _generation_context_token_logp(model, input_ids, labels, return_aux=False):

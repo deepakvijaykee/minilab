@@ -53,15 +53,6 @@ def _sample_next_token(logits, temperature, top_k=0, top_p=1.0):
     return torch.multinomial(logits.softmax(-1), 1)
 
 
-def _sample_clean_predictions(logits, mask_id, temperature):
-    logits = logits.clone()
-    logits[:, :, mask_id] = float("-inf")
-    if temperature == 0:
-        return logits.argmax(-1)
-    logits = logits / temperature
-    return torch.multinomial(logits.softmax(-1).view(-1, logits.size(-1)), 1).view(logits.shape[:2])
-
-
 def _absorbing_unmask_probability(fwd, t_now, t_next):
     alpha_now = fwd.alpha_at(t_now.unsqueeze(0)).item()
     alpha_next = fwd.alpha_at(t_next.unsqueeze(0)).item()
@@ -72,12 +63,32 @@ def _fill_remaining_masks(model, z, mask_id, batch_size):
     still_masked = z == mask_id
     if not still_masked.any():
         return z
-    predictions = _sample_clean_predictions(
+    predictions = sample_clean_logits(
         model(z, torch.zeros(batch_size, device=z.device)),
         mask_id,
         temperature=0,
     )
     return torch.where(still_masked, predictions, z)
+
+
+def _sample_clean_logits_reverse(model, fwd, batch_size, seq_len, num_steps, temperature, cache_interval=1):
+    device = next(model.parameters()).device
+    mask_id = fwd.mask_token_id
+    z = torch.full((batch_size, seq_len), mask_id, device=device, dtype=torch.long)
+    timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+    logits = None
+    for i in range(num_steps):
+        t_now, t_next = timesteps[i], timesteps[i + 1]
+        if i % cache_interval == 0:
+            logits = model(z, t_now.expand(batch_size))
+        predictions = sample_clean_logits(logits, mask_id, temperature)
+        unmask_prob = _absorbing_unmask_probability(fwd, t_now, t_next)
+
+        unmask = torch.rand(batch_size, seq_len, device=device) < unmask_prob
+        z = torch.where((z == mask_id) & unmask, predictions, z)
+
+    return _fill_remaining_masks(model, z, mask_id, batch_size)
 
 
 @torch.no_grad()
@@ -190,22 +201,7 @@ def sample_diffusion(model, fwd, batch_size, seq_len, num_steps=None, temperatur
     require(batch_size > 0 and seq_len > 0, "batch_size and seq_len must be > 0")
     require(0 < num_steps <= fwd.num_timesteps, "num_steps must be in [1, fwd.num_timesteps]")
     require(temperature >= 0, "temperature must be >= 0")
-    device = next(model.parameters()).device
-
-    mask_id = fwd.mask_token_id
-    z = torch.full((batch_size, seq_len), mask_id, device=device, dtype=torch.long)
-    timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-
-    for i in range(num_steps):
-        t_now, t_next = timesteps[i], timesteps[i + 1]
-        logits = model(z, t_now.expand(batch_size))
-        predictions = _sample_clean_predictions(logits, mask_id, temperature)
-        unmask_prob = _absorbing_unmask_probability(fwd, t_now, t_next)
-
-        unmask = torch.rand(batch_size, seq_len, device=device) < unmask_prob
-        z = torch.where((z == mask_id) & unmask, predictions, z)
-
-    return _fill_remaining_masks(model, z, mask_id, batch_size)
+    return _sample_clean_logits_reverse(model, fwd, batch_size, seq_len, num_steps, temperature)
 
 
 @register_sampler("ddpm_cache")
@@ -221,26 +217,15 @@ def sample_diffusion_cached(model, fwd, batch_size, seq_len, num_steps=None, tem
     require(0 < num_steps <= fwd.num_timesteps, "num_steps must be in [1, fwd.num_timesteps]")
     require(temperature >= 0, "temperature must be >= 0")
     require(cache_interval > 0, "cache_interval must be > 0")
-    device = next(model.parameters()).device
-
-    mask_id = fwd.mask_token_id
-    z = torch.full((batch_size, seq_len), mask_id, device=device, dtype=torch.long)
-    timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-
-    logits = None
-    for i in range(num_steps):
-        t_now, t_next = timesteps[i], timesteps[i + 1]
-
-        if i % cache_interval == 0:
-            logits = model(z, t_now.expand(batch_size))
-
-        predictions = _sample_clean_predictions(logits, mask_id, temperature)
-        unmask_prob = _absorbing_unmask_probability(fwd, t_now, t_next)
-
-        unmask = torch.rand(batch_size, seq_len, device=device) < unmask_prob
-        z = torch.where((z == mask_id) & unmask, predictions, z)
-
-    return _fill_remaining_masks(model, z, mask_id, batch_size)
+    return _sample_clean_logits_reverse(
+        model,
+        fwd,
+        batch_size,
+        seq_len,
+        num_steps,
+        temperature,
+        cache_interval=cache_interval,
+    )
 
 
 @register_sampler("sedd_analytical")

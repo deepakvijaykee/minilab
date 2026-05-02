@@ -7,15 +7,25 @@ normal causal LM objective and weight tying used elsewhere in minilab.
 
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 
 from minilab.base import BaseModel
 from minilab.checks import require
-from minilab.models.gpt import GPTConfig, TransformerBlock
+from minilab.models.transformer_utils import (
+    apply_logit_softcap,
+    apply_simple_position,
+    build_rope_or_simple_position,
+    commit_transformer_block_updates,
+    set_transformer_qk_clip_recording,
+    transformer_auxiliary_loss,
+    transformer_supports_qk_clip,
+)
+from minilab.models.gpt import (
+    GPTConfig,
+    TransformerBlock,
+)
 from minilab.models.mamba import MambaBlock
-from minilab.nn.architecture import MOE_FFNS, QK_CLIP_ATTENTIONS
-from minilab.registry import get_norm, get_position, register_model
+from minilab.registry import get_norm, register_model
 
 
 @dataclass
@@ -67,7 +77,7 @@ class HybridLM(BaseModel):
         self.ln_f = get_norm(config.norm)(config.dim)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
-        self.pos_enc = _hybrid_position(config)
+        self.pos_enc = build_rope_or_simple_position(config, "HybridLM")
         self.apply(self._init_weights)
 
     def muon_auxiliary_modules(self):
@@ -77,17 +87,23 @@ class HybridLM(BaseModel):
         return tuple(modules)
 
     def no_weight_decay_parameter_names(self):
-        return tuple(name for name, _ in self.named_parameters() if name.endswith(".A_log"))
+        return self._parameter_names_ending_with(".A_log")
 
     def set_qk_clip_recording(self, enabled):
-        for block in self.blocks:
-            if isinstance(block, TransformerBlock) and block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.set_qk_clip_recording(enabled)
+        set_transformer_qk_clip_recording(self._transformer_blocks(), enabled)
 
     def supports_qk_clip(self):
-        return any(
-            isinstance(block, TransformerBlock) and block.attention_name in QK_CLIP_ATTENTIONS
-            for block in self.blocks
+        return transformer_supports_qk_clip(self._transformer_blocks())
+
+    def auxiliary_loss(self):
+        return transformer_auxiliary_loss(self._transformer_blocks(), self.config.ffn, next(self.parameters()))
+
+    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
+        commit_transformer_block_updates(
+            self._transformer_blocks(),
+            self.config.ffn,
+            qk_clip_threshold,
+            qk_clip_balance,
         )
 
     def forward(self, idx, targets=None):
@@ -99,80 +115,25 @@ class HybridLM(BaseModel):
         ))
         x = self._cast_hidden(self.tok_emb(idx))
         T = idx.size(1)
-        freqs_cis = None
-        attn_bias = None
-        is_causal = True
-        if self.pos_enc is not None:
-            if self.pos_enc.kind == "rotary":
-                freqs_cis = self.pos_enc(T)
-            elif self.pos_enc.kind == "additive":
-                x = x + self._cast_hidden(self.pos_enc(T))
-            else:
-                require(self.pos_enc.kind == "none", f"HybridLM unsupported position kind: {self.pos_enc.kind}")
+        x, freqs_cis, attn_bias, is_causal = apply_simple_position(self.pos_enc, x, T, "HybridLM")
         x = self.drop(x)
         for block in self.blocks:
             if isinstance(block, MambaBlock):
-                if self._gradient_checkpointing and self.training:
-                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
-                else:
-                    x = block(x)
+                x = self._checkpointed_forward(block, x)
             else:
-                if self._gradient_checkpointing and self.training:
-                    def run_block(h, block=block):
-                        return block(h, freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=is_causal)
-                    x = torch.utils.checkpoint.checkpoint(run_block, x, use_reentrant=False)
-                else:
-                    x = block(x, freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=is_causal)
+                x = self._checkpointed_forward(
+                    block,
+                    x,
+                    freqs_cis=freqs_cis,
+                    attn_bias=attn_bias,
+                    is_causal=is_causal,
+                )
         x = self.ln_f(x)
-        logits = self.lm_head(x)
-        if self.config.final_logit_softcap > 0:
-            logits = torch.tanh(logits / self.config.final_logit_softcap) * self.config.final_logit_softcap
-        return logits, x
+        return apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap), x
 
-    def auxiliary_loss(self):
-        loss = next(self.parameters()).sum() * 0.0
-        if self.config.ffn not in MOE_FFNS:
-            return loss
-        for block in self.blocks:
-            if isinstance(block, TransformerBlock):
-                loss = loss + block.ffn.aux_loss
-        return loss
-
-    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
-        if self.config.ffn == "aux_free_moe":
-            for block in self.blocks:
-                if isinstance(block, TransformerBlock):
-                    block.ffn.commit_routing_bias_update()
-        if qk_clip_threshold <= 0:
-            return
-        for block in self.blocks:
-            if isinstance(block, TransformerBlock) and block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
+    def _transformer_blocks(self):
+        return [block for block in self.blocks if isinstance(block, TransformerBlock)]
 
 
 def _is_mamba_layer(layer_id, config):
     return layer_id % config.mamba_every == config.mamba_offset
-
-
-def _hybrid_position(config):
-    head_dim = config.dim // config.num_heads
-    if config.position == "rope":
-        return get_position("rope")(head_dim, config.max_seq_len, base=config.rope_base)
-    if config.position == "sinusoidal":
-        return get_position("sinusoidal")(config.dim, config.max_seq_len)
-    if config.position == "none":
-        return get_position("none")(config.dim, config.max_seq_len)
-    if config.position == "yarn_rope":
-        return get_position("yarn_rope")(
-            head_dim,
-            config.max_seq_len,
-            base=config.rope_base,
-            factor=config.rope_scaling_factor,
-            original_max_seq_len=config.rope_original_max_seq_len,
-            beta_fast=config.yarn_beta_fast,
-            beta_slow=config.yarn_beta_slow,
-        )
-    require(False, (
-        f"HybridLM unsupported position variant: {config.position}. "
-        "Gemma/Qwen local-global rotary schedules are implemented by GPT, not HybridLM."
-    ))

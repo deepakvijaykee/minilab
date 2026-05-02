@@ -9,10 +9,16 @@ from minilab.base import BaseModel
 from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
+from minilab.models.transformer_utils import (
+    apply_logit_softcap,
+    commit_transformer_block_updates,
+    set_transformer_qk_clip_recording,
+    transformer_auxiliary_loss,
+    transformer_supports_qk_clip,
+)
 from minilab.nn.architecture import (
     GQA_ATTENTIONS,
     MOE_FFNS,
-    QK_CLIP_ATTENTIONS,
     TOP_ONE_MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
@@ -85,6 +91,13 @@ class GPTConfig(BaseConfig):
     def __post_init__(self):
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
+        self._validate_core_fields()
+        self._validate_attention_position_contract()
+        self._reject_unused_variant_knobs()
+        self._validate_connection_knobs()
+        self._validate_ffn_knobs()
+
+    def _validate_core_fields(self):
         require(self.vocab_size > 0, "vocab_size must be > 0")
         require(self.dim > 0, "dim must be > 0")
         require(self.num_layers > 0, "num_layers must be > 0")
@@ -112,12 +125,15 @@ class GPTConfig(BaseConfig):
         require((self.mtp_depth == 0) == (self.mtp_loss_weight == 0), (
             "mtp_depth and mtp_loss_weight must be enabled together"
         ))
+
+    def _validate_attention_position_contract(self):
         if _attention_uses_gqa(self.attention):
             require(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
         else:
             require(self.num_kv_heads == self.num_heads, "num_kv_heads only applies to GQA attention variants")
         if self.position in _ROPE_POSITIONS:
-            require((self.dim // self.num_heads) % 2 == 0, "RoPE requires even head dimension")
+            head_dim = self.dim // self.num_heads
+            require(head_dim % 2 == 0, "RoPE requires even head dimension")
         if self.position == "sinusoidal":
             require(self.dim % 2 == 0, "sinusoidal position requires even dim")
         if self.attention == "cosformer":
@@ -147,9 +163,18 @@ class GPTConfig(BaseConfig):
         require(self.position != "qwen3_next_rope" or qwen_rope_attention, (
             "Gemma/Qwen local-global position='qwen3_next_rope' requires Qwen3-Next or partial-RoPE attention"
         ))
-        self._reject_unused_variant_knobs()
+        if self.position in {"gemma4_rope", "qwen3_next_rope"}:
+            head_dim = self.dim // self.num_heads
+            require(int(self.rope_partial_rotary_factor * head_dim // 2) > 0, (
+                "Gemma/Qwen proportional RoPE must rotate at least one frequency; "
+                "increase head dimension or rope_partial_rotary_factor"
+            ))
+
+    def _validate_connection_knobs(self):
         if self.per_layer_embedding_dim > 0:
             require(self.connection == "residual", "per-layer embeddings require residual connections")
+
+    def _validate_ffn_knobs(self):
         if self.ffn in MOE_FFNS:
             require(self.num_experts > 0, "num_experts must be > 0")
             require(1 <= self.top_k_experts <= self.num_experts, "top_k_experts must be in [1, num_experts]")
@@ -440,6 +465,10 @@ class MultiTokenPredictionModule(nn.Module):
 
     def forward(self, hidden, future_emb, freqs_cis=None, attn_bias=None, is_causal=True):
         x = self.proj(torch.cat([self.hidden_norm(hidden), self.embed_norm(future_emb)], dim=-1))
+        if not self.block.uses_residual_connection:
+            x = expand_residual_stream(x, self.block.attn_conn.expansion)
+            x = self.block(x, freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=is_causal)
+            return reduce_residual_stream(x)
         return self.block(x, freqs_cis=freqs_cis, attn_bias=attn_bias, is_causal=is_causal)
 
 
@@ -472,7 +501,7 @@ class GPT(BaseModel):
 
         self.apply(self._init_weights)
         if config.connection in ("hc", "mhc"):
-            for block in self.blocks:
+            for block in self._optimizer_transformer_blocks():
                 block.attn_conn.reset_dynamic_parameters()
                 block.ffn_conn.reset_dynamic_parameters()
 
@@ -483,40 +512,26 @@ class GPT(BaseModel):
         if self.pos_enc is not None and any(p.requires_grad for p in self.pos_enc.parameters()):
             modules.append(self.pos_enc)
         if self.config.connection != "residual":
-            for block in self.blocks:
+            for block in self._optimizer_transformer_blocks():
                 modules.extend((block.attn_conn, block.ffn_conn))
         return tuple(modules)
 
     def set_qk_clip_recording(self, enabled):
-        for block in self.blocks:
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.set_qk_clip_recording(enabled)
-        for module in self.mtp_modules:
-            block = module.block
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.set_qk_clip_recording(enabled)
-
-    def auxiliary_loss(self):
-        return self._ffn_auxiliary_loss()
-
-    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
-        if self.config.ffn == "aux_free_moe":
-            for block in self.blocks:
-                block.ffn.commit_routing_bias_update()
-            for module in self.mtp_modules:
-                module.block.ffn.commit_routing_bias_update()
-        if qk_clip_threshold <= 0:
-            return
-        for block in self.blocks:
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
-        for module in self.mtp_modules:
-            block = module.block
-            if block.attention_name in QK_CLIP_ATTENTIONS:
-                block.attn.commit_qk_clip_update(qk_clip_threshold, qk_clip_balance)
+        set_transformer_qk_clip_recording(self._optimizer_transformer_blocks(), enabled)
 
     def supports_qk_clip(self):
-        return any(block.attention_name in QK_CLIP_ATTENTIONS for block in self.blocks)
+        return transformer_supports_qk_clip(self.blocks)
+
+    def auxiliary_loss(self):
+        return transformer_auxiliary_loss(self.blocks, self.config.ffn, next(self.parameters()))
+
+    def post_optimizer_step(self, qk_clip_threshold, qk_clip_balance):
+        commit_transformer_block_updates(
+            self._optimizer_transformer_blocks(),
+            self.config.ffn,
+            qk_clip_threshold,
+            qk_clip_balance,
+        )
 
     def forward(self, idx, targets=None):
         logits, _, main_hidden = self.forward_hidden(idx, return_residual=True)
@@ -525,7 +540,7 @@ class GPT(BaseModel):
         if targets is not None:
             loss = causal_lm_cross_entropy(logits, targets)
             loss = loss + self._mtp_loss(main_hidden, idx, targets)
-            loss = loss + self._ffn_auxiliary_loss()
+            loss = loss + self.auxiliary_loss()
 
         return logits, loss
 
@@ -549,27 +564,21 @@ class GPT(BaseModel):
         for block in self.blocks:
             block_freqs = self._block_freqs(block, T, freqs_cis)
             per_layer_input = per_layer_inputs[:, :, block.block_id, :] if per_layer_inputs is not None else None
-            if self._gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, block_freqs, attn_bias, is_causal, per_layer_input, use_reentrant=False
-                )
-            else:
-                x = block(
-                    x,
-                    freqs_cis=block_freqs,
-                    attn_bias=attn_bias,
-                    is_causal=is_causal,
-                    per_layer_input=per_layer_input,
-                )
+            x = self._checkpointed_forward(
+                block,
+                x,
+                freqs_cis=block_freqs,
+                attn_bias=attn_bias,
+                is_causal=is_causal,
+                per_layer_input=per_layer_input,
+            )
 
         if self.config.connection != "residual":
             x = reduce_residual_stream(x)
 
         main_hidden = x
         x = self.ln_f(main_hidden)
-        logits = self.lm_head(x)
-        if self.config.final_logit_softcap > 0:
-            logits = torch.tanh(logits / self.config.final_logit_softcap) * self.config.final_logit_softcap
+        logits = apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap)
 
         if return_residual:
             return logits, x, main_hidden
@@ -623,10 +632,7 @@ class GPT(BaseModel):
             next_kv.append(block_kv)
 
         x = self.ln_f(x)
-        logits = self.lm_head(x)
-        if self.config.final_logit_softcap > 0:
-            logits = torch.tanh(logits / self.config.final_logit_softcap) * self.config.final_logit_softcap
-        return logits, next_kv
+        return apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap), next_kv
 
     def _position_inputs(self, seq_len, offset=0):
         freqs_cis, attn_bias, is_causal = None, None, True
@@ -670,10 +676,7 @@ class GPT(BaseModel):
         return self._block_freqs(block, seq_len, freqs_cis), attn_bias, is_causal
 
     def _mtp_logits(self, hidden):
-        logits = self.lm_head(self.ln_f(hidden))
-        if self.config.final_logit_softcap > 0:
-            logits = torch.tanh(logits / self.config.final_logit_softcap) * self.config.final_logit_softcap
-        return logits
+        return apply_logit_softcap(self.lm_head(self.ln_f(hidden)), self.config.final_logit_softcap)
 
     def _mtp_loss(self, main_hidden, idx, targets):
         if self.config.mtp_depth == 0 or self.config.mtp_loss_weight == 0:
@@ -704,13 +707,8 @@ class GPT(BaseModel):
             return main_hidden.sum() * 0.0
         return self.config.mtp_loss_weight * torch.stack(mtp_losses).mean() + mtp_aux
 
-    def _ffn_auxiliary_loss(self):
-        if self.config.ffn not in MOE_FFNS:
-            return next(self.parameters()).sum() * 0.0
-        loss = next(self.parameters()).sum() * 0.0
-        for block in self.blocks:
-            loss = loss + block.ffn.aux_loss
-        return loss
+    def _optimizer_transformer_blocks(self):
+        return [*self.blocks, *(module.block for module in self.mtp_modules)]
 
     def supports_kv_cache(self):
         if self.training:

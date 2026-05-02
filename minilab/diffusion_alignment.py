@@ -7,10 +7,10 @@ import torch
 import torch.nn.functional as F
 
 from minilab.alignment_common import (
-    GRPOSchedulerHorizonMixin,
-    RolloutPolicyTrainMixin,
     _diffusion_loss_per_example,
+    _group_normalized_advantages,
     _load_reference_model,
+    _rollout_policy_train_loop,
     _trainer_reference_path,
     _validate_reference_tokenizer,
 )
@@ -88,6 +88,30 @@ class _DiffusionAlignmentCheckpointMixin:
     def save_checkpoint(self):
         super().save_checkpoint()
         _save_diffusion_alignment_checkpoint(self.config.save_dir, self.step, self.ref_model_path, self.fwd)
+
+
+def _diffusion_pair_losses(
+    model,
+    fwd,
+    chosen_ids,
+    chosen_mask,
+    t,
+    chosen_z,
+    chosen_noised,
+    rejected_ids,
+    rejected_mask,
+    rejected_z,
+    rejected_noised,
+):
+    chosen = _diffusion_loss_per_example(
+        model, fwd, chosen_ids, chosen_mask, t, chosen_z, chosen_noised
+    )
+    aux_loss = model_aux_loss(model)
+    rejected = _diffusion_loss_per_example(
+        model, fwd, rejected_ids, rejected_mask, t, rejected_z, rejected_noised
+    )
+    aux_loss = aux_loss + model_aux_loss(model)
+    return chosen, rejected, 0.5 * aux_loss
 
 
 def _validate_reference_forward_process(ref_model_path, forward_process, algorithm):
@@ -170,14 +194,19 @@ class DiffusionDPOTrainer(_DiffusionAlignmentCheckpointMixin, Trainer):
             t=t,
         )
 
-        policy_chosen = _diffusion_loss_per_example(
-            self.model, self.fwd, chosen_ids, chosen_mask, t, chosen_z, chosen_noised
+        policy_chosen, policy_rejected, aux_loss = _diffusion_pair_losses(
+            self.model,
+            self.fwd,
+            chosen_ids,
+            chosen_mask,
+            t,
+            chosen_z,
+            chosen_noised,
+            rejected_ids,
+            rejected_mask,
+            rejected_z,
+            rejected_noised,
         )
-        aux_loss = model_aux_loss(self.model)
-        policy_rejected = _diffusion_loss_per_example(
-            self.model, self.fwd, rejected_ids, rejected_mask, t, rejected_z, rejected_noised
-        )
-        aux_loss = aux_loss + model_aux_loss(self.model)
 
         with torch.no_grad():
             ref_chosen = _diffusion_loss_per_example(
@@ -191,7 +220,7 @@ class DiffusionDPOTrainer(_DiffusionAlignmentCheckpointMixin, Trainer):
         # margin is the DPO classification logit.
         policy_margin = (-policy_chosen) - (-policy_rejected)
         ref_margin = (-ref_chosen) - (-ref_rejected)
-        return -F.logsigmoid(self.beta * (policy_margin - ref_margin)).mean() + 0.5 * aux_loss
+        return -F.logsigmoid(self.beta * (policy_margin - ref_margin)).mean() + aux_loss
 
 
 @register_trainer("diffusion_vrpo")
@@ -261,14 +290,20 @@ class DiffusionVRPOTrainer(DiffusionDPOTrainer):
                 self.device,
                 t=t,
             )
-            policy_chosen = _diffusion_loss_per_example(
-                self.model, self.fwd, chosen_ids, chosen_mask, t, chosen_z, chosen_noised
+            policy_chosen, policy_rejected, aux_loss = _diffusion_pair_losses(
+                self.model,
+                self.fwd,
+                chosen_ids,
+                chosen_mask,
+                t,
+                chosen_z,
+                chosen_noised,
+                rejected_ids,
+                rejected_mask,
+                rejected_z,
+                rejected_noised,
             )
-            aux_total = aux_total + model_aux_loss(self.model)
-            policy_rejected = _diffusion_loss_per_example(
-                self.model, self.fwd, rejected_ids, rejected_mask, t, rejected_z, rejected_noised
-            )
-            aux_total = aux_total + model_aux_loss(self.model)
+            aux_total = aux_total + aux_loss
             with torch.no_grad():
                 ref_chosen = _diffusion_loss_per_example(
                     self.ref_model, self.fwd, chosen_ids, chosen_mask, t, chosen_z, chosen_noised
@@ -279,16 +314,11 @@ class DiffusionVRPOTrainer(DiffusionDPOTrainer):
             policy_margin = (-policy_chosen) - (-policy_rejected)
             ref_margin = (-ref_chosen) - (-ref_rejected)
             total = total + -F.logsigmoid(self.beta * (policy_margin - ref_margin)).mean()
-        return total / self.num_samples + 0.5 * aux_total / self.num_samples
+        return total / self.num_samples + aux_total / self.num_samples
 
 
 @register_trainer("diffusion_grpo")
-class DiffusionGRPOTrainer(
-    RolloutPolicyTrainMixin,
-    GRPOSchedulerHorizonMixin,
-    _DiffusionAlignmentCheckpointMixin,
-    Trainer,
-):
+class DiffusionGRPOTrainer(_DiffusionAlignmentCheckpointMixin, Trainer):
     """GRPO for diffusion LMs using reverse-chain trajectory log-prob ratios."""
 
     _extra_critical_fields = (
@@ -326,6 +356,12 @@ class DiffusionGRPOTrainer(
         self.num_steps = config.diffusion_num_steps
         self.temperature = config.diffusion_temperature
 
+    def _configured_scheduler_total_steps(self):
+        return self.config.max_steps * self.config.grpo_inner_epochs
+
+    def train(self):
+        _rollout_policy_train_loop(self, self.inner_epochs)
+
     def compute_loss(self, batch):
         raise NotImplementedError("Diffusion GRPO runs its own train loop; compute_loss is not called")
 
@@ -357,9 +393,7 @@ class DiffusionGRPOTrainer(
             self.reward_fn(batch, c, m)
             for c, m in zip(completions, completion_masks, strict=True)
         ], dim=1).to(self.device)
-        adv = rewards - rewards.mean(dim=1, keepdim=True)
-        std = rewards.std(dim=1, keepdim=True, unbiased=False)
-        adv = torch.where(std > 0, adv / std, torch.zeros_like(adv))
+        adv = _group_normalized_advantages(rewards)
 
         self.model.train(was_training)
         return DiffusionGRPORollout(

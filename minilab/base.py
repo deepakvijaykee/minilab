@@ -63,6 +63,11 @@ class BaseModel(nn.Module):
     def gradient_checkpointing_enable(self):
         self._gradient_checkpointing = True
 
+    def _checkpointed_forward(self, module, *args, **kwargs):
+        if self._gradient_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(module, *args, use_reentrant=False, **kwargs)
+        return module(*args, **kwargs)
+
     def num_parameters(self):
         return sum(p.numel() for p in self.parameters())
 
@@ -72,6 +77,9 @@ class BaseModel(nn.Module):
 
     def no_weight_decay_parameter_names(self):
         return ()
+
+    def _parameter_names_ending_with(self, *suffixes):
+        return tuple(name for name, _ in self.named_parameters() if name.endswith(suffixes))
 
     def weight_decay_parameter_names(self):
         return tuple(

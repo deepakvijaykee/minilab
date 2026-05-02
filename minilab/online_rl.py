@@ -7,13 +7,13 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from minilab.alignment_common import (
-    GRPOSchedulerHorizonMixin,
     ReferenceCheckpointMixin,
-    RolloutPolicyTrainMixin,
     _generation_context_token_logp,
+    _group_normalized_advantages,
     _load_reference_model,
     _masked_response_mean,
     _model_max_seq_len,
+    _rollout_policy_train_loop,
     _trainer_reference_path,
     _validate_reference_tokenizer,
     _whiten_masked,
@@ -423,7 +423,7 @@ class PPOTrainer(Trainer):
 
 
 @register_trainer("grpo")
-class GRPOTrainer(RolloutPolicyTrainMixin, GRPOSchedulerHorizonMixin, ReferenceCheckpointMixin, Trainer):
+class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
     """Per step: sample K completions per prompt under the current (old) policy,
     freeze their log-probs, then run grpo_inner_epochs clipped-surrogate updates
     against those frozen old log-probs. This is what makes the PPO-style ratio
@@ -457,6 +457,12 @@ class GRPOTrainer(RolloutPolicyTrainMixin, GRPOSchedulerHorizonMixin, ReferenceC
         self.max_new_tokens = config.grpo_max_new_tokens
         self.clip_ratio = config.grpo_clip_ratio
         self.kl_coef = config.grpo_kl_coef
+
+    def _configured_scheduler_total_steps(self):
+        return self.config.max_steps * self.config.grpo_inner_epochs
+
+    def train(self):
+        _rollout_policy_train_loop(self, self.inner_epochs)
 
     def compute_loss(self, batch):
         # Unused — GRPO overrides train() because old_logps must be frozen once
@@ -506,9 +512,7 @@ class GRPOTrainer(RolloutPolicyTrainMixin, GRPOSchedulerHorizonMixin, ReferenceC
             self.reward_fn(batch, c, m)
             for c, m in zip(completions, completion_masks, strict=True)
         ], dim=1).to(self.device)
-        adv = rewards - rewards.mean(dim=1, keepdim=True)
-        std = rewards.std(dim=1, keepdim=True, unbiased=False)
-        adv = torch.where(std > 0, adv / std, torch.zeros_like(adv))
+        adv = _group_normalized_advantages(rewards)
 
         old_token_logps = []
         for k in range(self.K):
@@ -700,9 +704,7 @@ class DAPOTrainer(GRPOTrainer):
         rewards = rollout.rewards + torch.stack([
             self._length_reward(m) for m in rollout.completion_masks
         ], dim=1)
-        adv = rewards - rewards.mean(dim=1, keepdim=True)
-        std = rewards.std(dim=1, keepdim=True, unbiased=False)
-        adv = torch.where(std > 0, adv / std, torch.zeros_like(adv))
+        adv = _group_normalized_advantages(rewards)
         return replace(rollout, rewards=rewards, adv=adv)
 
     def _length_reward(self, completion_mask):
