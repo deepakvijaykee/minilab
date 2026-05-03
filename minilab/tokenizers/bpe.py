@@ -100,7 +100,9 @@ class BPETokenizer(BaseTokenizer):
                 "BPE tokenizer merge keys must be 'left,right' token ids"
             ))
             require(type(value) is int and value >= 0, "BPE tokenizer merge values must be token ids")
-            merges[(int(parts[0]), int(parts[1]))] = value
+            pair = (int(parts[0]), int(parts[1]))
+            require(pair not in merges, "BPE tokenizer merge keys must be unique")
+            merges[pair] = value
         require(len(set(merges.values())) == len(merges), "BPE tokenizer merge values must be unique")
 
         vocab: dict[int, bytes] = {}
@@ -109,7 +111,9 @@ class BPETokenizer(BaseTokenizer):
             require(type(value) is list and all(type(byte) is int and 0 <= byte <= 255 for byte in value), (
                 "BPE tokenizer vocab values must be byte lists"
             ))
-            vocab[int(key)] = bytes(value)
+            token_id = int(key)
+            require(token_id not in vocab, "BPE tokenizer vocab ids must be unique")
+            vocab[token_id] = bytes(value)
         require(sorted(vocab) == list(range(len(vocab))), "BPE tokenizer vocab ids must be contiguous from 0")
         require(len(vocab) >= 256, "BPE tokenizer state vocab must include byte-level base vocabulary")
         require(all(i in vocab and vocab[i] == bytes([i]) for i in range(256)), (

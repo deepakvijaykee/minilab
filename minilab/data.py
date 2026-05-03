@@ -485,14 +485,12 @@ def _preference_tokens(example, tokenizer, context):
 
 
 def _pack(prompt, response, prompt_len, seq_len):
-    full = (prompt[:prompt_len] + response)[:seq_len]
-    padded = full + [0] * (seq_len - len(full))
-    return torch.tensor(padded, dtype=torch.long)
+    full = _packed_sequence(prompt, response, prompt_len, seq_len)
+    return torch.tensor(_padded(full, seq_len), dtype=torch.long)
 
 
 def _labels(prompt, response, prompt_len, seq_len):
-    require(prompt_len > 0, f"prompt_len must be > 0, got {prompt_len}")
-    full = (prompt[:prompt_len] + response)[:seq_len]
+    full = _packed_sequence(prompt, response, prompt_len, seq_len)
     labels = [-100] * seq_len
     for i in range(prompt_len - 1, len(full) - 1):
         labels[i] = full[i + 1]
@@ -500,7 +498,7 @@ def _labels(prompt, response, prompt_len, seq_len):
 
 
 def _kto_row(prompt, response, prompt_len, seq_len, desirable):
-    full = (prompt[:prompt_len] + response)[:seq_len]
+    full = _packed_sequence(prompt, response, prompt_len, seq_len)
     response_len = len(full) - prompt_len
     require(response_len > 0, "KTO packed example has no response tokens after truncation")
     return {
@@ -513,9 +511,9 @@ def _kto_row(prompt, response, prompt_len, seq_len, desirable):
 
 
 def _diffusion_pack(prompt, response, prompt_len, seq_len):
-    full = (prompt[:prompt_len] + response)[:seq_len]
+    full = _packed_sequence(prompt, response, prompt_len, seq_len)
     require(len(full) > prompt_len, "diffusion packed example has no response tokens after truncation")
-    padded = full + [0] * (seq_len - len(full))
+    padded = _padded(full, seq_len)
     loss_mask = [False] * seq_len
     valid_mask = [False] * seq_len
     for i in range(prompt_len, len(full)):
@@ -527,6 +525,15 @@ def _diffusion_pack(prompt, response, prompt_len, seq_len):
         torch.tensor(loss_mask, dtype=torch.bool),
         torch.tensor(valid_mask, dtype=torch.bool),
     )
+
+
+def _packed_sequence(prompt, response, prompt_len, seq_len):
+    require(prompt_len > 0, f"prompt_len must be > 0, got {prompt_len}")
+    return (prompt[:prompt_len] + response)[:seq_len]
+
+
+def _padded(ids, seq_len, pad_id=0):
+    return ids + [pad_id] * (seq_len - len(ids))
 
 
 def _split_hh_assistant_turn(text, field_name):

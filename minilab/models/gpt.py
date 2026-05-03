@@ -10,16 +10,29 @@ from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
 from minilab.models.transformer_utils import (
+    DEFAULT_LOCAL_ATTENTION_WINDOW,
+    DEFAULT_NUM_EXPERTS,
+    DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
+    DEFAULT_ROPE_BASE,
+    DEFAULT_ROPE_GLOBAL_BASE,
+    DEFAULT_ROPE_LOCAL_BASE,
+    DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
+    DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
+    DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_TOP_K_EXPERTS,
+    DEFAULT_YARN_BETA_FAST,
+    DEFAULT_YARN_BETA_SLOW,
     apply_logit_softcap,
+    attention_uses_gqa,
     commit_transformer_block_updates,
     set_transformer_qk_clip_recording,
     transformer_auxiliary_loss,
     transformer_supports_qk_clip,
+    validate_moe_fields,
 )
 from minilab.nn.architecture import (
     GQA_ATTENTIONS,
     MOE_FFNS,
-    TOP_ONE_MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
 from minilab.nn.connections import expand_residual_stream, reduce_residual_stream
@@ -28,18 +41,6 @@ from minilab.registry import get_attention, get_connection, get_ffn, get_norm, g
 
 _ROPE_POSITIONS = {"rope", "gemma3_rope", "gemma4_rope", "yarn_rope", "qwen3_next_rope"}
 _BIAS_POSITIONS = {"alibi", "t5_relative", "kerple_log", "kerple_power"}
-_DEFAULT_ROPE_BASE = 10000.0
-_DEFAULT_ROPE_LOCAL_BASE = 10000.0
-_DEFAULT_ROPE_GLOBAL_BASE = 1000000.0
-_DEFAULT_ROPE_SCALING_FACTOR = 1.0
-_DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN = 4096
-_DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR = 0.25
-_DEFAULT_YARN_BETA_FAST = 32.0
-_DEFAULT_YARN_BETA_SLOW = 1.0
-_DEFAULT_LOCAL_ATTENTION_WINDOW = 1024
-_DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL = 4
-_DEFAULT_NUM_EXPERTS = 8
-_DEFAULT_TOP_K_EXPERTS = 2
 _LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
 _PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
 _CACHE_ATTENTIONS = {
@@ -69,19 +70,19 @@ class GPTConfig(BaseConfig):
     ffn: str = "swiglu"
     connection: str = "residual"
     connection_expansion: int = 4
-    num_experts: int = _DEFAULT_NUM_EXPERTS
-    top_k_experts: int = _DEFAULT_TOP_K_EXPERTS
+    num_experts: int = DEFAULT_NUM_EXPERTS
+    top_k_experts: int = DEFAULT_TOP_K_EXPERTS
     post_norm: bool = False
-    rope_base: float = _DEFAULT_ROPE_BASE
-    rope_local_base: float = _DEFAULT_ROPE_LOCAL_BASE
-    rope_global_base: float = _DEFAULT_ROPE_GLOBAL_BASE
-    rope_scaling_factor: float = _DEFAULT_ROPE_SCALING_FACTOR
-    rope_original_max_seq_len: int = _DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
-    rope_partial_rotary_factor: float = _DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR
-    yarn_beta_fast: float = _DEFAULT_YARN_BETA_FAST
-    yarn_beta_slow: float = _DEFAULT_YARN_BETA_SLOW
-    local_attention_window: int = _DEFAULT_LOCAL_ATTENTION_WINDOW
-    qwen3_next_full_attention_interval: int = _DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
+    rope_base: float = DEFAULT_ROPE_BASE
+    rope_local_base: float = DEFAULT_ROPE_LOCAL_BASE
+    rope_global_base: float = DEFAULT_ROPE_GLOBAL_BASE
+    rope_scaling_factor: float = DEFAULT_ROPE_SCALING_FACTOR
+    rope_original_max_seq_len: int = DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
+    rope_partial_rotary_factor: float = DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR
+    yarn_beta_fast: float = DEFAULT_YARN_BETA_FAST
+    yarn_beta_slow: float = DEFAULT_YARN_BETA_SLOW
+    local_attention_window: int = DEFAULT_LOCAL_ATTENTION_WINDOW
+    qwen3_next_full_attention_interval: int = DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
     attention_k_eq_v: bool = False
     per_layer_embedding_dim: int = 0
     final_logit_softcap: float = 0.0
@@ -127,19 +128,22 @@ class GPTConfig(BaseConfig):
         ))
 
     def _validate_attention_position_contract(self):
-        if _attention_uses_gqa(self.attention):
+        if attention_uses_gqa(self.attention):
             require(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
         else:
             require(self.num_kv_heads == self.num_heads, "num_kv_heads only applies to GQA attention variants")
         if self.position in _ROPE_POSITIONS:
             head_dim = self.dim // self.num_heads
             require(head_dim % 2 == 0, "RoPE requires even head dimension")
+        if self.position == "yarn_rope":
+            require(
+                self.yarn_beta_fast > self.yarn_beta_slow,
+                "yarn_beta_fast must be > yarn_beta_slow for position='yarn_rope'",
+            )
         if self.position == "sinusoidal":
             require(self.dim % 2 == 0, "sinusoidal position requires even dim")
-        if self.attention == "cosformer":
-            require(self.position == "none", "cosFormer owns its positional reweighting; set position='none'")
-        if self.attention == "lightning":
-            require(self.position == "none", "Lightning Attention owns positional decay; set position='none'")
+        if self.attention in {"cosformer", "lightning", "gated_deltanet"}:
+            require(self.position == "none", f"{self.attention} owns its positional rule; set position='none'")
         if self.attention == "gemma3":
             require(self.position == "gemma3_rope", "Gemma-style attention schedule requires position='gemma3_rope'")
         if self.attention == "gemma4":
@@ -154,6 +158,10 @@ class GPTConfig(BaseConfig):
             or self.attention in _PARTIAL_ROPE_ATTENTIONS
             or resolved_attention in _PARTIAL_ROPE_ATTENTIONS
         )
+        if qwen_rope_attention:
+            require(self.position in _ROPE_POSITIONS, (
+                "partial-RoPE attention requires a RoPE-compatible position"
+            ))
         require(self.position != "gemma3_rope" or self.attention == "gemma3", (
             "Gemma/Qwen local-global position='gemma3_rope' requires attention='gemma3'"
         ))
@@ -175,16 +183,7 @@ class GPTConfig(BaseConfig):
             require(self.connection == "residual", "per-layer embeddings require residual connections")
 
     def _validate_ffn_knobs(self):
-        if self.ffn in MOE_FFNS:
-            require(self.num_experts > 0, "num_experts must be > 0")
-            require(1 <= self.top_k_experts <= self.num_experts, "top_k_experts must be in [1, num_experts]")
-            if self.ffn in TOP_ONE_MOE_FFNS:
-                require(self.top_k_experts == 1, f"{self.ffn} requires top_k_experts=1")
-        else:
-            require(
-                self.num_experts == _DEFAULT_NUM_EXPERTS and self.top_k_experts == _DEFAULT_TOP_K_EXPERTS,
-                "num_experts and top_k_experts only apply to MoE FFNs",
-            )
+        validate_moe_fields(self)
 
     def _reject_unused_variant_knobs(self):
         resolved_attention = resolve_deepseek_v4_attention(self.attention, 0)
@@ -198,44 +197,47 @@ class GPTConfig(BaseConfig):
             or self.position in {"gemma4_rope", "qwen3_next_rope"}
         )
         require(
-            self.rope_base == _DEFAULT_ROPE_BASE or self.position in {"rope", "yarn_rope"},
+            self.rope_base == DEFAULT_ROPE_BASE or self.position in {"rope", "yarn_rope"},
             "rope_base only applies to position='rope' or position='yarn_rope'",
         )
         require(
-            self.rope_local_base == _DEFAULT_ROPE_LOCAL_BASE
+            self.rope_local_base == DEFAULT_ROPE_LOCAL_BASE
             or self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
             "rope_local_base only applies to Gemma/Qwen local-global RoPE positions",
         )
         require(
-            self.rope_global_base == _DEFAULT_ROPE_GLOBAL_BASE
+            self.rope_global_base == DEFAULT_ROPE_GLOBAL_BASE
             or self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
             "rope_global_base only applies to Gemma/Qwen local-global RoPE positions",
         )
         require(
-            self.rope_scaling_factor == _DEFAULT_ROPE_SCALING_FACTOR
+            self.rope_scaling_factor == DEFAULT_ROPE_SCALING_FACTOR
             or self.position in {"yarn_rope", "gemma4_rope"},
             "rope_scaling_factor only applies to YaRN RoPE or Gemma 4 proportional RoPE",
         )
         require(
-            self.rope_original_max_seq_len == _DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
+            self.rope_original_max_seq_len == DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
             or self.position == "yarn_rope",
             "rope_original_max_seq_len only applies to position='yarn_rope'",
         )
         require(
-            self.yarn_beta_fast == _DEFAULT_YARN_BETA_FAST and self.yarn_beta_slow == _DEFAULT_YARN_BETA_SLOW
+            (
+                self.yarn_beta_fast == DEFAULT_YARN_BETA_FAST
+                and self.yarn_beta_slow == DEFAULT_YARN_BETA_SLOW
+            )
             or self.position == "yarn_rope",
             "yarn_beta_fast and yarn_beta_slow only apply to position='yarn_rope'",
         )
         require(
-            self.rope_partial_rotary_factor == _DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR or uses_partial_rope,
+            self.rope_partial_rotary_factor == DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR or uses_partial_rope,
             "rope_partial_rotary_factor only applies to partial-RoPE attention or Gemma/Qwen proportional RoPE",
         )
         require(
-            self.local_attention_window == _DEFAULT_LOCAL_ATTENTION_WINDOW or uses_local_window,
+            self.local_attention_window == DEFAULT_LOCAL_ATTENTION_WINDOW or uses_local_window,
             "local_attention_window only applies to local/sliding-window attention",
         )
         require(
-            self.qwen3_next_full_attention_interval == _DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
+            self.qwen3_next_full_attention_interval == DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
             or self.attention == "qwen3_next",
             "qwen3_next_full_attention_interval only applies to attention='qwen3_next'",
         )
@@ -441,12 +443,6 @@ def _resolve_attention_name(config, block_id):
             return "gated_gqa_qknorm_partial_rope"
         return "gated_deltanet"
     return resolve_deepseek_v4_attention(config.attention, block_id)
-
-
-def _attention_uses_gqa(attention):
-    if attention in {"gemma3", "gemma4", "qwen3_next"}:
-        return True
-    return resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
 
 
 def _is_gemma_global_layer(block_id):

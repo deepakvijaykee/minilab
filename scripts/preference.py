@@ -7,7 +7,13 @@ import argparse
 
 import torch
 
-from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path, resolve_default
+from common import (
+    MODEL_CHOICES,
+    load_model_checkpoint,
+    require_checkpoint_path,
+    resolve_default,
+    resolve_save_every,
+)
 from minilab.alignment import (
     CPOTrainConfig,
     CPOTrainer,
@@ -107,7 +113,7 @@ base_kwargs = dict(
     lr=args.lr,
     log_every=50,
     eval_every=0,
-    save_every=args.save_every or args.max_steps,
+    save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=save_dir,
     resume_from=args.resume_from,
     seed=args.seed,

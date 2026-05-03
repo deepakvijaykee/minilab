@@ -5,11 +5,14 @@ import torch.nn as nn
 
 from minilab.checks import require
 from minilab.config import BaseConfig
+from minilab.models.transformer_utils import (
+    DEFAULT_NUM_EXPERTS,
+    DEFAULT_TOP_K_EXPERTS,
+    validate_moe_fields,
+)
 from minilab.nn.architecture import (
     GQA_ATTENTIONS,
-    MOE_FFNS,
     QK_CLIP_ATTENTIONS,
-    TOP_ONE_MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
 from minilab.nn.diffusion import (
@@ -28,8 +31,6 @@ _UNSUPPORTED_DIFFUSION_ATTENTIONS = {
     "gemma3",
     "gemma4",
 }
-_DEFAULT_NUM_EXPERTS = 8
-_DEFAULT_TOP_K_EXPERTS = 2
 
 
 @dataclass
@@ -44,8 +45,8 @@ class DiffusionModelConfig(BaseConfig):
     attention: str = "mha"
     num_kv_heads: int | None = None
     ffn: str = "swiglu"
-    num_experts: int = _DEFAULT_NUM_EXPERTS
-    top_k_experts: int = _DEFAULT_TOP_K_EXPERTS
+    num_experts: int = DEFAULT_NUM_EXPERTS
+    top_k_experts: int = DEFAULT_TOP_K_EXPERTS
     mask_token_id: int = 50256
     time_sampling: str = "continuous"
 
@@ -69,16 +70,7 @@ class DiffusionModelConfig(BaseConfig):
             require(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
         else:
             require(self.num_kv_heads == self.num_heads, "num_kv_heads only applies to GQA attention variants")
-        if self.ffn in MOE_FFNS:
-            require(self.num_experts > 0, "num_experts must be > 0")
-            require(1 <= self.top_k_experts <= self.num_experts, "top_k_experts must be in [1, num_experts]")
-            if self.ffn in TOP_ONE_MOE_FFNS:
-                require(self.top_k_experts == 1, f"{self.ffn} requires top_k_experts=1")
-        else:
-            require(
-                self.num_experts == _DEFAULT_NUM_EXPERTS and self.top_k_experts == _DEFAULT_TOP_K_EXPERTS,
-                "num_experts and top_k_experts only apply to MoE FFNs",
-            )
+        validate_moe_fields(self)
         require(self.mask_token_id == self.vocab_size - 1, (
             "diffusion models reserve mask_token_id as the final vocab id; "
             "set vocab_size=data_vocab_size+1 and mask_token_id=data_vocab_size"

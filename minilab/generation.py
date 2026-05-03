@@ -5,7 +5,8 @@ from minilab.checks import require
 from minilab.diffusion_sampling import (
     d3pm_reverse_timesteps,
     dream_remask_step,
-    llada_transfer_counts,
+    dream_sample_tokens,
+    dream_transfer_count,
     sample_categorical,
     sample_clean_logits,
     sample_logits,
@@ -401,7 +402,7 @@ def sample_diffusion_dream(
     """Dream-style masked generation from a prompt.
 
     All generation slots start as [MASK]. Each reverse step predicts clean
-    tokens for the whole sequence and transfers a fixed share of still-masked
+    tokens for the whole sequence and transfers a dynamic share of still-masked
     generation slots according to Dream's confidence policy.
     """
     _require_eval_model(model, "sample_diffusion_dream")
@@ -432,26 +433,37 @@ def sample_diffusion_dream(
     x = torch.cat([tokens, masked], dim=1)
     prompt_index = torch.zeros_like(x, dtype=torch.bool)
     prompt_index[:, : tokens.size(1)] = True
-    mask_index = x == mask_id
-    transfer_counts = llada_transfer_counts(mask_index & (~prompt_index), steps)
-    timesteps = torch.linspace(1.0, 0.0, steps, device=device)
-    for i, t_now in enumerate(timesteps):
-        if not ((x == mask_id) & (~prompt_index)).any():
+    eps = 1.0 / fwd.num_timesteps
+    timesteps = torch.linspace(1.0, eps, steps + 1, device=device)
+    for i in range(steps):
+        mask_index = (x == mask_id) & (~prompt_index)
+        if not mask_index.any():
             break
+        t_now, t_next = timesteps[i], timesteps[i + 1]
         logits = model(x, t_now.expand(x.size(0)))
-        x, _, _ = dream_remask_step(
-            logits,
-            x,
-            mask_id,
-            transfer_counts[:, i],
-            prompt_index=prompt_index,
-            block_end=x.size(1),
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            alg=alg,
-            alg_temp=alg_temp,
-        )
+        final_step = i == steps - 1
+        if alg == "origin":
+            logits = logits.clone()
+            logits[:, :, mask_id] = float("-inf")
+            _, x0 = dream_sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k, alg=alg)
+            p_transfer = 1.0 if final_step else 1.0 - t_next / t_now
+            transfer_index = (torch.rand(x.shape, device=device) < p_transfer) & mask_index
+            x = torch.where(transfer_index, x0, x)
+        else:
+            transfer_count = dream_transfer_count(mask_index, t_now, t_next, final_step)
+            x, _, _ = dream_remask_step(
+                logits,
+                x,
+                mask_id,
+                transfer_count,
+                prompt_index=prompt_index,
+                block_end=x.size(1),
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                alg=alg,
+                alg_temp=alg_temp,
+            )
     require(not ((x == mask_id) & (~prompt_index)).any(), "Dream sampling left masked generation tokens")
     return x
 
@@ -475,7 +487,7 @@ def _reverse_parameterization(model, context="sampler"):
 
 
 def _require_eval_model(model, context):
-    require(not model.training, f"{context} expects model.eval() at the call boundary")
+    require(not unwrap_model(model).training, f"{context} expects model.eval() at the call boundary")
 
 
 def _require_sampler_contract(model, fwd, expected_parameterization, context):

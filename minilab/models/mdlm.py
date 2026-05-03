@@ -48,9 +48,7 @@ class MDLM(DiffusionBackboneMixin, BaseModel):
     def compute_loss_per_example(self, logits, x_0, mask, t, fwd, loss_mask=None, normalization="sequence"):
         """MDLM continuous-time NELBO (Sahoo et al., 2024, Eq. 11):
             L = E_{t~U, z_t~q} [ -α'(t)/(1-α(t)) · Σ_{i: masked} log p_θ(x_0^i | z_t) ]
-        The earlier implementation was unweighted masked CE, which ignores the
-        schedule-derived weighting and is no longer the ELBO objective. We normalize
-        by sequence length so the loss magnitude is comparable across seq_len."""
+        Sequence normalization keeps loss magnitude comparable across lengths."""
         validate_clean_tokens(x_0, self.config, "MDLM loss")
         loss_mask = validate_loss_mask(loss_mask, x_0, "MDLM loss")
         require(fwd.process_type == self.forward_process_type, "MDLM loss requires the absorbing forward process")

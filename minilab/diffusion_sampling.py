@@ -6,6 +6,8 @@ from minilab.checks import require
 
 def sedd_absorbing_step_probs(log_scores, z, dsigma, mask_id, temperature, drop_mask=False):
     require(temperature >= 0, "temperature must be >= 0")
+    require(log_scores.ndim == 3, "SEDD log_scores must have shape (batch, seq, vocab)")
+    require(z.shape == log_scores.shape[:2], "SEDD current tokens must match log_scores batch and sequence shape")
     log_scores = log_scores.scatter(
         -1,
         z.unsqueeze(-1),
@@ -15,7 +17,7 @@ def sedd_absorbing_step_probs(log_scores, z, dsigma, mask_id, temperature, drop_
         scaled_log_scores = log_scores.double()
     else:
         scaled_log_scores = (log_scores / temperature).double()
-    dsigma = dsigma.to(scaled_log_scores.device, dtype=scaled_log_scores.dtype).view(1, 1)
+    dsigma = _sedd_batch_step(dsigma, z.size(0), scaled_log_scores.device, scaled_log_scores.dtype)
     require((dsigma >= 0).all(), "SEDD sigma step must be non-negative")
     log_weights = (
         _sedd_absorbing_log_staggered_scores(scaled_log_scores, dsigma, mask_id)
@@ -31,6 +33,17 @@ def sedd_absorbing_step_probs(log_scores, z, dsigma, mask_id, temperature, drop_
         return greedy
     log_probs = log_weights - torch.logsumexp(log_weights, dim=-1, keepdim=True)
     return log_probs.exp()
+
+
+def _sedd_batch_step(dsigma, batch_size, device, dtype):
+    dsigma = torch.as_tensor(dsigma, device=device, dtype=dtype)
+    if dsigma.ndim == 0 or dsigma.numel() == 1:
+        return dsigma.reshape(1, 1).expand(batch_size, 1)
+    if dsigma.shape == (batch_size,):
+        return dsigma.view(batch_size, 1)
+    if dsigma.shape == (batch_size, 1):
+        return dsigma
+    raise ValueError("SEDD sigma step must be scalar or have shape (batch,) / (batch, 1)")
 
 
 def _sedd_absorbing_log_staggered_scores(log_scores, dsigma, mask_id):
@@ -56,17 +69,12 @@ def _absorbing_transposed_transition_log_probs(z, dsigma, mask_id, vocab_size):
         device=z.device,
         dtype=dsigma.dtype,
     )
-    log_decay = -dsigma.squeeze()
-    log_unmask = torch.log1p(-(-dsigma).exp()).squeeze()
+    log_decay = (-dsigma).expand_as(z)
+    log_unmask = torch.log1p(-(-dsigma).exp()).expand_as(z)
+    log_transition.scatter_(-1, z.unsqueeze(-1), log_decay.unsqueeze(-1))
     masked = z == mask_id
-    observed = ~masked
-    if observed.any():
-        observed_rows = log_transition[observed]
-        observed_rows.scatter_(1, z[observed].unsqueeze(-1), log_decay.expand(observed_rows.size(0), 1))
-        log_transition[observed] = observed_rows
     if masked.any():
-        masked_rows = log_transition[masked]
-        masked_rows[:] = log_unmask
+        masked_rows = log_unmask[masked].unsqueeze(-1).expand(-1, vocab_size).clone()
         masked_rows[:, mask_id] = 0.0
         log_transition[masked] = masked_rows
     return log_transition
@@ -142,6 +150,59 @@ def llada_transfer_counts(mask_index, steps):
     return counts
 
 
+def _select_transfer_positions(
+    confidence,
+    eligible,
+    counts,
+    *,
+    stochastic=False,
+    temperature=0.0,
+):
+    transfer_index = torch.zeros_like(eligible, dtype=torch.bool)
+    for row in range(eligible.size(0)):
+        k = int(counts[row].item())
+        if k == 0:
+            continue
+        eligible_row = eligible[row]
+        require(k <= int(eligible_row.sum().item()), "num_transfer_tokens exceeds masked token count")
+        row_confidence = confidence[row].masked_fill(~eligible_row, float("-inf"))
+        require(torch.isfinite(row_confidence[eligible_row]).all(), (
+            "confidence scores must be finite for eligible transfer tokens"
+        ))
+        if stochastic and temperature > 0:
+            probs = torch.softmax(row_confidence / temperature, dim=0)
+            select_index = torch.multinomial(probs, num_samples=k, replacement=False)
+        else:
+            _, select_index = torch.topk(row_confidence, k=k)
+        transfer_index[row, select_index] = True
+    return transfer_index
+
+
+def dream_transfer_count(mask_index, t_now, t_next, final_step=False):
+    """Number of Dream masked tokens to transfer for one reverse step, per row."""
+    require(mask_index.dtype == torch.bool, "mask_index must be bool")
+    require(mask_index.dim() == 2, "mask_index must have shape (batch, seq)")
+    remaining = mask_index.sum(dim=1).long()
+    if final_step:
+        return remaining
+    t_now = _dream_row_times(t_now, mask_index.size(0), mask_index.device, "t_now")
+    t_next = _dream_row_times(t_next, mask_index.size(0), mask_index.device, "t_next")
+    require(((0 <= t_next) & (t_next < t_now) & (t_now <= 1)).all(), (
+        "Dream timesteps must satisfy 0 <= t_next < t_now <= 1"
+    ))
+    return (remaining.to(t_now.dtype) * (1.0 - t_next / t_now)).long()
+
+
+def _dream_row_times(value, batch_size, device, name):
+    if torch.is_tensor(value):
+        value = value.to(device=device, dtype=torch.float64)
+        if value.numel() == 1:
+            return value.reshape(1).expand(batch_size)
+        require(value.shape == (batch_size,), f"Dream {name} must be scalar or shape (batch,)")
+        return value
+    return torch.full((batch_size,), float(value), device=device, dtype=torch.float64)
+
+
 def llada_remask_step(
     logits,
     x,
@@ -179,17 +240,12 @@ def llada_remask_step(
         mask_index = mask_index & (~prompt_index)
     if block_end is not None:
         require(0 < block_end <= x.size(1), "block_end must be in (0, seq_len]")
+        inside_block = torch.arange(x.size(1), device=x.device) < block_end
+        mask_index = mask_index & inside_block.unsqueeze(0)
         confidence[:, block_end:] = float("-inf")
     x0 = torch.where(mask_index, x0, x)
     confidence = torch.where(mask_index, confidence, torch.full_like(confidence, float("-inf")))
-    transfer_index = torch.zeros_like(x, dtype=torch.bool)
-    for row in range(x.size(0)):
-        k = int(num_transfer_tokens[row].item())
-        if k == 0:
-            continue
-        require(k <= int(mask_index[row].sum().item()), "num_transfer_tokens exceeds masked token count")
-        _, select_index = torch.topk(confidence[row], k=k)
-        transfer_index[row, select_index] = True
+    transfer_index = _select_transfer_positions(confidence, mask_index, num_transfer_tokens)
     return torch.where(transfer_index, x0, x), transfer_index, confidence
 
 
@@ -222,7 +278,6 @@ def dream_sample_tokens(
     top_p=1.0,
     top_k=0,
     alg="origin",
-    alg_temp=0.0,
 ):
     """Dream token proposal and confidence policies.
 
@@ -234,7 +289,6 @@ def dream_sample_tokens(
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
     require(alg in {"origin", "maskgit_plus", "topk_margin", "entropy"}, f"unknown Dream alg: {alg}")
-    require(alg_temp >= 0, "alg_temp must be >= 0")
     logits = dream_top_k_logits(dream_top_p_logits(logits, top_p), top_k)
     if temperature > 0:
         probs = F.softmax(logits / temperature, dim=-1)
@@ -252,10 +306,23 @@ def dream_sample_tokens(
     elif alg == "entropy":
         confidence = torch.sum(probs * torch.log(probs.clamp_min(1e-10)), dim=-1)
 
-    if alg != "origin" and alg_temp > 0:
-        u = torch.rand_like(confidence).clamp_(1e-6, 1 - 1e-6)
-        confidence = confidence + alg_temp * (-torch.log(-torch.log(u)))
     return confidence, x0
+
+
+def _dream_transfer_counts(num_transfer_tokens, batch_size, device):
+    if torch.is_tensor(num_transfer_tokens):
+        num_transfer_tokens = num_transfer_tokens.to(device=device, dtype=torch.long)
+        if num_transfer_tokens.numel() == 1:
+            counts = num_transfer_tokens.reshape(1).expand(batch_size)
+        else:
+            require(num_transfer_tokens.shape == (batch_size,), (
+                "Dream num_transfer_tokens must be a scalar count or shape (batch,)"
+            ))
+            counts = num_transfer_tokens
+    else:
+        counts = torch.full((batch_size,), int(num_transfer_tokens), device=device, dtype=torch.long)
+    require((counts >= 0).all(), "Dream num_transfer_tokens must be >= 0")
+    return counts
 
 
 def dream_remask_step(
@@ -274,7 +341,8 @@ def dream_remask_step(
 ):
     """One Dream reverse step over currently masked tokens."""
     require(logits.shape[:2] == x.shape, "logits and x must share batch/sequence shape")
-    require(num_transfer_tokens.shape == (x.size(0),), "num_transfer_tokens must have shape (batch,)")
+    require(alg_temp >= 0, "alg_temp must be >= 0")
+    transfer_counts = _dream_transfer_counts(num_transfer_tokens, x.size(0), x.device)
     logits = logits.clone()
     logits[:, :, mask_id] = float("-inf")
     confidence, x0 = dream_sample_tokens(
@@ -283,7 +351,6 @@ def dream_remask_step(
         top_p=top_p,
         top_k=top_k,
         alg=alg,
-        alg_temp=alg_temp,
     )
     mask_index = x == mask_id
     if prompt_index is not None:
@@ -291,15 +358,15 @@ def dream_remask_step(
         mask_index = mask_index & (~prompt_index)
     if block_end is not None:
         require(0 < block_end <= x.size(1), "block_end must be in (0, seq_len]")
-        confidence[:, block_end:] = float("-inf")
+        inside_block = torch.arange(x.size(1), device=x.device) < block_end
+        mask_index = mask_index & inside_block.unsqueeze(0)
     x0 = torch.where(mask_index, x0, x)
     confidence = torch.where(mask_index, confidence, torch.full_like(confidence, float("-inf")))
-    transfer_index = torch.zeros_like(x, dtype=torch.bool)
-    for row in range(x.size(0)):
-        k = int(num_transfer_tokens[row].item())
-        if k == 0:
-            continue
-        require(k <= int(mask_index[row].sum().item()), "num_transfer_tokens exceeds masked token count")
-        _, select_index = torch.topk(confidence[row], k=k)
-        transfer_index[row, select_index] = True
+    transfer_index = _select_transfer_positions(
+        confidence,
+        mask_index,
+        transfer_counts,
+        stochastic=alg != "origin",
+        temperature=alg_temp,
+    )
     return torch.where(transfer_index, x0, x), transfer_index, confidence

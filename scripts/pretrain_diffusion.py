@@ -10,6 +10,7 @@ from minilab.tokenizers import load_tokenizer
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.nn.architecture import MOE_FFNS
+from minilab.models.transformer_utils import DEFAULT_NUM_EXPERTS, DEFAULT_TOP_K_EXPERTS
 from common import (
     DIFFUSION_MODEL_CHOICES,
     PRETRAIN_DATASET_CHOICES,
@@ -23,6 +24,7 @@ from common import (
     reject_supplied,
     resolve_pretrain_max_examples,
     resolve_default,
+    resolve_save_every,
 )
 
 
@@ -87,8 +89,8 @@ num_layers = resolve_default(args.num_layers, 6)
 num_heads = resolve_default(args.num_heads, 8)
 attention = resolve_default(args.attention, "mha")
 ffn = resolve_default(args.ffn, "swiglu")
-num_experts = resolve_default(args.num_experts, 8)
-top_k_experts = resolve_default(args.top_k_experts, 2)
+num_experts = resolve_default(args.num_experts, DEFAULT_NUM_EXPERTS)
+top_k_experts = resolve_default(args.top_k_experts, DEFAULT_TOP_K_EXPERTS)
 
 if not args.resume_from:
     if args.num_kv_heads is not None:
@@ -149,7 +151,8 @@ print(f"{model_name.upper()}: {model.num_parameters():,} params")
 
 tc = TrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
-    log_every=100, eval_every=500, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
+    log_every=100, eval_every=500, save_every=resolve_save_every(args.save_every, args.max_steps),
+    save_dir=args.save_dir,
     resume_from=args.resume_from, seed=args.seed,
 )
 sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples, "mode": "diffusion"}, args.seq_len)

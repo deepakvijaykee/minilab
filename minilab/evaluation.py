@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from minilab.base import unwrap_model
 from minilab.checks import require
 
 
@@ -23,8 +24,8 @@ def bits_per_character(model, dataloader):
 
 
 def _lm_nll_sum(model, dataloader, context):
-    require(not model.training, f"{context} expects model.eval() at the call boundary")
-    device = next(model.parameters()).device
+    model_core = _require_eval_model(model, context)
+    device = next(model_core.parameters()).device
     total_nll = 0.0
     total_tokens = 0
     for batch in dataloader:
@@ -46,18 +47,18 @@ def _lm_nll_sum(model, dataloader, context):
 @torch.no_grad()
 def sequence_logprob(model, tokenizer, prompt, continuation):
     """Log-probability of `continuation` under an autoregressive model."""
-    require(not model.training, "sequence_logprob expects model.eval() at the call boundary")
+    model_core = _require_eval_model(model, "sequence_logprob")
     prompt_ids = tokenizer.encode(prompt)
     continuation_ids = tokenizer.encode(continuation)
     require(len(prompt_ids) > 0, "sequence_logprob requires a non-empty prompt")
     require(len(continuation_ids) > 0, "sequence_logprob requires a non-empty continuation")
     ids = prompt_ids + continuation_ids
-    max_seq_len = model.config.max_seq_len
+    max_seq_len = model_core.config.max_seq_len
     require(len(ids) <= max_seq_len + 1, (
         f"sequence_logprob exact scoring needs at most {max_seq_len + 1} tokens, got {len(ids)}"
     ))
 
-    device = next(model.parameters()).device
+    device = next(model_core.parameters()).device
     input_ids = torch.tensor([ids[:-1]], device=device, dtype=torch.long)
     targets = torch.tensor(ids[1:], device=device, dtype=torch.long)
     logits, _ = model(input_ids)
@@ -71,7 +72,7 @@ def sequence_logprob(model, tokenizer, prompt, continuation):
 @torch.no_grad()
 def multiple_choice_accuracy(model, tokenizer, examples, normalize=False):
     """Evaluate examples shaped as {"prompt", "choices", "answer"}."""
-    require(not model.training, "multiple_choice_accuracy expects model.eval() at the call boundary")
+    _require_eval_model(model, "multiple_choice_accuracy")
     total = 0
     correct = 0
     for ex in examples:
@@ -104,7 +105,7 @@ def generation_task_accuracy(
     top_p=1.0,
 ):
     """Evaluate PromptDataset-like rows with `answers` and a task reward function."""
-    require(not model.training, "generation_task_accuracy expects model.eval() at the call boundary")
+    model_core = _require_eval_model(model, "generation_task_accuracy")
     from minilab.data import AnsweredPromptDataset
 
     require(isinstance(dataset, AnsweredPromptDataset), (
@@ -115,7 +116,7 @@ def generation_task_accuracy(
     from minilab.generation import generate
 
     rewards = []
-    device = next(model.parameters()).device
+    device = next(model_core.parameters()).device
     for idx in range(len(dataset)):
         row = dataset[idx]
         prompt_len = int(row["prompt_len"].item())
@@ -139,6 +140,12 @@ def save_eval_results(results, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, indent=2))
+
+
+def _require_eval_model(model, context):
+    model_core = unwrap_model(model)
+    require(not model_core.training, f"{context} expects model.eval() at the call boundary")
+    return model_core
 
 
 def distinct_n(texts, n=2):

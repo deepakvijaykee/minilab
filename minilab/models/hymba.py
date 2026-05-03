@@ -17,6 +17,16 @@ from minilab.base import BaseModel
 from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
+    DEFAULT_LOCAL_ATTENTION_WINDOW,
+    DEFAULT_NUM_EXPERTS,
+    DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
+    DEFAULT_ROPE_BASE,
+    DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
+    DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
+    DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_TOP_K_EXPERTS,
+    DEFAULT_YARN_BETA_FAST,
+    DEFAULT_YARN_BETA_SLOW,
     attention_freqs_for_attention,
     apply_logit_softcap,
     apply_simple_position,
@@ -25,33 +35,14 @@ from minilab.models.transformer_utils import (
     set_transformer_qk_clip_recording,
     transformer_auxiliary_loss,
     transformer_supports_qk_clip,
+    validate_parallel_or_interleaved_lm_config,
 )
 from minilab.models.gpt import (
     _build_transformer_attention,
     _build_transformer_ffn,
 )
 from minilab.nn.ssm import Mamba2Mixer
-from minilab.nn.architecture import (
-    GQA_ATTENTIONS,
-    MOE_FFNS,
-    TOP_ONE_MOE_FFNS,
-    resolve_deepseek_v4_attention,
-)
 from minilab.registry import get_norm, register_model
-
-
-_LOCAL_WINDOW_ATTENTIONS = {"sliding_window", "sliding_window_gqa_qknorm"}
-_PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
-_DEFAULT_ROPE_BASE = 10000.0
-_DEFAULT_ROPE_SCALING_FACTOR = 1.0
-_DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN = 4096
-_DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR = 0.25
-_DEFAULT_YARN_BETA_FAST = 32.0
-_DEFAULT_YARN_BETA_SLOW = 1.0
-_DEFAULT_LOCAL_ATTENTION_WINDOW = 1024
-_DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL = 4
-_DEFAULT_NUM_EXPERTS = 8
-_DEFAULT_TOP_K_EXPERTS = 2
 
 
 @dataclass
@@ -68,17 +59,17 @@ class HymbaConfig(BaseConfig):
     position: str = "rope"
     norm: str = "rmsnorm"
     ffn: str = "swiglu"
-    num_experts: int = _DEFAULT_NUM_EXPERTS
-    top_k_experts: int = _DEFAULT_TOP_K_EXPERTS
+    num_experts: int = DEFAULT_NUM_EXPERTS
+    top_k_experts: int = DEFAULT_TOP_K_EXPERTS
     post_norm: bool = False
-    rope_base: float = _DEFAULT_ROPE_BASE
-    rope_scaling_factor: float = _DEFAULT_ROPE_SCALING_FACTOR
-    rope_original_max_seq_len: int = _DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
-    rope_partial_rotary_factor: float = _DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR
-    yarn_beta_fast: float = _DEFAULT_YARN_BETA_FAST
-    yarn_beta_slow: float = _DEFAULT_YARN_BETA_SLOW
-    local_attention_window: int = _DEFAULT_LOCAL_ATTENTION_WINDOW
-    qwen3_next_full_attention_interval: int = _DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
+    rope_base: float = DEFAULT_ROPE_BASE
+    rope_scaling_factor: float = DEFAULT_ROPE_SCALING_FACTOR
+    rope_original_max_seq_len: int = DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
+    rope_partial_rotary_factor: float = DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR
+    yarn_beta_fast: float = DEFAULT_YARN_BETA_FAST
+    yarn_beta_slow: float = DEFAULT_YARN_BETA_SLOW
+    local_attention_window: int = DEFAULT_LOCAL_ATTENTION_WINDOW
+    qwen3_next_full_attention_interval: int = DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
     final_logit_softcap: float = 0.0
     d_state: int = 64
     d_conv: int = 4
@@ -91,8 +82,7 @@ class HymbaConfig(BaseConfig):
     dt_init_floor: float = 1e-4
 
     def __post_init__(self):
-        self._validate_lm_fields()
-        self._validate_transformer_branch_fields()
+        validate_parallel_or_interleaved_lm_config(self, "HymbaLM")
         require(self.d_state > 0, "d_state must be > 0")
         require(self.d_conv > 0, "d_conv must be > 0")
         require(self.expand > 0, "expand must be > 0")
@@ -105,92 +95,6 @@ class HymbaConfig(BaseConfig):
         require(self.num_meta_tokens >= 0, "num_meta_tokens must be >= 0")
         require(0 < self.dt_min < self.dt_max, "dt_min and dt_max must satisfy 0 < dt_min < dt_max")
         require(self.dt_init_floor > 0, "dt_init_floor must be > 0")
-
-    def _validate_lm_fields(self):
-        if self.num_kv_heads is None:
-            self.num_kv_heads = self.num_heads
-        require(self.vocab_size > 0, "vocab_size must be > 0")
-        require(self.dim > 0, "dim must be > 0")
-        require(self.num_layers > 0, "num_layers must be > 0")
-        require(self.num_heads > 0, "num_heads must be > 0")
-        require(self.num_kv_heads > 0, "num_kv_heads must be > 0")
-        require(self.max_seq_len > 0, "max_seq_len must be > 0")
-        require(self.dim % self.num_heads == 0, "dim must be divisible by num_heads")
-        require(0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)")
-        require(self.ffn_mult > 0, "ffn_mult must be > 0")
-        require(self.rope_base > 0, "rope_base must be > 0")
-        require(self.rope_scaling_factor > 0, "rope_scaling_factor must be > 0")
-        require(self.rope_original_max_seq_len > 0, "rope_original_max_seq_len must be > 0")
-        require(0.0 < self.rope_partial_rotary_factor <= 1.0, "rope_partial_rotary_factor must be in (0, 1]")
-        require(self.yarn_beta_fast > 0, "yarn_beta_fast must be > 0")
-        require(self.yarn_beta_slow > 0, "yarn_beta_slow must be > 0")
-        require(self.local_attention_window > 0, "local_attention_window must be > 0")
-        require(self.qwen3_next_full_attention_interval > 0, "qwen3_next_full_attention_interval must be > 0")
-        require(self.final_logit_softcap >= 0, "final_logit_softcap must be >= 0")
-
-    def _validate_transformer_branch_fields(self):
-        require(self.position in {"rope", "yarn_rope", "none", "sinusoidal"}, (
-            "HymbaLM supports RoPE, YaRN RoPE, sinusoidal, or no position encoding; "
-            "Gemma/Qwen local-global rotary schedules are implemented by GPT, not HymbaLM"
-        ))
-        require(self.attention not in {"gemma3", "gemma4"}, (
-            "Gemma local-global attention schedules are implemented by GPT, not HymbaLM"
-        ))
-        if _attention_uses_gqa(self.attention):
-            require(self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
-        else:
-            require(self.num_kv_heads == self.num_heads, "num_kv_heads only applies to GQA attention variants")
-        if self.position in {"rope", "yarn_rope"}:
-            require((self.dim // self.num_heads) % 2 == 0, "RoPE requires even head dimension")
-        if self.position == "sinusoidal":
-            require(self.dim % 2 == 0, "sinusoidal position requires even dim")
-        if self.attention in {"cosformer", "lightning"}:
-            require(self.position == "none", f"{self.attention} owns its positional rule; set position='none'")
-        if self.attention == "qwen3_next":
-            require(self.position == "yarn_rope", "Qwen3-Next-style HymbaLM requires position='yarn_rope'")
-        resolved_attention = resolve_deepseek_v4_attention(self.attention, 0)
-        uses_local_window = self.attention in _LOCAL_WINDOW_ATTENTIONS or resolved_attention in _LOCAL_WINDOW_ATTENTIONS
-        uses_partial_rope = self.attention in _PARTIAL_ROPE_ATTENTIONS or resolved_attention in _PARTIAL_ROPE_ATTENTIONS
-        require(
-            self.rope_base == _DEFAULT_ROPE_BASE or self.position in {"rope", "yarn_rope"},
-            "rope_base only applies to position='rope' or position='yarn_rope'",
-        )
-        require(
-            self.rope_scaling_factor == _DEFAULT_ROPE_SCALING_FACTOR or self.position == "yarn_rope",
-            "rope_scaling_factor only applies to position='yarn_rope'",
-        )
-        require(
-            self.rope_original_max_seq_len == _DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN or self.position == "yarn_rope",
-            "rope_original_max_seq_len only applies to position='yarn_rope'",
-        )
-        require(
-            self.yarn_beta_fast == _DEFAULT_YARN_BETA_FAST and self.yarn_beta_slow == _DEFAULT_YARN_BETA_SLOW
-            or self.position == "yarn_rope",
-            "yarn_beta_fast and yarn_beta_slow only apply to position='yarn_rope'",
-        )
-        require(
-            self.local_attention_window == _DEFAULT_LOCAL_ATTENTION_WINDOW or uses_local_window,
-            "local_attention_window only applies to local/sliding-window attention",
-        )
-        require(
-            self.rope_partial_rotary_factor == _DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR or uses_partial_rope,
-            "rope_partial_rotary_factor only applies to partial-RoPE attention",
-        )
-        require(
-            self.qwen3_next_full_attention_interval == _DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
-            or self.attention == "qwen3_next",
-            "qwen3_next_full_attention_interval only applies to attention='qwen3_next'",
-        )
-        if self.ffn in MOE_FFNS:
-            require(self.num_experts > 0, "num_experts must be > 0")
-            require(1 <= self.top_k_experts <= self.num_experts, "top_k_experts must be in [1, num_experts]")
-            if self.ffn in TOP_ONE_MOE_FFNS:
-                require(self.top_k_experts == 1, f"{self.ffn} requires top_k_experts=1")
-        else:
-            require(
-                self.num_experts == _DEFAULT_NUM_EXPERTS and self.top_k_experts == _DEFAULT_TOP_K_EXPERTS,
-                "num_experts and top_k_experts only apply to MoE FFNs",
-            )
 
 
 class HymbaBlock(nn.Module):
@@ -213,15 +117,25 @@ class HymbaBlock(nn.Module):
         self.merge = nn.Linear(2 * config.dim, config.dim, bias=False)
         self.ffn = _build_transformer_ffn(config)
         self.drop = nn.Dropout(config.dropout)
+        self.post_norm = config.post_norm
+        if self.post_norm:
+            self.branch_post_norm = get_norm(config.norm)(config.dim)
+            self.ffn_post_norm = get_norm(config.norm)(config.dim)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         h = self.branch_norm(x)
         block_freqs = attention_freqs_for_attention(self.attention_name, freqs_cis)
         attn = self.attn(h, block_freqs, attn_bias, is_causal)
         ssm = self.ssm(h)
-        x = x + self.drop(self.merge(torch.cat([attn, ssm], dim=-1)))
-        x = x + self.drop(self.ffn(self.ffn_norm(x)))
-        return x
+        branch_out = self.merge(torch.cat([attn, ssm], dim=-1))
+        if self.post_norm:
+            branch_out = self.branch_post_norm(branch_out)
+        x = x + self.drop(branch_out)
+
+        ffn_out = self.ffn(self.ffn_norm(x))
+        if self.post_norm:
+            ffn_out = self.ffn_post_norm(ffn_out)
+        return x + self.drop(ffn_out)
 
 
 @register_model("hymba")
@@ -296,7 +210,3 @@ class HymbaLM(BaseModel):
         if meta:
             x = x[:, meta:]
         return apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap), x
-
-
-def _attention_uses_gqa(attention):
-    return attention == "qwen3_next" or resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS

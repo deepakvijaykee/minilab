@@ -16,10 +16,13 @@ from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
 from minilab.models.transformer_utils import (
+    DEFAULT_NUM_EXPERTS,
+    DEFAULT_TOP_K_EXPERTS,
     commit_transformer_block_updates,
     set_transformer_qk_clip_recording,
     transformer_auxiliary_loss,
     transformer_supports_qk_clip,
+    validate_fixed_rope_transformer_config,
 )
 from minilab.models.gpt import (
     GPTConfig,
@@ -35,27 +38,23 @@ class ByteLatentConfig(BaseConfig):
     dim: int = 256
     num_layers: int = 4
     num_heads: int = 4
+    num_kv_heads: int | None = None
     max_seq_len: int = 1024
     patch_size: int = 8
     dropout: float = 0.0
     ffn_mult: float = 4.0
     attention: str = "mha"
     ffn: str = "swiglu"
+    num_experts: int = DEFAULT_NUM_EXPERTS
+    top_k_experts: int = DEFAULT_TOP_K_EXPERTS
     norm: str = "rmsnorm"
 
     def __post_init__(self):
         require(self.vocab_size == BYTE_VOCAB_SIZE, (
             f"ByteLatentLM requires byte vocab size {BYTE_VOCAB_SIZE}"
         ))
-        require(self.dim > 0, "dim must be > 0")
-        require(self.num_layers > 0, "num_layers must be > 0")
-        require(self.num_heads > 0, "num_heads must be > 0")
-        require(self.dim % self.num_heads == 0, "dim must be divisible by num_heads")
-        require((self.dim // self.num_heads) % 2 == 0, "RoPE requires even head dimension")
-        require(self.max_seq_len > 0, "max_seq_len must be > 0")
+        validate_fixed_rope_transformer_config(self, "ByteLatentLM")
         require(self.patch_size > 0, "patch_size must be > 0")
-        require(0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)")
-        require(self.ffn_mult > 0, "ffn_mult must be > 0")
 
 
 def entropy_from_logits(logits):
@@ -126,11 +125,14 @@ class ByteLatentLM(BaseModel):
             dim=config.dim,
             num_layers=config.num_layers,
             num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
             max_seq_len=self.max_patches,
             dropout=config.dropout,
             ffn_mult=config.ffn_mult,
             attention=config.attention,
             ffn=config.ffn,
+            num_experts=config.num_experts,
+            top_k_experts=config.top_k_experts,
             norm=config.norm,
         )
         self.blocks = nn.ModuleList([TransformerBlock(gpt_cfg, i) for i in range(config.num_layers)])
@@ -206,6 +208,7 @@ class ByteLatentLM(BaseModel):
         expanded = torch.where((patch_ids > 0).unsqueeze(-1), expanded, torch.zeros_like(expanded))
         hidden = self.ln_f(local + expanded)
         return self.lm_head(hidden), hidden
+
 
 class _CausalConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):

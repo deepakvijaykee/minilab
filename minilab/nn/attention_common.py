@@ -153,6 +153,8 @@ def _bool_to_additive_bias(allowed, dtype):
 def _merge_attention_bias(base_bias, extra_bias):
     if extra_bias is None:
         return base_bias
+    if extra_bias.dtype == torch.bool:
+        extra_bias = _bool_to_additive_bias(extra_bias.to(base_bias.device), base_bias.dtype)
     return base_bias + extra_bias
 
 

@@ -5,7 +5,7 @@ from minilab.data import load_openwebtext, load_text8, load_tinystories, load_wi
 from minilab.evaluation import perplexity
 from minilab import generation as _generation
 from minilab import models as _models
-from minilab.nn.architecture import GQA_ATTENTIONS, resolve_deepseek_v4_attention
+from minilab.models.transformer_utils import attention_uses_gqa
 from minilab.registry import get_model, get_sampler
 from minilab.trainer import LMTrainer, set_seed, tokenizer_signature
 from torch.utils.data import DataLoader
@@ -142,9 +142,12 @@ def lm_model_kwargs(
     elif model_name == "byte_latent":
         kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
         _update_supplied(kwargs, {
+            "num_kv_heads": num_kv_heads,
             "attention": attention,
             "norm": norm,
             "ffn": ffn,
+            "num_experts": num_experts,
+            "top_k_experts": top_k_experts,
         })
     elif model_name == "xlstm":
         kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
@@ -226,6 +229,13 @@ def resolve_default(value, default):
     return default if value is None else value
 
 
+def resolve_save_every(save_every, max_steps):
+    """CLI helper: --save-every 0 means save once at the final step."""
+    require(max_steps > 0, "max_steps must be > 0")
+    require(save_every >= 0, "save_every must be >= 0")
+    return max_steps if save_every == 0 else save_every
+
+
 def load_pretrain_dataset(name, tok, seq_len, split, max_examples, mode):
     if name == "tinystories":
         return load_tinystories(tok, seq_len, split=split, max_examples=max_examples, mode=mode)
@@ -251,12 +261,6 @@ def load_pretrain_eval_dataset(name, tok, seq_len, max_examples, mode):
     require(name != "openwebtext", "evaluation requires a validation split; OpenWebText loader only supports train")
     eval_max_examples = 0 if name == "text8" else max_examples
     return load_pretrain_dataset(name, tok, seq_len, "validation", eval_max_examples, mode)
-
-
-def attention_uses_gqa(attention):
-    return attention in {"gemma3", "gemma4", "qwen3_next"} or (
-        resolve_deepseek_v4_attention(attention, 0) in GQA_ATTENTIONS
-    )
 
 
 def require_checkpoint_path(checkpoint, resume_from, context):

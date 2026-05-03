@@ -6,7 +6,15 @@
 
 import argparse
 import torch
-from common import MODEL_CHOICES, build_lm_model, lm_model_kwargs, load_model_checkpoint, reject_supplied, resolve_default
+from common import (
+    MODEL_CHOICES,
+    build_lm_model,
+    lm_model_kwargs,
+    load_model_checkpoint,
+    reject_supplied,
+    resolve_default,
+    resolve_save_every,
+)
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.data import load_alpaca
@@ -75,9 +83,18 @@ else:
 ds = load_alpaca(tok, args.seq_len, max_examples=args.max_examples)
 print(f"Alpaca: {len(ds)} examples")
 
-tc = TrainConfig(max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
-                 log_every=100, eval_every=0, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
-                 resume_from=args.resume_from, seed=args.seed)
+tc = TrainConfig(
+    max_steps=args.max_steps,
+    warmup_steps=args.warmup_steps,
+    batch_size=args.batch_size,
+    lr=args.lr,
+    log_every=100,
+    eval_every=0,
+    save_every=resolve_save_every(args.save_every, args.max_steps),
+    save_dir=args.save_dir,
+    resume_from=args.resume_from,
+    seed=args.seed,
+)
 sig = run_signature(tok, {"name": "alpaca", "split": "train", "max_examples": args.max_examples}, args.seq_len)
 trainer = SFTTrainer(model, ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok))
 trainer.train()

@@ -11,6 +11,7 @@ from minilab.checks import require
 from minilab.data import load_alpaca_diffusion, load_dolly_diffusion
 from minilab.diffusion import ForwardProcess
 from minilab.generation import infill
+from minilab.models.transformer_utils import DEFAULT_NUM_EXPERTS, DEFAULT_TOP_K_EXPERTS
 from minilab.nn.architecture import MOE_FFNS
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import (
@@ -29,6 +30,7 @@ from common import (
     load_diffusion_model_checkpoint,
     reject_supplied,
     resolve_default,
+    resolve_save_every,
 )
 
 
@@ -100,8 +102,8 @@ num_layers = resolve_default(args.num_layers, 6)
 num_heads = resolve_default(args.num_heads, 8)
 attention = resolve_default(args.attention, "mha")
 ffn = resolve_default(args.ffn, "swiglu")
-num_experts = resolve_default(args.num_experts, 8)
-top_k_experts = resolve_default(args.top_k_experts, 2)
+num_experts = resolve_default(args.num_experts, DEFAULT_NUM_EXPERTS)
+top_k_experts = resolve_default(args.top_k_experts, DEFAULT_TOP_K_EXPERTS)
 
 if not loading_model:
     if args.num_kv_heads is not None:
@@ -166,7 +168,7 @@ tc = TrainConfig(
     lr=args.lr,
     log_every=100,
     eval_every=0,
-    save_every=args.save_every or args.max_steps,
+    save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=args.save_dir,
     resume_from=args.resume_from,
     seed=args.seed,

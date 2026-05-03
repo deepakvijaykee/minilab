@@ -229,8 +229,8 @@ class DiffusionVRPOTrainer(DiffusionDPOTrainer):
 
     This trainer keeps the Diffusion-DPO objective but averages multiple shared
     ELBO timestep estimates per pair. When enabled, antithetic sampling pairs a
-    timestep `t` with `1 - t`, matching VRPO's unbiased variance-reduction
-    strategy for diffusion preference gradients.
+    continuous timestep `t` with `1 - t`; discrete-time objectives pair the
+    corresponding training-grid indices instead of leaving the grid.
     """
 
     _extra_critical_fields = ("dpo_beta", "vrpo_num_samples", "vrpo_antithetic")
@@ -265,7 +265,7 @@ class DiffusionVRPOTrainer(DiffusionDPOTrainer):
         for sample_id in range(self.num_samples):
             store_antithetic_pair = False
             if self.antithetic and paired_t is not None:
-                t = 1.0 - paired_t
+                t = _antithetic_diffusion_time(paired_t, self.fwd, model.config.time_sampling)
                 paired_t = None
             else:
                 t = None
@@ -475,6 +475,15 @@ def _diffusion_rollout_once(model, fwd, prompt_ids, prompt_lens, max_new_tokens,
     )
 
 
+def _antithetic_diffusion_time(t, fwd, time_sampling):
+    require(time_sampling in {"continuous", "discrete"}, "diffusion time_sampling must be continuous or discrete")
+    if time_sampling == "discrete":
+        idx = fwd.time_index(t, min_index=1, max_index=fwd.num_timesteps)
+        paired_idx = fwd.num_timesteps + 1 - idx
+        return paired_idx.to(device=t.device, dtype=t.dtype) / fwd.num_timesteps
+    return 1.0 - t
+
+
 def _rollout_clean_logits(model, fwd, tokens, response_mask, num_steps, temperature):
     device = tokens.device
     B = tokens.size(0)
@@ -574,6 +583,7 @@ def _rollout_d3pm(model, fwd, tokens, response_mask, num_steps, temperature):
 
 
 def _diffusion_trajectory_logp(model, fwd, trace, include_aux=False):
+    require(trace, "diffusion trajectory log-prob requires at least one trace step")
     B = trace[0].z.size(0)
     device = trace[0].z.device
     total_logp = torch.zeros(B, device=device)

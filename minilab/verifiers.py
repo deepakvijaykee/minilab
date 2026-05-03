@@ -18,10 +18,13 @@ from minilab.base import BaseModel
 from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
+    DEFAULT_NUM_EXPERTS,
+    DEFAULT_TOP_K_EXPERTS,
     commit_transformer_block_updates,
     set_transformer_qk_clip_recording,
     transformer_auxiliary_loss,
     transformer_supports_qk_clip,
+    validate_fixed_rope_transformer_config,
 )
 from minilab.models.gpt import (
     GPTConfig,
@@ -151,23 +154,19 @@ class VerifierConfig(BaseConfig):
     dim: int = 256
     num_layers: int = 4
     num_heads: int = 4
+    num_kv_heads: int | None = None
     max_seq_len: int = 512
     dropout: float = 0.0
     ffn_mult: float = 4.0
     attention: str = "mha"
     ffn: str = "swiglu"
+    num_experts: int = DEFAULT_NUM_EXPERTS
+    top_k_experts: int = DEFAULT_TOP_K_EXPERTS
     norm: str = "rmsnorm"
 
     def __post_init__(self):
         require(self.vocab_size > 0, "vocab_size must be > 0")
-        require(self.dim > 0, "dim must be > 0")
-        require(self.num_layers > 0, "num_layers must be > 0")
-        require(self.num_heads > 0, "num_heads must be > 0")
-        require(self.dim % self.num_heads == 0, "dim must be divisible by num_heads")
-        require((self.dim // self.num_heads) % 2 == 0, "RoPE requires even head dimension")
-        require(self.max_seq_len > 0, "max_seq_len must be > 0")
-        require(0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)")
-        require(self.ffn_mult > 0, "ffn_mult must be > 0")
+        validate_fixed_rope_transformer_config(self, "OutcomeVerifier")
 
 
 @register_model("verifier")
@@ -183,11 +182,14 @@ class OutcomeVerifier(BaseModel):
             dim=config.dim,
             num_layers=config.num_layers,
             num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
             max_seq_len=config.max_seq_len,
             dropout=config.dropout,
             ffn_mult=config.ffn_mult,
             attention=config.attention,
             ffn=config.ffn,
+            num_experts=config.num_experts,
+            top_k_experts=config.top_k_experts,
             norm=config.norm,
         )
         self.blocks = nn.ModuleList([TransformerBlock(gpt_cfg, i) for i in range(config.num_layers)])
@@ -243,9 +245,10 @@ class OutcomeVerifier(BaseModel):
         loss = None
         if labels is not None:
             require(labels.shape == logits.shape, "OutcomeVerifier labels must have shape (batch,)")
-            loss = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
+            loss = F.binary_cross_entropy_with_logits(logits, labels.to(device=logits.device, dtype=logits.dtype))
             loss = loss + self.auxiliary_loss()
         return logits, loss
+
 
 def verifier_accuracy(logits, labels):
     preds = logits.sigmoid() >= 0.5

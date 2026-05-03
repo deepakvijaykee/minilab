@@ -9,6 +9,7 @@ from minilab.tokenizers import load_tokenizer
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature
 from minilab.nn.architecture import MOE_FFNS
+from minilab.models.transformer_utils import DEFAULT_NUM_EXPERTS, DEFAULT_TOP_K_EXPERTS
 from common import (
     PRETRAIN_EVAL_DATASET_CHOICES,
     attention_uses_gqa,
@@ -49,8 +50,8 @@ if args.num_experts is not None or args.top_k_experts is not None:
     require(args.ffn in MOE_FFNS, "--num-experts and --top-k-experts only apply to MoE FFNs")
 set_seed(args.seed)
 
-num_experts = resolve_default(args.num_experts, 8)
-top_k_experts = resolve_default(args.top_k_experts, 2)
+num_experts = resolve_default(args.num_experts, DEFAULT_NUM_EXPERTS)
+top_k_experts = resolve_default(args.top_k_experts, DEFAULT_TOP_K_EXPERTS)
 
 tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size

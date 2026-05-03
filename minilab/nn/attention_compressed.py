@@ -60,6 +60,12 @@ def _expand_external_bias(attn_bias, batch_size, num_heads, T):
         require(attn_bias.size(-2) == T and attn_bias.size(-1) == T, (
             "4D attn_bias must end with shape (T, T)"
         ))
+        require(attn_bias.size(0) in {1, batch_size}, (
+            "4D attn_bias batch dimension must be 1 or batch size"
+        ))
+        require(attn_bias.size(1) in {1, num_heads}, (
+            "4D attn_bias head dimension must be 1 or num_heads"
+        ))
         return attn_bias
     raise ValueError("attn_bias must have 2, 3, or 4 dimensions")
 

@@ -25,6 +25,7 @@ from common import (
     load_diffusion_model_checkpoint,
     require_checkpoint_path,
     resolve_default,
+    resolve_save_every,
 )
 
 
@@ -78,7 +79,7 @@ base_kwargs = dict(
     dpo_beta=args.beta,
     log_every=50,
     eval_every=0,
-    save_every=args.save_every or args.max_steps,
+    save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=args.save_dir,
     resume_from=args.resume_from,
     seed=args.seed,

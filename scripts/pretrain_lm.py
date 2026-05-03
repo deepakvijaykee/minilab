@@ -23,12 +23,27 @@ from common import (
     reject_supplied,
     resolve_pretrain_max_examples,
     resolve_default,
+    resolve_save_every,
 )
 from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.generation import generate
 from minilab.evaluation import perplexity
+from minilab.models.transformer_utils import (
+    DEFAULT_LOCAL_ATTENTION_WINDOW,
+    DEFAULT_NUM_EXPERTS,
+    DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
+    DEFAULT_ROPE_BASE,
+    DEFAULT_ROPE_GLOBAL_BASE,
+    DEFAULT_ROPE_LOCAL_BASE,
+    DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
+    DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
+    DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_TOP_K_EXPERTS,
+    DEFAULT_YARN_BETA_FAST,
+    DEFAULT_YARN_BETA_SLOW,
+)
 from minilab.nn.architecture import (
     MOE_FFNS,
     resolve_deepseek_v4_attention,
@@ -47,7 +62,10 @@ _MODEL_BUILD_FLAGS = (
 )
 _MAMBA_BUILD_FLAGS = ("dim", "num_layers")
 _XLSTM_BUILD_FLAGS = ("dim", "num_layers", "num_heads")
-_BYTE_LATENT_BUILD_FLAGS = ("dim", "num_layers", "num_heads", "attention", "norm", "ffn")
+_BYTE_LATENT_BUILD_FLAGS = (
+    "dim", "num_layers", "num_heads", "num_kv_heads", "attention",
+    "norm", "ffn", "num_experts", "top_k_experts",
+)
 _MAMBA_ONLY_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _MAMBA_BUILD_FLAGS)
 _XLSTM_ONLY_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _XLSTM_BUILD_FLAGS)
 _BYTE_LATENT_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _BYTE_LATENT_BUILD_FLAGS)
@@ -64,10 +82,6 @@ _QK_CLIP_FLAGS = ("qk_clip_threshold", "qk_clip_balance")
 _QK_CLIP_MODEL_CHOICES = {"gpt", "hybrid", "hymba", "byte_latent"}
 _LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
 _PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
-
-
-def _uses_qk_clip(model):
-    return model.supports_qk_clip()
 
 
 p = argparse.ArgumentParser()
@@ -123,13 +137,13 @@ model_name = args.model or "gpt"
 if args.resume_from:
     reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
 elif model_name in {"mamba", "mamba2"}:
-    reject_supplied(args, _MAMBA_ONLY_REJECTED_FLAGS, "only applies to --model gpt, hymba, hybrid, or xlstm")
+    reject_supplied(args, _MAMBA_ONLY_REJECTED_FLAGS, "does not apply to --model mamba or mamba2")
 elif model_name in {"hybrid", "hymba"}:
     reject_supplied(args, _GPT_ONLY_BUILD_FLAGS, "only applies to --model gpt")
 elif model_name == "xlstm":
-    reject_supplied(args, _XLSTM_ONLY_REJECTED_FLAGS, "only applies to --model gpt")
+    reject_supplied(args, _XLSTM_ONLY_REJECTED_FLAGS, "does not apply to --model xlstm")
 elif model_name == "byte_latent":
-    reject_supplied(args, _BYTE_LATENT_REJECTED_FLAGS, "only applies to --model gpt, hymba, hybrid, or xlstm")
+    reject_supplied(args, _BYTE_LATENT_REJECTED_FLAGS, "does not apply to --model byte_latent")
 if not args.resume_from and model_name not in _QK_CLIP_MODEL_CHOICES:
     reject_supplied(args, _QK_CLIP_FLAGS, "only applies to QK-Clip-capable attention models")
 if args.qk_clip_threshold is not None:
@@ -148,23 +162,26 @@ num_heads = resolve_default(args.num_heads, 8)
 attention = resolve_default(args.attention, "mha")
 position = resolve_default(args.position, "rope")
 norm = resolve_default(args.norm, "rmsnorm")
-rope_base = resolve_default(args.rope_base, 10000.0)
-rope_local_base = resolve_default(args.rope_local_base, 10000.0)
-rope_global_base = resolve_default(args.rope_global_base, 1000000.0)
-rope_scaling_factor = resolve_default(args.rope_scaling_factor, 1.0)
-rope_original_max_seq_len = resolve_default(args.rope_original_max_seq_len, 4096)
-rope_partial_rotary_factor = resolve_default(args.rope_partial_rotary_factor, 0.25)
-yarn_beta_fast = resolve_default(args.yarn_beta_fast, 32.0)
-yarn_beta_slow = resolve_default(args.yarn_beta_slow, 1.0)
-local_attention_window = resolve_default(args.local_attention_window, 1024)
-qwen3_next_full_attention_interval = resolve_default(args.qwen3_next_full_attention_interval, 4)
+rope_base = resolve_default(args.rope_base, DEFAULT_ROPE_BASE)
+rope_local_base = resolve_default(args.rope_local_base, DEFAULT_ROPE_LOCAL_BASE)
+rope_global_base = resolve_default(args.rope_global_base, DEFAULT_ROPE_GLOBAL_BASE)
+rope_scaling_factor = resolve_default(args.rope_scaling_factor, DEFAULT_ROPE_SCALING_FACTOR)
+rope_original_max_seq_len = resolve_default(args.rope_original_max_seq_len, DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN)
+rope_partial_rotary_factor = resolve_default(args.rope_partial_rotary_factor, DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR)
+yarn_beta_fast = resolve_default(args.yarn_beta_fast, DEFAULT_YARN_BETA_FAST)
+yarn_beta_slow = resolve_default(args.yarn_beta_slow, DEFAULT_YARN_BETA_SLOW)
+local_attention_window = resolve_default(args.local_attention_window, DEFAULT_LOCAL_ATTENTION_WINDOW)
+qwen3_next_full_attention_interval = resolve_default(
+    args.qwen3_next_full_attention_interval,
+    DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
+)
 attention_k_eq_v = resolve_default(args.attention_k_eq_v, False)
 per_layer_embedding_dim = resolve_default(args.per_layer_embedding_dim, 0)
 final_logit_softcap = resolve_default(args.final_logit_softcap, 0.0)
 connection = resolve_default(args.connection, "residual")
 ffn = resolve_default(args.ffn, "swiglu")
-num_experts = resolve_default(args.num_experts, 8)
-top_k_experts = resolve_default(args.top_k_experts, 2)
+num_experts = resolve_default(args.num_experts, DEFAULT_NUM_EXPERTS)
+top_k_experts = resolve_default(args.top_k_experts, DEFAULT_TOP_K_EXPERTS)
 post_norm = resolve_default(args.post_norm, False)
 mtp_depth = resolve_default(args.mtp_depth, 0)
 mtp_loss_weight = resolve_default(args.mtp_loss_weight, 0.0)
@@ -270,7 +287,7 @@ else:
     )
     model = build_lm_model(model_name, **config_kwargs)
 if args.qk_clip_threshold is not None:
-    require(_uses_qk_clip(model), "--qk-clip-threshold requires QK-Clip-capable attention")
+    require(model.supports_qk_clip(), "--qk-clip-threshold requires QK-Clip-capable attention")
 if args.grad_checkpoint:
     model.gradient_checkpointing_enable()
 print(f"{type(model).__name__}: {model.num_parameters():,} params")
@@ -279,7 +296,8 @@ tc = TrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
     muon_lr=args.muon_lr, optimizer=args.optimizer, lr_schedule=args.lr_schedule,
     qk_clip_threshold=qk_clip_threshold, qk_clip_balance=qk_clip_balance,
-    log_every=100, eval_every=500, save_every=args.save_every or args.max_steps, save_dir=args.save_dir,
+    log_every=100, eval_every=500, save_every=resolve_save_every(args.save_every, args.max_steps),
+    save_dir=args.save_dir,
     resume_from=args.resume_from, seed=args.seed,
 )
 sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples}, args.seq_len)

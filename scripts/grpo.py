@@ -4,7 +4,13 @@
 """
 
 import argparse
-from common import MODEL_CHOICES, load_model_checkpoint, require_checkpoint_path, resolve_default
+from common import (
+    MODEL_CHOICES,
+    load_model_checkpoint,
+    require_checkpoint_path,
+    resolve_default,
+    resolve_save_every,
+)
 from minilab.tokenizers import load_tokenizer
 from minilab.data import load_gsm8k
 from minilab.alignment import (
@@ -131,7 +137,7 @@ base_config = dict(
     lr=args.lr,
     log_every=50,
     eval_every=0,
-    save_every=args.save_every or args.max_steps,
+    save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=args.save_dir or f"checkpoints/{args.algorithm}",
     resume_from=args.resume_from,
     seed=args.seed,
