@@ -25,6 +25,7 @@ from minilab.models.transformer_utils import (
     apply_logit_softcap,
     attention_uses_gqa,
     commit_transformer_block_updates,
+    require_default_unless,
     set_transformer_qk_clip_recording,
     transformer_auxiliary_loss,
     transformer_supports_qk_clip,
@@ -64,6 +65,7 @@ class GPTConfig(BaseConfig):
     max_seq_len: int = 1024
     dropout: float = 0.0
     ffn_mult: float = 4.0
+    norm_eps: float = 1e-6
     attention: str = "mha"
     position: str = "rope"
     norm: str = "rmsnorm"
@@ -108,6 +110,7 @@ class GPTConfig(BaseConfig):
         require(self.dim % self.num_heads == 0, "dim must be divisible by num_heads")
         require(0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)")
         require(self.ffn_mult > 0, "ffn_mult must be > 0")
+        require(self.norm_eps > 0, "norm_eps must be > 0")
         require(self.connection_expansion > 0, "connection_expansion must be > 0")
         require(self.rope_base > 0, "rope_base must be > 0")
         require(self.rope_local_base > 0, "rope_local_base must be > 0")
@@ -196,28 +199,34 @@ class GPTConfig(BaseConfig):
             or resolved_attention in _PARTIAL_ROPE_ATTENTIONS
             or self.position in {"gemma4_rope", "qwen3_next_rope"}
         )
-        require(
-            self.rope_base == DEFAULT_ROPE_BASE or self.position in {"rope", "yarn_rope"},
+        require_default_unless(
+            self.rope_base,
+            DEFAULT_ROPE_BASE,
+            self.position in {"rope", "yarn_rope"},
             "rope_base only applies to position='rope' or position='yarn_rope'",
         )
-        require(
-            self.rope_local_base == DEFAULT_ROPE_LOCAL_BASE
-            or self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
+        require_default_unless(
+            self.rope_local_base,
+            DEFAULT_ROPE_LOCAL_BASE,
+            self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
             "rope_local_base only applies to Gemma/Qwen local-global RoPE positions",
         )
-        require(
-            self.rope_global_base == DEFAULT_ROPE_GLOBAL_BASE
-            or self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
+        require_default_unless(
+            self.rope_global_base,
+            DEFAULT_ROPE_GLOBAL_BASE,
+            self.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"},
             "rope_global_base only applies to Gemma/Qwen local-global RoPE positions",
         )
-        require(
-            self.rope_scaling_factor == DEFAULT_ROPE_SCALING_FACTOR
-            or self.position in {"yarn_rope", "gemma4_rope"},
+        require_default_unless(
+            self.rope_scaling_factor,
+            DEFAULT_ROPE_SCALING_FACTOR,
+            self.position in {"yarn_rope", "gemma4_rope"},
             "rope_scaling_factor only applies to YaRN RoPE or Gemma 4 proportional RoPE",
         )
-        require(
-            self.rope_original_max_seq_len == DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN
-            or self.position == "yarn_rope",
+        require_default_unless(
+            self.rope_original_max_seq_len,
+            DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
+            self.position == "yarn_rope",
             "rope_original_max_seq_len only applies to position='yarn_rope'",
         )
         require(
@@ -228,17 +237,22 @@ class GPTConfig(BaseConfig):
             or self.position == "yarn_rope",
             "yarn_beta_fast and yarn_beta_slow only apply to position='yarn_rope'",
         )
-        require(
-            self.rope_partial_rotary_factor == DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR or uses_partial_rope,
+        require_default_unless(
+            self.rope_partial_rotary_factor,
+            DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
+            uses_partial_rope,
             "rope_partial_rotary_factor only applies to partial-RoPE attention or Gemma/Qwen proportional RoPE",
         )
-        require(
-            self.local_attention_window == DEFAULT_LOCAL_ATTENTION_WINDOW or uses_local_window,
+        require_default_unless(
+            self.local_attention_window,
+            DEFAULT_LOCAL_ATTENTION_WINDOW,
+            uses_local_window,
             "local_attention_window only applies to local/sliding-window attention",
         )
-        require(
-            self.qwen3_next_full_attention_interval == DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
-            or self.attention == "qwen3_next",
+        require_default_unless(
+            self.qwen3_next_full_attention_interval,
+            DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
+            self.attention == "qwen3_next",
             "qwen3_next_full_attention_interval only applies to attention='qwen3_next'",
         )
         require(
@@ -277,6 +291,10 @@ def _build_transformer_ffn(config):
             top_k=config.top_k_experts,
         )
     return get_ffn(config.ffn)(config.dim, ffn_hidden)
+
+
+def _build_transformer_norm(config, dim):
+    return get_norm(config.norm)(dim, eps=config.norm_eps)
 
 
 def _build_transformer_attention(config, block_id):
@@ -351,7 +369,7 @@ def _build_per_layer_embeddings(config):
         return None, None, None, None, None
     embed = nn.Embedding(config.vocab_size, config.num_layers * config.per_layer_embedding_dim)
     projection = nn.Linear(config.dim, config.num_layers * config.per_layer_embedding_dim, bias=False)
-    norm = get_norm(config.norm)(config.per_layer_embedding_dim)
+    norm = _build_transformer_norm(config, config.per_layer_embedding_dim)
     return embed, projection, norm, 1.0 / math.sqrt(2.0), config.dim ** -0.5
 
 
@@ -360,16 +378,16 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.block_id = block_id
         self.per_layer_embedding_dim = config.per_layer_embedding_dim if block_id < config.num_layers else 0
-        self.attn_norm = get_norm(config.norm)(config.dim)
-        self.ffn_norm = get_norm(config.norm)(config.dim)
+        self.attn_norm = _build_transformer_norm(config, config.dim)
+        self.ffn_norm = _build_transformer_norm(config, config.dim)
         self.post_norm = config.post_norm
         if self.post_norm:
-            self.attn_post_norm = get_norm(config.norm)(config.dim)
-            self.ffn_post_norm = get_norm(config.norm)(config.dim)
+            self.attn_post_norm = _build_transformer_norm(config, config.dim)
+            self.ffn_post_norm = _build_transformer_norm(config, config.dim)
         if self.per_layer_embedding_dim > 0:
             self.per_layer_input_gate = nn.Linear(config.dim, self.per_layer_embedding_dim, bias=False)
             self.per_layer_projection = nn.Linear(self.per_layer_embedding_dim, config.dim, bias=False)
-            self.post_per_layer_input_norm = get_norm(config.norm)(config.dim)
+            self.post_per_layer_input_norm = _build_transformer_norm(config, config.dim)
         self.drop = nn.Dropout(config.dropout)
 
         self.ffn = _build_transformer_ffn(config)
@@ -454,8 +472,8 @@ class MultiTokenPredictionModule(nn.Module):
 
     def __init__(self, config, block_id):
         super().__init__()
-        self.hidden_norm = get_norm(config.norm)(config.dim)
-        self.embed_norm = get_norm(config.norm)(config.dim)
+        self.hidden_norm = _build_transformer_norm(config, config.dim)
+        self.embed_norm = _build_transformer_norm(config, config.dim)
         self.proj = nn.Linear(2 * config.dim, config.dim, bias=False)
         self.block = TransformerBlock(config, block_id)
 
@@ -478,7 +496,7 @@ class GPT(BaseModel):
         self.tok_emb = nn.Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([TransformerBlock(config, i) for i in range(config.num_layers)])
-        self.ln_f = get_norm(config.norm)(config.dim)
+        self.ln_f = _build_transformer_norm(config, config.dim)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
         (

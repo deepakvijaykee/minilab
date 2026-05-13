@@ -16,6 +16,7 @@ from common import (
     resolve_save_every,
 )
 from minilab.checks import require
+from minilab.presets import get_lm_model_preset, lm_model_preset_choices
 from minilab.tokenizers import load_tokenizer
 from minilab.data import load_alpaca
 from minilab.alignment import SFTTrainer
@@ -23,18 +24,19 @@ from minilab.trainer import TrainConfig, run_signature, set_seed, tokenizer_sign
 from minilab.generation import generate
 
 
-_MODEL_BUILD_FLAGS = ("dim", "num_layers", "num_heads")
+_MODEL_BUILD_FLAGS = ("preset", "dim", "num_layers", "num_heads")
 
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--checkpoint", default=None)
 p.add_argument("--model", choices=MODEL_CHOICES, default=None, help="model family for new runs; inferred from checkpoints")
+p.add_argument("--preset", choices=lm_model_preset_choices(), default=None, help="tiny model preset for new runs")
 p.add_argument("--save-dir", default="checkpoints/sft")
 p.add_argument("--dim", type=int, default=None)
 p.add_argument("--num-layers", type=int, default=None)
 p.add_argument("--num-heads", type=int, default=None)
-p.add_argument("--seq-len", type=int, default=256)
+p.add_argument("--seq-len", type=int, default=None)
 p.add_argument("--max-steps", type=int, default=3000)
 p.add_argument("--warmup-steps", type=int, default=100)
 p.add_argument("--save-every", type=int, default=0, help="periodic save interval (0 = save once at end)")
@@ -44,7 +46,13 @@ p.add_argument("--max-examples", type=int, default=10000)
 p.add_argument("--resume-from", default="")
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
-model_name = args.model or "gpt"
+preset = get_lm_model_preset(args.preset) if args.preset else {}
+if args.preset and args.model is not None:
+    require(
+        args.model == preset["model"],
+        f"--model {args.model} conflicts with --preset {args.preset} ({preset['model']})",
+    )
+model_name = preset.get("model") or args.model or "gpt"
 require(not (args.checkpoint and args.resume_from), "SFT accepts --checkpoint or --resume-from, not both")
 
 if args.resume_from or args.checkpoint:
@@ -54,9 +62,10 @@ elif model_name in {"mamba", "mamba2"}:
 
 set_seed(args.seed)
 
-dim = resolve_default(args.dim, 256)
-num_layers = resolve_default(args.num_layers, 6)
-num_heads = resolve_default(args.num_heads, 8)
+dim = resolve_default(args.dim, preset.get("dim", 256))
+num_layers = resolve_default(args.num_layers, preset.get("num_layers", 6))
+num_heads = resolve_default(args.num_heads, preset.get("num_heads", 8))
+seq_len = resolve_default(args.seq_len, preset.get("seq_len", 256))
 
 tok = load_tokenizer(args.tokenizer)
 
@@ -75,12 +84,12 @@ else:
         dim=dim,
         num_layers=num_layers,
         num_heads=num_heads,
-        max_seq_len=args.seq_len,
+        max_seq_len=seq_len,
     )
     model = build_lm_model(model_name, **config_kwargs)
     print(f"New model ({model.num_parameters():,} params)")
 
-ds = load_alpaca(tok, args.seq_len, max_examples=args.max_examples)
+ds = load_alpaca(tok, seq_len, max_examples=args.max_examples)
 print(f"Alpaca: {len(ds)} examples")
 
 tc = TrainConfig(
@@ -95,7 +104,7 @@ tc = TrainConfig(
     resume_from=args.resume_from,
     seed=args.seed,
 )
-sig = run_signature(tok, {"name": "alpaca", "split": "train", "max_examples": args.max_examples}, args.seq_len)
+sig = run_signature(tok, {"name": "alpaca", "split": "train", "max_examples": args.max_examples}, seq_len)
 trainer = SFTTrainer(model, ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok))
 trainer.train()
 model = trainer.model

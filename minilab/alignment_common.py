@@ -232,26 +232,29 @@ def _diffusion_loss_per_example(model, fwd, x_0, loss_mask, t, z_t, mask):
 
 
 def _rollout_policy_train_loop(trainer, inner_epochs):
-    trainer.model.eval()
-    pbar = tqdm(range(trainer.step + 1, trainer.config.max_steps + 1), desc="Training")
-    for trainer.step in pbar:
-        batch = trainer._next_batch()
-        rollout = trainer._rollout(batch)
-        total_loss = 0.0
-        for _ in range(inner_epochs):
-            with torch.autocast(trainer.device, dtype=trainer.dtype, enabled=trainer.dtype != torch.float32):
-                loss = trainer._policy_loss(rollout)
-            trainer.scaler.scale(loss).backward()
-            trainer._optimizer_update()
-            total_loss += loss.item()
+    def loop():
+        trainer.model.eval()
+        pbar = tqdm(range(trainer.step + 1, trainer.config.max_steps + 1), desc="Training")
+        for trainer.step in pbar:
+            batch = trainer._next_batch()
+            rollout = trainer._rollout(batch)
+            total_loss = 0.0
+            for _ in range(inner_epochs):
+                with torch.autocast(trainer.device, dtype=trainer.dtype, enabled=trainer.dtype != torch.float32):
+                    loss = trainer._policy_loss(rollout)
+                trainer.scaler.scale(loss).backward()
+                trainer._optimizer_update()
+                total_loss += loss.item()
 
-        lr = trainer.scheduler.get_last_lr()[0]
-        if trainer.step % trainer.config.log_every == 0:
-            avg_loss = total_loss / inner_epochs
-            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
-            if trainer.aim_run:
-                trainer.aim_run.track(avg_loss, name="loss", step=trainer.step)
-                trainer.aim_run.track(lr, name="lr", step=trainer.step)
-        trainer._save_checkpoint_if_due()
+            lr = trainer.scheduler.get_last_lr()[0]
+            if trainer.step % trainer.config.log_every == 0:
+                avg_loss = total_loss / inner_epochs
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+                if trainer.aim_run:
+                    trainer.aim_run.track(avg_loss, name="loss", step=trainer.step)
+                    trainer.aim_run.track(lr, name="lr", step=trainer.step)
+            trainer._save_checkpoint_if_due()
 
-    trainer._save_final_checkpoint()
+        trainer._save_final_checkpoint()
+
+    trainer._run_train_loop_with_metrics(loop)

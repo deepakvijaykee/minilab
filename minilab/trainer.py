@@ -2,7 +2,9 @@ import hashlib
 import json
 import math
 import random
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -197,6 +199,14 @@ class Trainer:
         self.step = 0
         self.batches_consumed = 0
         self._last_checkpoint_step = None
+        self._run_metrics_active = False
+        self._run_metrics = None
+        self._run_metrics_started_at = None
+        self._run_metrics_started_at_iso = ""
+        self._run_metrics_start_step = 0
+        self._run_metrics_start_batches = 0
+        self._run_metrics_observed_examples = 0
+        self._run_metrics_observed_token_slots = 0
         # Snapshot of loader_generator state taken immediately before the current
         # epoch's iter() call. That is the state that must be restored on resume so
         # the new iter() produces the same shuffle for the epoch we're in the middle of.
@@ -380,6 +390,147 @@ class Trainer:
                 f"({self._resume_scheduler_total_steps}). Start a new run for a longer decay."
             ))
 
+    def _cuda_metrics_enabled(self):
+        return self.device == "cuda" and torch.cuda.is_available()
+
+    def _cuda_device_index(self):
+        return torch.cuda.current_device()
+
+    def _cuda_device_summary(self):
+        if not self._cuda_metrics_enabled():
+            return {
+                "available": False,
+                "measurement": "unavailable",
+            }
+
+        idx = self._cuda_device_index()
+        props = torch.cuda.get_device_properties(idx)
+        summary = {
+            "available": True,
+            "measurement": "torch.cuda allocator stats",
+            "device_index": idx,
+            "device_name": props.name,
+            "total_memory_bytes": props.total_memory,
+            "total_memory_gb": props.total_memory / 1024 ** 3,
+        }
+        if hasattr(torch.cuda, "get_allocator_backend"):
+            summary["allocator_backend"] = torch.cuda.get_allocator_backend()
+        return summary
+
+    def _begin_run_metrics(self):
+        self._run_metrics_active = True
+        self._run_metrics_started_at = time.perf_counter()
+        self._run_metrics_started_at_iso = datetime.now(timezone.utc).isoformat()
+        self._run_metrics_start_step = self.step
+        self._run_metrics_start_batches = self.batches_consumed
+        self._run_metrics_observed_examples = 0
+        self._run_metrics_observed_token_slots = 0
+        if self._cuda_metrics_enabled():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
+    def _record_batch_metrics(self, batch):
+        if not self._run_metrics_active:
+            return
+
+        for value in batch.values():
+            if torch.is_tensor(value) and value.dim() > 0:
+                self._run_metrics_observed_examples += value.size(0)
+                break
+
+        token_keys = ("input_ids", "labels", "chosen_ids", "rejected_ids", "prompt_ids")
+        for key in token_keys:
+            value = batch.get(key)
+            if torch.is_tensor(value) and value.dim() >= 2:
+                self._run_metrics_observed_token_slots += value.numel()
+
+    def _finish_run_metrics(self, status, error=None):
+        if not self._run_metrics_active:
+            return None
+
+        if self._cuda_metrics_enabled():
+            torch.cuda.synchronize()
+
+        duration = time.perf_counter() - self._run_metrics_started_at
+        metrics = {
+            "status": status,
+            "error": error,
+            "started_at": self._run_metrics_started_at_iso,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": duration,
+            "device": self.device,
+            "trainer": type(self).__name__,
+            "model": type(unwrap_model(self.model)).__name__,
+            "parameters": unwrap_model(self.model).num_parameters(),
+            "step": {
+                "start": self._run_metrics_start_step,
+                "end": self.step,
+                "measured": max(0, self.step - self._run_metrics_start_step),
+                "configured_max": self.config.max_steps,
+            },
+            "batches": {
+                "start": self._run_metrics_start_batches,
+                "end": self.batches_consumed,
+                "measured": max(0, self.batches_consumed - self._run_metrics_start_batches),
+            },
+            "observed_examples": self._run_metrics_observed_examples,
+            "observed_token_slots": self._run_metrics_observed_token_slots,
+            "token_slots_per_second": (
+                self._run_metrics_observed_token_slots / duration if duration > 0 else None
+            ),
+            "config": self.config.to_dict(),
+            "cuda": self._cuda_device_summary(),
+        }
+
+        if self._cuda_metrics_enabled():
+            metrics["cuda"].update({
+                "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "max_memory_allocated_gb": torch.cuda.max_memory_allocated() / 1024 ** 3,
+                "max_memory_reserved_bytes": torch.cuda.max_memory_reserved(),
+                "max_memory_reserved_gb": torch.cuda.max_memory_reserved() / 1024 ** 3,
+                "memory_allocated_bytes": torch.cuda.memory_allocated(),
+                "memory_reserved_bytes": torch.cuda.memory_reserved(),
+            })
+
+        self._run_metrics = metrics
+        self._run_metrics_active = False
+        self._write_run_metrics(metrics)
+        self._print_run_metrics(metrics)
+        return metrics
+
+    def _write_run_metrics(self, metrics):
+        save_dir = Path(self.config.save_dir)
+        checkpoint_dir = save_dir / f"step_{self.step}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        targets = [save_dir / "run_metrics.json"]
+        if checkpoint_dir.exists():
+            targets.append(checkpoint_dir / "run_metrics.json")
+        for target in targets:
+            target.write_text(json.dumps(metrics, indent=2) + "\n")
+
+    def _print_run_metrics(self, metrics):
+        duration = metrics["duration_seconds"]
+        print(f"\n  run metrics: duration={duration:.1f}s")
+        cuda = metrics["cuda"]
+        if cuda.get("available"):
+            alloc = cuda["max_memory_allocated_gb"]
+            reserved = cuda["max_memory_reserved_gb"]
+            print(f"  peak CUDA memory: allocated={alloc:.2f} GB reserved={reserved:.2f} GB")
+        if Path(self.config.save_dir, "run_metrics.json").exists():
+            print(f"  wrote {Path(self.config.save_dir) / 'run_metrics.json'}")
+
+    def _run_train_loop_with_metrics(self, loop_fn):
+        self._begin_run_metrics()
+        try:
+            loop_fn()
+        except BaseException as exc:
+            self._finish_run_metrics(
+                "failed",
+                {"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        return self._finish_run_metrics("completed")
+
     def _next_batch(self):
         batch = next(self.train_iter, None)
         require(batch is not None, "train_loader produced no batches")
@@ -392,7 +543,9 @@ class Trainer:
         if self.batches_consumed % len(self.train_loader) == 0:
             self.loader_rng_epoch_start = self.loader_generator.get_state()
             self.train_iter = iter(self.train_loader)
-        return {k: v.to(self.device) for k, v in batch.items()}
+        batch = {k: v.to(self.device) for k, v in batch.items()}
+        self._record_batch_metrics(batch)
+        return batch
 
     def compute_loss(self, batch):
         raise NotImplementedError
@@ -432,37 +585,45 @@ class Trainer:
             self._save_checkpoint_for_step()
 
     def train(self):
-        self.model.train()
-        pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
+        def loop():
+            self.model.train()
+            pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
 
-        for self.step in pbar:
-            total_loss = 0.0
-            for _ in range(self.config.grad_accum_steps):
-                batch = self._next_batch()
-                with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-                    loss = self.compute_loss(batch) / self.config.grad_accum_steps
-                self.scaler.scale(loss).backward()
-                total_loss += loss.item()
+            for self.step in pbar:
+                total_loss = 0.0
+                for _ in range(self.config.grad_accum_steps):
+                    batch = self._next_batch()
+                    with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                        loss = self.compute_loss(batch) / self.config.grad_accum_steps
+                    self.scaler.scale(loss).backward()
+                    total_loss += loss.item()
 
-            self._optimizer_update()
+                self._optimizer_update()
 
-            lr = self.scheduler.get_last_lr()[0]
-            if self.step % self.config.log_every == 0:
-                pbar.set_postfix(loss=f"{total_loss:.4f}", lr=f"{lr:.2e}")
-                if self.aim_run:
-                    self.aim_run.track(total_loss, name="loss", step=self.step)
-                    self.aim_run.track(lr, name="lr", step=self.step)
+                lr = self.scheduler.get_last_lr()[0]
+                if self.step % self.config.log_every == 0:
+                    pbar.set_postfix(loss=f"{total_loss:.4f}", lr=f"{lr:.2e}")
+                    if self.aim_run:
+                        self.aim_run.track(total_loss, name="loss", step=self.step)
+                        self.aim_run.track(lr, name="lr", step=self.step)
 
-            if self.eval_loader is not None and self.config.eval_every > 0 and self.step % self.config.eval_every == 0:
-                eval_loss = self.evaluate()
-                print(f"\n  step {self.step} eval loss: {eval_loss:.4f}")
-                if self.aim_run:
-                    self.aim_run.track(eval_loss, name="eval_loss", step=self.step)
-                self.model.train()
+                should_eval = (
+                    self.eval_loader is not None
+                    and self.config.eval_every > 0
+                    and self.step % self.config.eval_every == 0
+                )
+                if should_eval:
+                    eval_loss = self.evaluate()
+                    print(f"\n  step {self.step} eval loss: {eval_loss:.4f}")
+                    if self.aim_run:
+                        self.aim_run.track(eval_loss, name="eval_loss", step=self.step)
+                    self.model.train()
 
-            self._save_checkpoint_if_due()
+                self._save_checkpoint_if_due()
 
-        self._save_final_checkpoint()
+            self._save_final_checkpoint()
+
+        self._run_train_loop_with_metrics(loop)
 
     @torch.no_grad()
     def evaluate(self):

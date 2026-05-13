@@ -6,6 +6,7 @@
 
 import argparse
 from minilab.checks import require
+from minilab.presets import get_diffusion_model_preset, diffusion_model_preset_choices
 from minilab.tokenizers import load_tokenizer
 from minilab.diffusion import ForwardProcess
 from minilab.trainer import DiffusionTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
@@ -29,7 +30,7 @@ from common import (
 
 
 _MODEL_BUILD_FLAGS = (
-    "dim", "num_layers", "num_heads", "num_kv_heads",
+    "preset", "dim", "num_layers", "num_heads", "num_kv_heads",
     "attention", "ffn", "num_experts", "top_k_experts",
     "block_size", "block_diffusion_unconditional", "antithetic_time_sampling",
 )
@@ -42,12 +43,13 @@ p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--save-dir", default="checkpoints/diffusion")
 p.add_argument("--model", default=None, choices=DIFFUSION_MODEL_CHOICES, help="model family for new runs; inferred from checkpoints")
+p.add_argument("--preset", choices=diffusion_model_preset_choices(), default=None, help="tiny diffusion model preset for new runs")
 p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
 p.add_argument("--dim", type=int, default=None)
 p.add_argument("--num-layers", type=int, default=None)
 p.add_argument("--num-heads", type=int, default=None)
 p.add_argument("--num-kv-heads", type=int, default=None, help="KV heads for GQA; defaults to num_heads")
-p.add_argument("--seq-len", type=int, default=256)
+p.add_argument("--seq-len", type=int, default=None)
 p.add_argument("--attention", default=None)
 p.add_argument("--ffn", default=None)
 p.add_argument("--num-experts", type=int, default=None)
@@ -76,7 +78,13 @@ p.add_argument("--grad-checkpoint", action="store_true")
 p.add_argument("--resume-from", default="")
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
-model_name = args.model or "mdlm"
+preset = get_diffusion_model_preset(args.preset) if args.preset else {}
+if args.preset and args.model is not None:
+    require(
+        args.model == preset["model"],
+        f"--model {args.model} conflicts with --preset {args.preset} ({preset['model']})",
+    )
+model_name = preset.get("model") or args.model or "mdlm"
 
 if args.resume_from:
     reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
@@ -84,9 +92,10 @@ if args.resume_from:
 
 set_seed(args.seed)
 
-dim = resolve_default(args.dim, 256)
-num_layers = resolve_default(args.num_layers, 6)
-num_heads = resolve_default(args.num_heads, 8)
+dim = resolve_default(args.dim, preset.get("dim", 256))
+num_layers = resolve_default(args.num_layers, preset.get("num_layers", 6))
+num_heads = resolve_default(args.num_heads, preset.get("num_heads", 8))
+seq_len = resolve_default(args.seq_len, preset.get("seq_len", 256))
 attention = resolve_default(args.attention, "mha")
 ffn = resolve_default(args.ffn, "swiglu")
 num_experts = resolve_default(args.num_experts, DEFAULT_NUM_EXPERTS)
@@ -104,11 +113,11 @@ tok = load_tokenizer(args.tokenizer)
 mask_id = tok.vocab_size
 
 max_examples = resolve_pretrain_max_examples(args.dataset, args.max_examples, 50000)
-train_ds = load_pretrain_dataset(args.dataset, tok, args.seq_len, "train", max_examples, "diffusion")
+train_ds = load_pretrain_dataset(args.dataset, tok, seq_len, "train", max_examples, "diffusion")
 eval_ds = (
     None
     if args.dataset == "openwebtext"
-    else load_pretrain_eval_dataset(args.dataset, tok, args.seq_len, 2000, "diffusion")
+    else load_pretrain_eval_dataset(args.dataset, tok, seq_len, 2000, "diffusion")
 )
 eval_count = "none" if eval_ds is None else len(eval_ds)
 print(f"Data: {args.dataset} train={len(train_ds)} eval={eval_count}")
@@ -130,7 +139,7 @@ else:
             num_layers=num_layers,
             num_heads=num_heads,
             num_kv_heads=args.num_kv_heads,
-            max_seq_len=args.seq_len,
+            max_seq_len=seq_len,
             attention=attention,
             ffn=ffn,
             num_experts=num_experts,
@@ -155,7 +164,7 @@ tc = TrainConfig(
     save_dir=args.save_dir,
     resume_from=args.resume_from, seed=args.seed,
 )
-sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples, "mode": "diffusion"}, args.seq_len)
+sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples, "mode": "diffusion"}, seq_len)
 trainer = DiffusionTrainer(model, fwd, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
 trainer.train()
 model = trainer.model
@@ -164,7 +173,7 @@ print("\n--- Samples ---")
 model.eval()
 if model.supports_unconditional_diffusion_sampling():
     sample_steps = min(256, fwd.num_timesteps)
-    samples = diffusion_sampler(model_name)(model, fwd, batch_size=4, seq_len=args.seq_len, num_steps=sample_steps)
+    samples = diffusion_sampler(model_name)(model, fwd, batch_size=4, seq_len=seq_len, num_steps=sample_steps)
     for i in range(4):
         s = [t for t in samples[i].tolist() if t < tok.vocab_size]
         print(f"  {tok.decode(s)[:120]}")

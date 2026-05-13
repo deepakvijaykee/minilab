@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from minilab.checks import require
+from minilab.hf_cache import configure_hf_cache
 from minilab.tasks.gsm8k import parse_gold_answer, prompt_parts
 
 _TEXT8_TRAIN_CHARS = 90_000_000
@@ -15,6 +16,7 @@ _TEXT8_TEST_CHARS = 5_000_000
 
 
 def load_dataset(*args, **kwargs):
+    configure_hf_cache(include_datasets=True)
     from datasets import load_dataset as hf_load_dataset
     return hf_load_dataset(*args, **kwargs)
 
@@ -288,6 +290,8 @@ def _alpaca_examples(max_examples):
         prompt = row["instruction"]
         if row["input"]:
             prompt = prompt + "\n" + row["input"]
+        if not prompt.strip() or not row["output"].strip():
+            continue
         examples.append({"prompt": prompt, "response": row["output"]})
     return examples
 
@@ -410,6 +414,8 @@ def _dolly_examples(max_examples):
         prompt = row["instruction"]
         if row["context"]:
             prompt = prompt + "\n" + row["context"]
+        if not prompt.strip() or not row["response"].strip():
+            continue
         examples.append({"prompt": prompt, "response": row["response"]})
     return examples
 

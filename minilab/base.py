@@ -228,8 +228,9 @@ class BaseTokenizer:
 
     @classmethod
     def load(cls, path):
+        path = Path(path)
         tok = cls()
-        state = json.loads(Path(path).read_text())
+        state = json.loads(path.read_text())
         require(isinstance(state, dict), "Tokenizer state must be a JSON object")
         expected_state = tok._get_state()
         if "type" in expected_state:
@@ -237,6 +238,8 @@ class BaseTokenizer:
             require(state["type"] == expected_state["type"], (
                 f"Tokenizer state was saved as {state['type']!r}, cannot load as {cls.__name__}."
             ))
+        if hasattr(tok, "_set_state_base_dir"):
+            tok._set_state_base_dir(path.parent)
         tok._set_state(state)
         return tok
 

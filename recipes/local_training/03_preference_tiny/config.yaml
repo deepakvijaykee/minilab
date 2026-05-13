@@ -1,0 +1,29 @@
+recipe: preference_tiny
+script: scripts/preference.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoint: checkpoints/local_training/sft/step_500
+outputs:
+  checkpoint_dir: checkpoints/local_training/preference_dpo
+defaults:
+  algorithm: dpo
+  dataset: hh
+  preset_for_estimate: gpt-10m
+  seq_len: 512
+  max_steps: 300
+  warmup_steps: 30
+  batch_size: 2
+  lr: 0.00001
+  beta: 0.1
+  max_examples: 1000
+environment_overrides:
+  TOKENIZER: tokenizer path
+  SFT_CHECKPOINT: SFT checkpoint path
+  ALGORITHM: dpo, ipo, cpo, simpo, orpo, repo, or kto
+  DATASET: hh or ultrafeedback
+  SAVE_DIR: preference checkpoint directory
+  PRESET: model preset used by the estimator
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  BATCH_SIZE: dataloader batch size
+  MAX_EXAMPLES: dataset cap

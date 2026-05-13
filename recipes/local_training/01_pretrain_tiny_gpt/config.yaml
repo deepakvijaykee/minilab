@@ -1,0 +1,25 @@
+recipe: pretrain_tiny_gpt
+script: scripts/pretrain_lm.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+outputs:
+  checkpoint_dir: checkpoints/local_training/lm
+defaults:
+  preset: gpt-10m
+  dataset: tinystories
+  seq_len: 512
+  max_steps: 1000
+  warmup_steps: 50
+  batch_size: 8
+  lr: 0.0003
+  max_examples: 10000
+  grad_checkpoint: true
+environment_overrides:
+  TOKENIZER: tokenizer path
+  PRESET: gpt-10m, gpt-25m, gpt-60m, or mamba-25m
+  SAVE_DIR: checkpoint directory
+  DATASET: pretraining dataset
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  BATCH_SIZE: dataloader batch size
+  MAX_EXAMPLES: dataset cap

@@ -116,9 +116,6 @@ class RLOOTrainConfig(GRPOTrainConfig):
 class GSPOTrainConfig(GRPOTrainConfig):
     grpo_clip_ratio: float = 4e-4
 
-    def __post_init__(self):
-        super().__post_init__()
-
 
 class PPOValueHead(nn.Module):
     def __init__(self, dim):
@@ -286,34 +283,37 @@ class PPOTrainer(Trainer):
         raise NotImplementedError("PPO runs its own train loop; compute_loss is not called")
 
     def train(self):
-        self.model.eval()
-        self.value_head.eval()
-        pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
-        for self.step in pbar:
-            batch = self._next_batch()
-            rollout = self._rollout(batch)
-            total_loss = 0.0
-            for _ in range(self.inner_epochs):
-                self.model.eval()
-                self.value_head.train()
-                with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-                    loss = self._policy_loss(rollout)
-                self.scaler.scale(loss).backward()
-                self._optimizer_update()
-                total_loss += loss.item()
-
-            lr = self.scheduler.get_last_lr()[0]
-            if self.step % self.config.log_every == 0:
-                avg_loss = total_loss / self.inner_epochs
-                pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
-                if self.aim_run:
-                    self.aim_run.track(avg_loss, name="loss", step=self.step)
-                    self.aim_run.track(lr, name="lr", step=self.step)
-            self._save_checkpoint_if_due()
+        def loop():
             self.model.eval()
             self.value_head.eval()
+            pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
+            for self.step in pbar:
+                batch = self._next_batch()
+                rollout = self._rollout(batch)
+                total_loss = 0.0
+                for _ in range(self.inner_epochs):
+                    self.model.eval()
+                    self.value_head.train()
+                    with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                        loss = self._policy_loss(rollout)
+                    self.scaler.scale(loss).backward()
+                    self._optimizer_update()
+                    total_loss += loss.item()
 
-        self._save_final_checkpoint()
+                lr = self.scheduler.get_last_lr()[0]
+                if self.step % self.config.log_every == 0:
+                    avg_loss = total_loss / self.inner_epochs
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+                    if self.aim_run:
+                        self.aim_run.track(avg_loss, name="loss", step=self.step)
+                        self.aim_run.track(lr, name="lr", step=self.step)
+                self._save_checkpoint_if_due()
+                self.model.eval()
+                self.value_head.eval()
+
+            self._save_final_checkpoint()
+
+        self._run_train_loop_with_metrics(loop)
 
     def _rollout(self, batch):
         prompt_ids = batch["prompt_ids"]
@@ -668,6 +668,8 @@ class DAPOTrainer(GRPOTrainer):
         self.max_resample = config.dapo_max_resample
 
     def save_checkpoint(self):
+        # DAPO is reference-free, but inherits GRPO rollout helpers. Bypass
+        # ReferenceCheckpointMixin so checkpoints do not require ref_path.txt.
         Trainer.save_checkpoint(self)
 
     def compute_loss(self, batch):

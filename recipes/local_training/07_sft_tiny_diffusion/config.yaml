@@ -1,0 +1,28 @@
+recipe: sft_tiny_diffusion
+script: scripts/sft_diffusion.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoint: checkpoints/local_training/diffusion/step_1000
+outputs:
+  checkpoint_dir: checkpoints/local_training/diffusion_sft
+defaults:
+  preset_for_estimate: mdlm-25m
+  dataset: alpaca
+  seq_len: 512
+  max_steps: 500
+  warmup_steps: 50
+  batch_size: 2
+  lr: 0.0001
+  max_examples: 2000
+  sample_new_tokens: 80
+  grad_checkpoint: true
+environment_overrides:
+  TOKENIZER: tokenizer path
+  DIFFUSION_CHECKPOINT: pretrained diffusion checkpoint path
+  SAVE_DIR: diffusion SFT checkpoint directory
+  PRESET: model preset used by the estimator
+  DATASET: alpaca or dolly
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  BATCH_SIZE: dataloader batch size
+  MAX_EXAMPLES: dataset cap

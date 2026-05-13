@@ -1,0 +1,15 @@
+recipe: train_tokenizer
+script: scripts/train_tokenizer.py
+outputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+defaults:
+  type: bpe
+  dataset: tinystories
+  vocab_size: 4096
+  num_texts: 5000
+environment_overrides:
+  TOKENIZER: output tokenizer path
+  TOKENIZER_TYPE: tokenizer implementation
+  DATASET: tokenizer corpus
+  VOCAB_SIZE: vocabulary size
+  NUM_TEXTS: number of dataset rows used for tokenizer training

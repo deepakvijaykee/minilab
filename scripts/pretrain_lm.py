@@ -26,6 +26,7 @@ from common import (
     resolve_save_every,
 )
 from minilab.checks import require
+from minilab.presets import get_lm_model_preset, lm_model_preset_choices
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
 from minilab.generation import generate
@@ -51,7 +52,7 @@ from minilab.nn.architecture import (
 
 
 _MODEL_BUILD_FLAGS = (
-    "dim", "num_layers", "num_heads", "num_kv_heads", "attention", "position",
+    "preset", "dim", "num_layers", "num_heads", "num_kv_heads", "attention", "position",
     "norm",
     "rope_base", "rope_local_base", "rope_global_base", "rope_scaling_factor",
     "rope_original_max_seq_len", "rope_partial_rotary_factor", "yarn_beta_fast",
@@ -88,12 +89,13 @@ p = argparse.ArgumentParser()
 p.add_argument("--tokenizer", required=True)
 p.add_argument("--save-dir", default="checkpoints/lm")
 p.add_argument("--model", choices=MODEL_CHOICES, default=None, help="model family for new runs; inferred from checkpoints")
+p.add_argument("--preset", choices=lm_model_preset_choices(), default=None, help="tiny model preset for new runs")
 p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default="tinystories")
 p.add_argument("--dim", type=int, default=None)
 p.add_argument("--num-layers", type=int, default=None)
 p.add_argument("--num-heads", type=int, default=None)
 p.add_argument("--num-kv-heads", type=int, default=None, help="KV heads for GQA; defaults to num_heads")
-p.add_argument("--seq-len", type=int, default=256)
+p.add_argument("--seq-len", type=int, default=None)
 p.add_argument("--attention", default=None)
 p.add_argument("--position", default=None)
 p.add_argument("--norm", default=None)
@@ -132,7 +134,13 @@ p.add_argument("--grad-checkpoint", action="store_true")
 p.add_argument("--resume-from", default="")
 p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
-model_name = args.model or "gpt"
+preset = get_lm_model_preset(args.preset) if args.preset else {}
+if args.preset and args.model is not None:
+    require(
+        args.model == preset["model"],
+        f"--model {args.model} conflicts with --preset {args.preset} ({preset['model']})",
+    )
+model_name = preset.get("model") or args.model or "gpt"
 
 if args.resume_from:
     reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
@@ -156,9 +164,10 @@ if args.qk_clip_balance is not None:
 
 set_seed(args.seed)
 
-dim = resolve_default(args.dim, 256)
-num_layers = resolve_default(args.num_layers, 6)
-num_heads = resolve_default(args.num_heads, 8)
+dim = resolve_default(args.dim, preset.get("dim", 256))
+num_layers = resolve_default(args.num_layers, preset.get("num_layers", 6))
+num_heads = resolve_default(args.num_heads, preset.get("num_heads", 8))
+seq_len = resolve_default(args.seq_len, preset.get("seq_len", 256))
 attention = resolve_default(args.attention, "mha")
 position = resolve_default(args.position, "rope")
 norm = resolve_default(args.norm, "rmsnorm")
@@ -239,11 +248,11 @@ if args.mtp_loss_weight is not None:
 
 tok = load_tokenizer(args.tokenizer)
 max_examples = resolve_pretrain_max_examples(args.dataset, args.max_examples, 50000)
-train_ds = load_pretrain_dataset(args.dataset, tok, args.seq_len, "train", max_examples, "lm")
+train_ds = load_pretrain_dataset(args.dataset, tok, seq_len, "train", max_examples, "lm")
 eval_ds = (
     None
     if args.dataset == "openwebtext"
-    else load_pretrain_eval_dataset(args.dataset, tok, args.seq_len, 2000, "lm")
+    else load_pretrain_eval_dataset(args.dataset, tok, seq_len, 2000, "lm")
 )
 eval_count = "none" if eval_ds is None else len(eval_ds)
 print(f"Data: {args.dataset} train={len(train_ds)} eval={eval_count}")
@@ -260,7 +269,7 @@ else:
         num_layers=num_layers,
         num_heads=num_heads,
         num_kv_heads=args.num_kv_heads,
-        max_seq_len=args.seq_len,
+        max_seq_len=seq_len,
         attention=attention,
         position=position,
         norm=norm,
@@ -300,7 +309,7 @@ tc = TrainConfig(
     save_dir=args.save_dir,
     resume_from=args.resume_from, seed=args.seed,
 )
-sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples}, args.seq_len)
+sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples}, seq_len)
 trainer = LMTrainer(model, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)
 trainer.train()
 model = trainer.model

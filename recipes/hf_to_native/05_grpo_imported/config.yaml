@@ -1,0 +1,13 @@
+model: smollm2-135m
+algorithm: grpo
+policy_checkpoint: checkpoints/imported/smollm2-135m-simpo/step_50
+save_dir: checkpoints/imported/smollm2-135m-grpo
+seq_len: 512
+max_steps: 25
+warmup_steps: 5
+batch_size: 1
+lr: 5.0e-6
+num_generations: 2
+max_new_tokens: 64
+max_examples: 100
+eval_examples: 20

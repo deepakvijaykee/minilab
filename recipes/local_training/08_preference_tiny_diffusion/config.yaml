@@ -1,0 +1,30 @@
+recipe: preference_tiny_diffusion
+script: scripts/dpo_diffusion.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoint: checkpoints/local_training/diffusion_sft/step_500
+outputs:
+  checkpoint_dir: checkpoints/local_training/diffusion_dpo
+defaults:
+  algorithm: dpo
+  dataset: hh-rlhf
+  preset_for_estimate: mdlm-25m
+  seq_len: 512
+  max_steps: 300
+  warmup_steps: 30
+  batch_size: 2
+  lr: 0.00001
+  beta: 0.1
+  max_examples: 1000
+  sample_new_tokens: 80
+environment_overrides:
+  TOKENIZER: tokenizer path
+  DIFFUSION_SFT_CHECKPOINT: diffusion SFT checkpoint path
+  ALGORITHM: dpo or vrpo
+  DATASET: hh-rlhf or ultrafeedback
+  SAVE_DIR: diffusion preference checkpoint directory
+  PRESET: model preset used by the estimator
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  BATCH_SIZE: dataloader batch size
+  MAX_EXAMPLES: dataset cap

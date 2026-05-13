@@ -1,0 +1,13 @@
+# Sample Output Shape
+
+```text
+Estimated VRAM (rough planning estimate)
+...
+Data: tinystories train=... eval=...
+MDLM: ... params
+Training: ...
+saved checkpoints/local_training/diffusion/step_1000
+
+--- Samples ---
+...
+```

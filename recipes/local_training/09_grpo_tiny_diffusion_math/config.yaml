@@ -1,0 +1,29 @@
+recipe: grpo_tiny_diffusion_math
+script: scripts/grpo_diffusion.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoint: checkpoints/local_training/diffusion_sft/step_500
+outputs:
+  checkpoint_dir: checkpoints/local_training/diffusion_grpo
+defaults:
+  preset_for_estimate: mdlm-25m
+  seq_len: 512
+  max_steps: 100
+  warmup_steps: 20
+  batch_size: 1
+  num_generations: 2
+  inner_epochs: 4
+  max_new_tokens: 64
+  diffusion_steps: 64
+  max_examples: 500
+  eval_examples: 50
+environment_overrides:
+  TOKENIZER: tokenizer path
+  DIFFUSION_SFT_CHECKPOINT: diffusion SFT checkpoint path
+  SAVE_DIR: diffusion GRPO checkpoint directory
+  PRESET: model preset used by the estimator
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  NUM_GENERATIONS: rollout group size
+  MAX_NEW_TOKENS: reserved response length
+  DIFFUSION_STEPS: denoising steps per rollout

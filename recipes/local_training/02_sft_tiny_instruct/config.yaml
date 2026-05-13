@@ -1,0 +1,24 @@
+recipe: sft_tiny_instruct
+script: scripts/sft.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoint: checkpoints/local_training/lm/step_1000
+outputs:
+  checkpoint_dir: checkpoints/local_training/sft
+defaults:
+  preset_for_estimate: gpt-10m
+  seq_len: 512
+  max_steps: 500
+  warmup_steps: 50
+  batch_size: 4
+  lr: 0.0001
+  max_examples: 2000
+environment_overrides:
+  TOKENIZER: tokenizer path
+  BASE_CHECKPOINT: pretrained checkpoint path
+  SAVE_DIR: SFT checkpoint directory
+  PRESET: model preset used by the estimator
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  BATCH_SIZE: dataloader batch size
+  MAX_EXAMPLES: dataset cap

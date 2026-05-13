@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "minilab"
 version = "0.1.0"
-description = "A modular library for training language models from scratch: autoregressive transformers, text diffusion, and alignment."
+description = "A laptop-GPU-friendly training lab for end-to-end language model training, alignment, RLVR, and diffusion LM experiments."
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
@@ -19,4 +19,5 @@ dependencies = [
 data = ["datasets>=2.14"]
 logging = ["aim>=3.17"]
 flash = ["flash-attn>=2.3"]
+hf = ["transformers>=4.40", "huggingface_hub>=0.23", "safetensors>=0.4"]
 dev = ["pytest", "ruff"]

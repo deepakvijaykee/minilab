@@ -1,0 +1,22 @@
+recipe: eval_all
+script: scripts/evaluate.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoints:
+    base: checkpoints/local_training/lm/step_1000
+    sft: checkpoints/local_training/sft/step_500
+    preference: checkpoints/local_training/preference_dpo/step_300
+    grpo: checkpoints/local_training/grpo/step_100
+defaults:
+  dataset: tinystories
+  seq_len: 512
+  num_samples: 10
+environment_overrides:
+  TOKENIZER: tokenizer path
+  DATASET: evaluation dataset
+  SEQ_LEN: token sequence length
+  NUM_SAMPLES: generated samples per checkpoint
+  BASE_CHECKPOINT: base LM checkpoint path
+  SFT_CHECKPOINT: SFT checkpoint path
+  PREFERENCE_CHECKPOINT: preference checkpoint path
+  GRPO_CHECKPOINT: RLVR checkpoint path

@@ -1,0 +1,5 @@
+model: smollm2-135m
+save_dir: checkpoints/imported/smollm2-135m
+max_seq_len: 512
+verify: true
+device: cpu

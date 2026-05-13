@@ -1,0 +1,28 @@
+recipe: grpo_tiny_math
+script: scripts/grpo.py
+inputs:
+  tokenizer: checkpoints/local_training/tokenizer.json
+  checkpoint: checkpoints/local_training/sft/step_500
+outputs:
+  checkpoint_dir: checkpoints/local_training/grpo
+defaults:
+  algorithm: grpo
+  preset_for_estimate: gpt-10m
+  seq_len: 512
+  max_steps: 100
+  warmup_steps: 20
+  batch_size: 1
+  num_generations: 2
+  max_new_tokens: 64
+  max_examples: 500
+  eval_examples: 50
+environment_overrides:
+  TOKENIZER: tokenizer path
+  SFT_CHECKPOINT: SFT checkpoint path
+  ALGORITHM: grpo, rloo, gspo, dapo, or ppo
+  SAVE_DIR: RLVR checkpoint directory
+  PRESET: model preset used by the estimator
+  SEQ_LEN: token sequence length
+  MAX_STEPS: training steps
+  NUM_GENERATIONS: rollout group size
+  MAX_NEW_TOKENS: rollout length

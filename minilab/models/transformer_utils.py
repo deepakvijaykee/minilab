@@ -28,6 +28,10 @@ DEFAULT_NUM_EXPERTS = 8
 DEFAULT_TOP_K_EXPERTS = 2
 
 
+def require_default_unless(value, default, condition, message):
+    require(value == default or condition, message)
+
+
 def validate_parallel_or_interleaved_lm_config(config, owner):
     """Shared config contract for compact HybridLM/HymbaLM-style backbones."""
     if config.num_kv_heads is None:
@@ -113,16 +117,22 @@ def _validate_simple_transformer_branch(config, owner):
         require(config.position in {"rope", "yarn_rope"}, (
             f"partial-RoPE attention in {owner} requires a RoPE-compatible position"
         ))
-    require(
-        config.rope_base == DEFAULT_ROPE_BASE or config.position in {"rope", "yarn_rope"},
+    require_default_unless(
+        config.rope_base,
+        DEFAULT_ROPE_BASE,
+        config.position in {"rope", "yarn_rope"},
         "rope_base only applies to position='rope' or position='yarn_rope'",
     )
-    require(
-        config.rope_scaling_factor == DEFAULT_ROPE_SCALING_FACTOR or config.position == "yarn_rope",
+    require_default_unless(
+        config.rope_scaling_factor,
+        DEFAULT_ROPE_SCALING_FACTOR,
+        config.position == "yarn_rope",
         "rope_scaling_factor only applies to position='yarn_rope'",
     )
-    require(
-        config.rope_original_max_seq_len == DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN or config.position == "yarn_rope",
+    require_default_unless(
+        config.rope_original_max_seq_len,
+        DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
+        config.position == "yarn_rope",
         "rope_original_max_seq_len only applies to position='yarn_rope'",
     )
     require(
@@ -133,17 +143,22 @@ def _validate_simple_transformer_branch(config, owner):
         or config.position == "yarn_rope",
         "yarn_beta_fast and yarn_beta_slow only apply to position='yarn_rope'",
     )
-    require(
-        config.local_attention_window == DEFAULT_LOCAL_ATTENTION_WINDOW or uses_local_window,
+    require_default_unless(
+        config.local_attention_window,
+        DEFAULT_LOCAL_ATTENTION_WINDOW,
+        uses_local_window,
         "local_attention_window only applies to local/sliding-window attention",
     )
-    require(
-        config.rope_partial_rotary_factor == DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR or uses_partial_rope,
+    require_default_unless(
+        config.rope_partial_rotary_factor,
+        DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
+        uses_partial_rope,
         "rope_partial_rotary_factor only applies to partial-RoPE attention",
     )
-    require(
-        config.qwen3_next_full_attention_interval == DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
-        or config.attention == "qwen3_next",
+    require_default_unless(
+        config.qwen3_next_full_attention_interval,
+        DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
+        config.attention == "qwen3_next",
         "qwen3_next_full_attention_interval only applies to attention='qwen3_next'",
     )
     validate_moe_fields(config)
