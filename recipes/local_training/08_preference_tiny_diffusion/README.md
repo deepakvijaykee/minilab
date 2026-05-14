@@ -9,10 +9,9 @@ diffusion estimates per pair.
 bash recipes/local_training/08_preference_tiny_diffusion/run.sh
 ```
 
-Defaults: `--algorithm dpo`, `--dataset hh-rlhf`,
-`DIFFUSION_SFT_CHECKPOINT=.../diffusion_sft/step_500`, `--max-steps 300`,
-`--batch-size 2`, `--lr 1e-5`, `--beta 0.1`, `--max-examples 1000`,
-`--sample-new-tokens 80`. The save directory is named
+The default run is diffusion DPO on HH-RLHF starting from
+`diffusion_sft/step_500`: 300 steps at batch 2, `lr=1e-5`, `beta=0.1`,
+1000 preference pairs, 80 sampled response tokens. The save directory is
 `checkpoints/local_training/diffusion_<algorithm>`.
 
 Run the variance-reduced variant:

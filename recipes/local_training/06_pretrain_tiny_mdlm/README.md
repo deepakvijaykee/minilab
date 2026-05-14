@@ -7,10 +7,10 @@ diffusion-track counterpart to recipe 01; recipes 07-09 load this checkpoint.
 bash recipes/local_training/06_pretrain_tiny_mdlm/run.sh
 ```
 
-Defaults: `--preset mdlm-25m`, `--seq-len 512`, `--batch-size 4`,
-`--max-steps 1000`, `--max-examples 10000`, gradient checkpointing on. The
-batch size is smaller than recipe 01 (`8`) because MDLM keeps the full
-sequence at every timestep and the activation budget is tighter.
+It pretrains `mdlm-25m` for 1000 steps at batch 4 over 10000 TinyStories
+examples, with gradient checkpointing on. The batch size is half of
+recipe 01 (`8`) because MDLM keeps the full sequence at every timestep,
+which is tighter on activation memory.
 
 Useful overrides:
 

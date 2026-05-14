@@ -7,9 +7,9 @@ recipe 01 and trains an instruction-following variant.
 bash recipes/local_training/02_sft_tiny_instruct/run.sh
 ```
 
-Defaults: `BASE_CHECKPOINT=checkpoints/local_training/lm/step_1000`,
-`--max-steps 500`, `--batch-size 4`, `--lr 1e-4`,
-`--max-examples 2000`. Output lands in `checkpoints/local_training/sft`.
+By default it consumes `checkpoints/local_training/lm/step_1000` and runs
+for 500 steps at batch 4, `lr=1e-4`, over 2000 Alpaca rows. Output lands
+in `checkpoints/local_training/sft`.
 
 The SFT trainer masks loss on prompt tokens and only supervises responses,
 so the base LM's text habits carry over while only the answer style is

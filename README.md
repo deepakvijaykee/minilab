@@ -1,56 +1,101 @@
 # minilab
 
-Minilab is a laptop-GPU-friendly training lab for building language models end
-to end: tokenizer training, tiny pretraining, supervised fine-tuning,
-preference optimization, RLVR, evaluation, and diffusion LM experiments.
+Minilab is my small-scale language-model training lab.
 
-The point is small, faithful runs you can actually inspect, not frontier-scale
-training. Everything should fit on a single device and fail loudly when
-something is wrong.
+The goal is to make the full pretraining → SFT → preference optimization →
+RLVR loop runnable on a single consumer GPU, ideally an 8GB laptop GPU.
 
-## What you can train
+This is not a distributed training framework. It is not trying to replace
+TRL, torchtune, Axolotl, or Megatron. It is for understanding and debugging
+post-training methods in small, inspectable experiments where I can see
+what each step does to the model.
 
-- Tokenizers: BPE, WordPiece, Unigram, character, and byte tokenizers.
-- Autoregressive LMs: GPT-style transformers, Mamba/SSM variants, hybrids,
-  xLSTM, and byte-latent models.
-- Diffusion LMs: MDLM, SEDD, D3PM, and block diffusion models.
-- Supervised alignment: instruction SFT for autoregressive and diffusion LMs.
-- Preference optimization: DPO, IPO, CPO, ORPO, SimPO, RePO, and KTO.
-- RLVR and online RL: GRPO, RLOO, GSPO, DAPO, and PPO with verifier rewards.
+The main path is:
 
-## Laptop-scale design
+```text
+tokenizer → tiny GPT pretraining → SFT → DPO/SimPO → GRPO with GSM8K verifier → eval
+```
 
-- Small-model defaults that make short runs practical.
-- Single-device scripts with no distributed setup required.
-- Dataset caps, short sequence lengths, and small batch settings for debugging.
-- Gradient accumulation, mixed precision, and gradient checkpointing where
-  supported.
-- Readable PyTorch implementations over framework machinery.
-- Evaluation and diagnostics for comparing checkpoints and inspecting failures.
+Each step is a recipe under `recipes/local_training/`, runnable as one
+`bash run.sh`. The diffusion branch (recipes `06`-`09`) mirrors the same
+shape with MDLM in place of GPT.
 
-## Learning path
+## Cost on my laptop
 
-Start with a tokenizer, pretrain a tiny LM, then move through alignment and
-evaluation:
+Hardware: NVIDIA RTX 5060 Laptop, 8GB VRAM.
+Main tested path: `gpt-10m`, 4k-vocab BPE tokenizer, FP32 + AdamW, grad
+checkpointing where the recipe enables it.
 
-1. Train a tokenizer.
-2. Pretrain an autoregressive LM.
-3. Sample from and evaluate the base checkpoint.
-4. Supervised fine-tune on instruction data.
-5. Run preference optimization.
-6. Improve math behavior with RLVR and verifier rewards.
-7. Compare autoregressive and diffusion LM training paths.
+Wall times include the first `torch.compile` cold-start (~30-60s) and the
+first-run HF dataset download; both cache after that. Peak VRAM is also
+recorded in `run_metrics.json` as `max_memory_reserved_gb`.
+
+| Stage | Steps | Peak VRAM | Wall time | Result |
+| --- | ---: | ---: | ---: | --- |
+| 00 tokenizer | — | CPU | ~30s | tokenizer saved, sample sentence roundtrips |
+| 01 pretrain `gpt-10m` | 1000 | ~1.5 GB | ~3 min | loss curve looks right; samples have TinyStories cadence but aren't stories yet |
+| 02 SFT (Alpaca) | 500 | ~1.2 GB | ~2 min | output shifts from story drift to Q/A shape (content still weak) |
+| 03 DPO (HH-RLHF) | 300 | ~1.3 GB | ~2 min | chosen margin stays positive on most pairs |
+| 04 GRPO (GSM8K) | 100 | ~1.2 GB | ~12 min | the rollout loop is the wall-time cost; GSM8K accuracy is single-digit and noisy |
+| 05 eval | — | ~0.8 GB | ~3 min | per-stage perplexity, Distinct-N, and five sampled completions |
+| 06 pretrain `mdlm-25m` | 1000 | ~2.0 GB | ~5 min | denoising loss trends down; samples are token-shaped but not coherent |
+| 07 diffusion SFT | 500 | ~1.7 GB | ~3 min | response-token loss drops; ceiling is whatever recipe 06 produced |
+| 08 diffusion DPO | 300 | ~2.5 GB | ~6 min | trainable plus frozen reference both fit on 8GB; preference loss stays finite |
+| 09 diffusion GRPO | 100 | ~2.3 GB | ~30 min | 64 reverse-diffusion forwards × 2 generations × 100 outer steps is where the time goes |
+
+Peak VRAM never crosses 3 GB at the defaults, which leaves room to push
+`PRESET=gpt-25m`, a larger `BATCH_SIZE`, or longer `MAX_NEW_TOKENS` before
+the 8GB limit bites. Run `scripts/estimate_vram.py` before pushing any
+of those up.
+
+## Known limitations
+
+- The default runs are sanity checks, not leaderboard runs. Coherent
+  TinyStories prose and useful instruction quality need 3000+ pretrain
+  steps and a larger preset (`gpt-25m` or `gpt-60m`).
+- Tiny models pick up formatting before reasoning, so SFT and DPO/SimPO
+  improvements show up in response shape long before they show up in
+  GSM8K-style accuracy.
+- GRPO/RLVR can stay at 0% indefinitely if the SFT base never produces
+  answer-shaped completions. The verifier has nothing to credit, so the
+  policy gradient is zero. Train recipe 02 longer before chasing RLVR.
+- Diffusion alignment is the less-validated branch. The default recipes
+  run to completion; qualitative output at the laptop scale is still poor.
+- The main tested path is GPT-style tiny models. Mamba, Hymba, xLSTM,
+  ByteLatent, and the diffusion variants are in the registry so the
+  comparison scripts have something to compare against, not because they
+  have been driven end to end through alignment.
+- HF import is Llama-only today. Qwen3 and Gemma3 round-trip through
+  inspection and generation but are rejected by `scripts/import_hf.py`
+  until their weight mappings are validated.
+
+## Install
+
+Requires Python 3.10 or newer.
+
+```bash
+python -m pip install -e .
+```
+
+Optional extras:
+
+```bash
+python -m pip install -e ".[data]"     # dataset-backed scripts
+python -m pip install -e ".[logging]"  # aim logging
+python -m pip install -e ".[dev]"      # pytest and ruff
+```
 
 ## Local training recipes
 
-The main end-to-end path lives in `recipes/local_training/`:
-
-Install the data extra first because the recipes load TinyStories, Alpaca,
-HH-RLHF or UltraFeedback, and GSM8K through Hugging Face Datasets:
+The main path lives in `recipes/local_training/`. Install the data extra
+first because the recipes load TinyStories, Alpaca, HH-RLHF or
+UltraFeedback, and GSM8K through Hugging Face Datasets:
 
 ```bash
 python -m pip install -e ".[data]"
 ```
+
+Autoregressive run order:
 
 ```bash
 bash recipes/local_training/00_train_tokenizer/run.sh
@@ -61,9 +106,7 @@ bash recipes/local_training/04_grpo_tiny_math/run.sh
 bash recipes/local_training/05_eval_all/run.sh
 ```
 
-The diffusion branch uses the same tokenizer and mirrors the training path with
-MDLM pretraining, diffusion SFT, diffusion preference optimization, and
-diffusion GRPO:
+Diffusion run order (uses the same tokenizer):
 
 ```bash
 bash recipes/local_training/06_pretrain_tiny_mdlm/run.sh
@@ -72,8 +115,8 @@ bash recipes/local_training/08_preference_tiny_diffusion/run.sh
 bash recipes/local_training/09_grpo_tiny_diffusion_math/run.sh
 ```
 
-The diffusion path mirrors the AR path stage for stage so the two stay
-comparable, without pretending diffusion models are next-token predictors:
+The diffusion branch is parallel to the AR branch stage for stage, without
+treating diffusion models as next-token predictors:
 
 | Stage | AR path | Diffusion path |
 | --- | --- | --- |
@@ -82,14 +125,13 @@ comparable, without pretending diffusion models are next-token predictors:
 | Preference tuning | DPO/IPO/SimPO/etc. over response log-probs | DPO/VRPO over diffusion loss proxies |
 | RLVR | GRPO/RLOO/etc. with generated completions | GRPO over reverse denoising trajectories |
 
-Each recipe ships a `README.md`, `config.yaml`, `run.sh`, `expected_metrics.md`,
-and `sample_outputs.md`. The defaults are scoped to fit a laptop GPU and finish
-in minutes, not to chase quality. Scale up with environment overrides like
-`PRESET=gpt-25m`, `MAX_STEPS=3000`, or `ALGORITHM=simpo`.
+Every recipe carries a `README.md`, `config.yaml`, `run.sh`,
+`expected_metrics.md`, and `sample_outputs.md`. Scale up with environment
+overrides like `PRESET=gpt-25m`, `MAX_STEPS=3000`, or `ALGORITHM=simpo`.
 
 ## Tiny presets
 
-Presets remove the need to design memory-aware model sizes from scratch:
+Presets are pre-sized model configs that fit common laptop budgets:
 
 | Preset | Family | Default context | Approx params | Use case |
 | --- | --- | ---: | ---: | --- |
@@ -99,8 +141,8 @@ Presets remove the need to design memory-aware model sizes from scratch:
 | `mamba-25m` | Mamba | 512 | ~22M-29M | SSM comparison runs |
 | `mdlm-25m` | MDLM | 512 | ~26M-31M | diffusion LM experiments |
 
-Parameter counts vary with tokenizer vocabulary size. The ranges above cover
-the recipe default 4k vocabulary through a 16k vocabulary.
+Parameter counts vary with tokenizer vocabulary size. The ranges above
+cover the recipe default 4k vocabulary through a 16k vocabulary.
 
 Use presets directly:
 
@@ -128,12 +170,13 @@ directory. On CUDA, this includes `max_memory_allocated_gb` and
 
 ## Hugging Face bridge
 
-There is also an optional bridge for curated sub-1B Hugging Face causal LMs:
-inspect them, generate from them, or import compatible checkpoints into the
-native Minilab format so they go through the same trainers as everything else.
-This is not a general HF loader. Only Llama-compatible weights are wired up
-today (SmolLM2 works; Qwen3 and Gemma3 are accepted by inspection and
-generation but rejected by import until their weight mappings are validated).
+The HF bridge is for curated sub-1B causal LMs: inspect them, generate
+from them, or import compatible checkpoints into the native Minilab
+format so they go through the same trainers as everything else. This is
+not a general HF loader. Only Llama-compatible weights are wired up today
+(SmolLM2 works; Qwen3 and Gemma3 round-trip through inspection and
+generation but are rejected by import until their weight mappings are
+validated).
 
 ```bash
 python -m pip install -e ".[data,hf]"
@@ -146,29 +189,14 @@ bash recipes/hf_to_native/05_grpo_imported/run.sh
 ```
 
 Curated aliases include `smollm2-135m`, `smollm2-360m`, `gemma3-270m`, and
-`qwen3-0.6b`, plus instruct/base variants where available. The full list comes
-from `scripts/hf_inspect.py --list-presets`. Recipes live in
+`qwen3-0.6b`, plus instruct/base variants where available. The full list
+comes from `scripts/hf_inspect.py --list-presets`. Recipes live in
 `recipes/hf_to_native/`.
 
-## Install
+## Running scripts directly
 
-Requires Python 3.10 or newer.
-
-```bash
-python -m pip install -e .
-```
-
-Optional extras:
-
-```bash
-python -m pip install -e ".[data]"     # dataset-backed scripts
-python -m pip install -e ".[logging]"  # aim logging
-python -m pip install -e ".[dev]"      # pytest and ruff
-```
-
-## Quick start
-
-Train a tokenizer, pretrain an autoregressive LM, and sample from it:
+If you would rather skip the recipe wrappers, the underlying scripts take
+the same flags:
 
 ```bash
 python scripts/train_tokenizer.py --save tokenizer.json
@@ -176,28 +204,41 @@ python scripts/pretrain_lm.py --tokenizer tokenizer.json
 python scripts/generate.py --tokenizer tokenizer.json --checkpoint checkpoints/lm/step_5000
 ```
 
-Run alignment on an existing checkpoint:
-
 ```bash
 python scripts/sft.py --tokenizer tokenizer.json --checkpoint checkpoints/lm/step_5000
 python scripts/preference.py --algorithm dpo --tokenizer tokenizer.json --checkpoint checkpoints/sft/step_3000
 python scripts/grpo.py --tokenizer tokenizer.json --checkpoint checkpoints/sft/step_3000
 ```
 
-Train and sample a diffusion LM:
-
 ```bash
 python scripts/pretrain_diffusion.py --tokenizer tokenizer.json --model mdlm
 python scripts/sample_diffusion.py --tokenizer tokenizer.json --checkpoint checkpoints/diffusion/step_5000
 ```
-
-Run diffusion alignment on an existing diffusion checkpoint:
 
 ```bash
 python scripts/sft_diffusion.py --tokenizer tokenizer.json --checkpoint checkpoints/diffusion/step_5000
 python scripts/dpo_diffusion.py --tokenizer tokenizer.json --checkpoint checkpoints/diffusion_sft/step_3000
 python scripts/grpo_diffusion.py --tokenizer tokenizer.json --checkpoint checkpoints/diffusion_sft/step_3000
 ```
+
+## What else is in here
+
+Beyond the main path, the registry includes alternative implementations
+that are present mostly so the comparison scripts have something to
+compare against:
+
+- Other LM families: Mamba/Mamba-2, Hybrid, Hymba, xLSTM, ByteLatent.
+- Diffusion LMs: MDLM, SEDD, D3PM, block diffusion.
+- Preference-optimization variants: IPO, CPO, ORPO, RePO, KTO alongside
+  DPO and SimPO.
+- Online RL variants: RLOO, GSPO, DAPO, PPO alongside GRPO.
+- Tokenizer variants: BPE, WordPiece, Unigram, character, byte.
+
+The comparison scripts (`scripts/compare_attention.py`,
+`scripts/compare_position.py`, `scripts/compare_connection.py`,
+`scripts/compare_diffusion.py`) are the closest thing to first-class entry
+points for these. The full alignment pipeline has only been driven end to
+end on GPT-style models.
 
 ## Package contents
 
@@ -257,3 +298,5 @@ Package areas:
 
 Core dependencies are `torch`, `numpy`, `regex`, `tqdm`, and `pyyaml`. Optional
 extras add `datasets`, `aim`, `flash-attn`, `pytest`, and `ruff`.
+</content>
+</invoke>

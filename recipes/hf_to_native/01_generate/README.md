@@ -8,9 +8,9 @@ importing it.
 bash recipes/hf_to_native/01_generate/run.sh
 ```
 
-Defaults: `MODEL=smollm2-135m-instruct`, prompt `Explain gravity in one
-paragraph.`, `DEVICE=auto`, `MAX_NEW_TOKENS=128`, `TEMPERATURE=0.7`,
-`TOP_P=0.95`, `TOP_K=50`.
+By default it runs `smollm2-135m-instruct` on `DEVICE=auto` with the prompt
+"Explain gravity in one paragraph.", generating up to 128 tokens at
+`temperature=0.7`, `top_p=0.95`, `top_k=50`.
 
 ```bash
 MODEL=qwen3-0.6b DEVICE=cuda PROMPT="Solve 12+37." bash recipes/hf_to_native/01_generate/run.sh

@@ -8,11 +8,11 @@ checkpoint trained from scratch.
 bash recipes/hf_to_native/02_import/run.sh
 ```
 
-Defaults: `MODEL=smollm2-135m`,
-`SAVE_DIR=checkpoints/imported/smollm2-135m`, `MAX_SEQ_LEN=512`,
-`DEVICE=cpu`, `VERIFY=1`. With `VERIFY=1` the script compares HF and
-native logits on a short prompt and prints the max and mean absolute
-difference; values around `1e-5` or smaller mean the mapping is clean.
+Out of the box it pulls `smollm2-135m`, writes to
+`checkpoints/imported/smollm2-135m`, sets the native context length to 512,
+runs on CPU, and verifies logits. The verify step compares HF and native
+logits on a short prompt and prints the max and mean absolute difference;
+values around `1e-5` or smaller mean the mapping is clean.
 
 After import the same SFT / preference / GRPO scripts work on the result:
 
