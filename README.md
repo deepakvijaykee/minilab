@@ -4,9 +4,9 @@ Minilab is a laptop-GPU-friendly training lab for building language models end
 to end: tokenizer training, tiny pretraining, supervised fine-tuning,
 preference optimization, RLVR, evaluation, and diffusion LM experiments.
 
-It is designed for small, faithful, inspectable runs rather than distributed
-frontier-scale training. The goal is to make the full LM training stack runnable
-and debuggable on local hardware.
+The point is small, faithful runs you can actually inspect, not frontier-scale
+training. Everything should fit on a single device and fail loudly when
+something is wrong.
 
 ## What you can train
 
@@ -41,7 +41,7 @@ evaluation:
 6. Improve math behavior with RLVR and verifier rewards.
 7. Compare autoregressive and diffusion LM training paths.
 
-## Local Training Recipes
+## Local training recipes
 
 The main end-to-end path lives in `recipes/local_training/`:
 
@@ -72,7 +72,8 @@ bash recipes/local_training/08_preference_tiny_diffusion/run.sh
 bash recipes/local_training/09_grpo_tiny_diffusion_math/run.sh
 ```
 
-This path is deliberately parallel to the autoregressive track:
+The diffusion path mirrors the AR path stage for stage so the two stay
+comparable, without pretending diffusion models are next-token predictors:
 
 | Stage | AR path | Diffusion path |
 | --- | --- | --- |
@@ -81,10 +82,10 @@ This path is deliberately parallel to the autoregressive track:
 | Preference tuning | DPO/IPO/SimPO/etc. over response log-probs | DPO/VRPO over diffusion loss proxies |
 | RLVR | GRPO/RLOO/etc. with generated completions | GRPO over reverse denoising trajectories |
 
-Each recipe includes a `README.md`, `config.yaml`, `run.sh`,
-`expected_metrics.md`, and `sample_outputs.md`. The defaults are short sanity
-runs; use environment variables such as `PRESET=gpt-25m`, `MAX_STEPS=3000`, or
-`ALGORITHM=simpo` to scale up or switch methods.
+Each recipe ships a `README.md`, `config.yaml`, `run.sh`, `expected_metrics.md`,
+and `sample_outputs.md`. The defaults are scoped to fit a laptop GPU and finish
+in minutes, not to chase quality. Scale up with environment overrides like
+`PRESET=gpt-25m`, `MAX_STEPS=3000`, or `ALGORITHM=simpo`.
 
 ## Tiny presets
 
@@ -127,9 +128,12 @@ directory. On CUDA, this includes `max_memory_allocated_gb` and
 
 ## Hugging Face bridge
 
-Minilab also includes an optional bridge for curated sub-1B Hugging Face causal
-LMs. The bridge is for inspection, generation, and importing compatible small
-HF checkpoints into Minilab's native format, not arbitrary large-model support.
+There is also an optional bridge for curated sub-1B Hugging Face causal LMs:
+inspect them, generate from them, or import compatible checkpoints into the
+native Minilab format so they go through the same trainers as everything else.
+This is not a general HF loader. Only Llama-compatible weights are wired up
+today (SmolLM2 works; Qwen3 and Gemma3 are accepted by inspection and
+generation but rejected by import until their weight mappings are validated).
 
 ```bash
 python -m pip install -e ".[data,hf]"
@@ -139,15 +143,12 @@ bash recipes/hf_to_native/02_import/run.sh
 bash recipes/hf_to_native/03_sft_imported/run.sh
 bash recipes/hf_to_native/04_preference_imported/run.sh
 bash recipes/hf_to_native/05_grpo_imported/run.sh
-bash recipes/hf_to_native/06_summary/run.sh
 ```
 
 Curated aliases include `smollm2-135m`, `smollm2-360m`, `gemma3-270m`, and
-`qwen3-0.6b`, plus instruct/base variants where available. See
-`recipes/hf_to_native/`. Inspection and generation work directly through
-Transformers for any compatible preset; native import currently supports
-Llama-compatible checkpoints such as SmolLM2 and rejects Qwen/Gemma until their
-weight mappings are validated.
+`qwen3-0.6b`, plus instruct/base variants where available. The full list comes
+from `scripts/hf_inspect.py --list-presets`. Recipes live in
+`recipes/hf_to_native/`.
 
 ## Install
 
@@ -245,8 +246,6 @@ Package areas:
   from curated sub-1B Hugging Face causal LMs.
 - `scripts/import_hf.py`: import compatible Hugging Face causal LMs into
   Minilab's native checkpoint/tokenizer format.
-- `scripts/summarize_runs.py`: summarize `run_metrics.json` files across recipe
-  runs.
 - `scripts/evaluate.py` and `scripts/evaluate_text8.py`: evaluate checkpoints.
 - `scripts/estimate_vram.py`: estimate rough memory usage before a run.
 - `scripts/compare_attention.py`, `scripts/compare_position.py`,

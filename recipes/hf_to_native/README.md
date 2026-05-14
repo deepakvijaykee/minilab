@@ -1,7 +1,8 @@
-# Hugging Face to Native Recipes
+# Hugging Face to native recipes
 
-This track is intentionally narrow: curated sub-1B Hugging Face causal LMs for
-inspection, generation, and import into Minilab's native checkpoint format.
+A narrow track for curated sub-1B Hugging Face causal LMs. The point is to
+bring real pretrained baselines through the same trainers used everywhere
+else, not to build a general HF loader.
 
 Install the optional dependencies:
 
@@ -9,11 +10,11 @@ Install the optional dependencies:
 python -m pip install -e ".[data,hf]"
 ```
 
-If `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, or `TRANSFORMERS_CACHE` is not set, the
-HF scripts default to `.cache/huggingface/` under the repo so downloads stay
-inside the workspace.
+If none of `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, or `TRANSFORMERS_CACHE` is set,
+the HF scripts cache into `.cache/huggingface/` under the repo so downloads
+stay inside the workspace.
 
-## Curated Models
+## Curated models
 
 | Alias | Hugging Face repo | Size | Role |
 | --- | --- | ---: | --- |
@@ -61,7 +62,6 @@ Then run native training recipes on the imported checkpoint:
 bash recipes/hf_to_native/03_sft_imported/run.sh
 bash recipes/hf_to_native/04_preference_imported/run.sh
 bash recipes/hf_to_native/05_grpo_imported/run.sh
-bash recipes/hf_to_native/06_summary/run.sh
 ```
 
 List curated presets:
@@ -72,6 +72,9 @@ python scripts/hf_inspect.py --list-presets
 
 ## Scope
 
-These scripts do not replace Minilab's native model/training stack. HF import is
-for bringing real pretrained small-model baselines into the same trainers used
-by local pretraining, SFT, preference optimization, and RLVR.
+These scripts do not replace Minilab's native training stack. Import maps HF
+weights into the native GPT format so they can be trained by the same code as
+local pretraining and alignment runs. Today only Llama-compatible weights
+import cleanly; Qwen3 and Gemma3 round-trip through inspection and generation
+but fail import until their weight mappings are validated (see
+`scripts/import_hf.py::_native_config`).

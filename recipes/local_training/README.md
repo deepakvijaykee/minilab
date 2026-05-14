@@ -1,13 +1,14 @@
-# Local Training Recipes
+# Local training recipes
 
-This track is the end-to-end Minilab path for local, single-device training.
-It starts with tokenizer training, then branches into autoregressive GPT and
-diffusion MDLM training paths with SFT, preference optimization, RLVR, and
-evaluation or sampling.
+The end-to-end path for local, single-device training. Start with the
+tokenizer, then branch into either the autoregressive GPT track or the
+diffusion MDLM track. Both branches go through SFT, preference optimization,
+RLVR, and evaluation.
 
-The defaults favor short, inspectable runs over leaderboard numbers. Increase
-`MAX_STEPS`, `MAX_EXAMPLES`, `PRESET`, and batch settings after the full path
-works on your machine.
+Defaults are sized for a laptop GPU and a short run. They are good for
+checking that the loop works on your machine, not for chasing quality. Bump
+`MAX_STEPS`, `MAX_EXAMPLES`, `PRESET`, and the batch settings once the full
+path runs end to end.
 
 Install the data extra before running the track:
 
@@ -15,7 +16,7 @@ Install the data extra before running the track:
 python -m pip install -e ".[data]"
 ```
 
-## Autoregressive Run Order
+## Autoregressive run order
 
 ```bash
 bash recipes/local_training/00_train_tokenizer/run.sh
@@ -26,7 +27,7 @@ bash recipes/local_training/04_grpo_tiny_math/run.sh
 bash recipes/local_training/05_eval_all/run.sh
 ```
 
-## Diffusion Run Order
+## Diffusion run order
 
 ```bash
 bash recipes/local_training/00_train_tokenizer/run.sh
@@ -36,8 +37,8 @@ bash recipes/local_training/08_preference_tiny_diffusion/run.sh
 bash recipes/local_training/09_grpo_tiny_diffusion_math/run.sh
 ```
 
-The diffusion branch mirrors the AR branch without pretending diffusion models
-are next-token models:
+The diffusion branch mirrors the AR branch stage for stage but stays diffusion
+native; nothing is treated as a next-token model.
 
 | Recipe | What it trains | Default objective |
 | --- | --- | --- |
@@ -46,7 +47,7 @@ are next-token models:
 | `08_preference_tiny_diffusion` | preference-tuned MDLM | diffusion DPO, or VRPO with `ALGORITHM=vrpo` |
 | `09_grpo_tiny_diffusion_math` | verifier-reward MDLM | diffusion GRPO over reverse denoising trajectories |
 
-## Default Artifacts
+## Default artefacts
 
 - `checkpoints/local_training/tokenizer.json`
 - `checkpoints/local_training/lm/step_1000`
@@ -58,7 +59,7 @@ are next-token models:
 - `checkpoints/local_training/diffusion_dpo/step_300`
 - `checkpoints/local_training/diffusion_grpo/step_100`
 
-## Useful Overrides
+## Useful overrides
 
 ```bash
 PRESET=gpt-25m MAX_STEPS=3000 bash recipes/local_training/01_pretrain_tiny_gpt/run.sh
@@ -76,10 +77,10 @@ python scripts/estimate_vram.py --model gpt-25m --method grpo --seq-len 512 --ba
 python scripts/estimate_vram.py --model mdlm-25m --method diffusion_grpo --seq-len 512 --batch-size 1 --num-generations 2
 ```
 
-Each training recipe writes `run_metrics.json` automatically. The file is
-written to the final checkpoint directory and copied to the recipe save
-directory. On CUDA, the metrics use PyTorch allocator stats:
-`max_memory_allocated_gb` and `max_memory_reserved_gb`.
-
-Replace the sanity checks in each `expected_metrics.md` with measured numbers
-from your own hardware when publishing benchmark-style tables.
+Every training recipe writes `run_metrics.json` to the final checkpoint
+directory and copies it into the recipe save directory. On CUDA the file
+includes `max_memory_allocated_gb` and `max_memory_reserved_gb` from
+`torch.cuda` peak memory stats; on CPU those keys are absent. Open
+`run_metrics.json` after a run for actual numbers; the per-recipe
+`expected_metrics.md` files describe what to look for, not measured
+benchmarks.
