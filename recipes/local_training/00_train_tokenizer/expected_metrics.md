@@ -1,17 +1,18 @@
 # Expected signals
 
-The script prints three lines of state:
+The script prints three lines:
 
-1. `Corpus: <N> chars from <N> TinyStories rows`. This is the sanity check
-   that the dataset actually loaded. An empty corpus usually means the HF
-   datasets cache failed.
-2. `Saved <path> (vocab=<N>)`. The tokenizer was written and reports the
-   trained vocabulary size. For BPE this can be slightly smaller than the
-   requested `--vocab-size` if the corpus runs out of merges.
+1. `Corpus: <N> chars from <N> TinyStories rows`. Sanity check that the
+   dataset loaded. An empty corpus usually means the HF datasets cache
+   failed.
+2. `Saved <path> (vocab=<N>)`. The trained vocabulary size. BPE can land
+   slightly below the requested size when the corpus runs out of distinct
+   frequent pairs to merge. A 4k vocab on 5000 TinyStories rows usually
+   saturates; a 16k vocab on the same corpus will not. If you need a
+   large vocab, train on a larger corpus or accept the smaller realized
+   size.
 3. `"Once upon a time there was a little girl named Lily." -> <N> tokens,
-   roundtrip OK`. The sample sentence encodes and decodes back exactly.
-   WordPiece prints the decoded text instead of asserting roundtrip,
-   because WordPiece is lossy.
-
-These are correctness gates; tokenizer quality at this scale is downstream
-of how well later pretraining picks up the cadence.
+   roundtrip OK`. The sample sentence encodes and decodes losslessly.
+   WordPiece prints `decodes as "..."` instead, because its detokenizer
+   is not a strict inverse. That is a property of the WordPiece scheme,
+   not a bug in this implementation.

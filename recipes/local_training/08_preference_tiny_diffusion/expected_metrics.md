@@ -1,18 +1,20 @@
 # Expected signals
 
-- Diffusion DPO and VRPO both print `Trainable: <path> (mdlm, <N> params,
-  schedule=<schedule>)` followed by `Frozen reference: <path>`. The
-  schedule string comes from `forward_process.json`; if it reads
-  `schedule=None` something is wrong with the checkpoint copy.
-- The dataset line is `hh-rlhf: <N> diffusion preference pairs` (or
-  `ultrafeedback: ...`). The count reflects pairs left after filtering for
-  sequences that fit `--seq-len`.
-- VRPO is noticeably slower per step (it averages multiple diffusion
-  estimates per pair). Expect step time roughly proportional to
-  `--vrpo-num-samples`.
-- The end-of-run block prints `--- After Diffusion DPO ---` (or `VRPO`)
-  with three response generations through reverse diffusion.
-
-Quality at this scale is bounded by the diffusion SFT base. The preference
-step shifts the response distribution but cannot manufacture coherence
-that the base does not already have.
+- Diffusion DPO substitutes a one-sample ELBO of the denoising loss for
+  the exact log-likelihood in standard DPO. Each preference pair therefore
+  gives an unbiased but high-variance gradient estimate; per-pair noise
+  can be on the order of the signal, which is why convergence looks
+  rougher than AR DPO at matched step counts.
+- VRPO targets that variance directly: it averages `--vrpo-num-samples`
+  independent ELBO estimates per pair before computing the preference loss.
+  Step time scales roughly linearly with that knob, and the variance of the
+  preference-loss gradient drops as `1/num_samples` (so stderr like
+  `1/sqrt(num_samples)`).
+- The model line reads `(mdlm, <N> params, schedule=<schedule>)` for both
+  algorithms. A `schedule=None` value means `forward_process.json` did not
+  copy through; the trainer cannot reconstruct the forward process and the
+  loss values are wrong from step 1.
+- End-of-run generations come from reverse diffusion with
+  `--sample-new-tokens 80`. Quality is bounded above by the diffusion SFT
+  base. Preference tuning re-weights which response distribution the model
+  denoises toward; it does not improve how well the model denoises.

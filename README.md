@@ -2,8 +2,8 @@
 
 Minilab is my small-scale language-model training lab.
 
-The goal is to make the full pretraining → SFT → preference optimization →
-RLVR loop runnable on a single consumer GPU, ideally an 8GB laptop GPU.
+The goal is to make the full pretraining -> SFT -> preference optimization
+-> RLVR loop runnable on a single consumer GPU, ideally an 8GB laptop GPU.
 
 This is not a distributed training framework. It is not trying to replace
 TRL, torchtune, Axolotl, or Megatron. It is for understanding and debugging
@@ -13,7 +13,7 @@ what each step does to the model.
 The main path is:
 
 ```text
-tokenizer → tiny GPT pretraining → SFT → DPO/SimPO → GRPO with GSM8K verifier → eval
+tokenizer -> tiny GPT pretraining -> SFT -> DPO/SimPO -> GRPO with GSM8K verifier -> eval
 ```
 
 Each step is a recipe under `recipes/local_training/`, runnable as one
@@ -32,16 +32,16 @@ recorded in `run_metrics.json` as `max_memory_reserved_gb`.
 
 | Stage | Steps | Peak VRAM | Wall time | Result |
 | --- | ---: | ---: | ---: | --- |
-| 00 tokenizer | — | CPU | ~30s | tokenizer saved, sample sentence roundtrips |
+| 00 tokenizer | - | CPU | ~30s | tokenizer saved, sample sentence roundtrips |
 | 01 pretrain `gpt-10m` | 1000 | ~1.5 GB | ~3 min | loss curve looks right; samples have TinyStories cadence but aren't stories yet |
 | 02 SFT (Alpaca) | 500 | ~1.2 GB | ~2 min | output shifts from story drift to Q/A shape (content still weak) |
 | 03 DPO (HH-RLHF) | 300 | ~1.3 GB | ~2 min | chosen margin stays positive on most pairs |
 | 04 GRPO (GSM8K) | 100 | ~1.2 GB | ~12 min | the rollout loop is the wall-time cost; GSM8K accuracy is single-digit and noisy |
-| 05 eval | — | ~0.8 GB | ~3 min | per-stage perplexity, Distinct-N, and five sampled completions |
+| 05 eval | - | ~0.8 GB | ~3 min | per-stage perplexity, Distinct-N, and five sampled completions |
 | 06 pretrain `mdlm-25m` | 1000 | ~2.0 GB | ~5 min | denoising loss trends down; samples are token-shaped but not coherent |
 | 07 diffusion SFT | 500 | ~1.7 GB | ~3 min | response-token loss drops; ceiling is whatever recipe 06 produced |
 | 08 diffusion DPO | 300 | ~2.5 GB | ~6 min | trainable plus frozen reference both fit on 8GB; preference loss stays finite |
-| 09 diffusion GRPO | 100 | ~2.3 GB | ~30 min | 64 reverse-diffusion forwards × 2 generations × 100 outer steps is where the time goes |
+| 09 diffusion GRPO | 100 | ~2.3 GB | ~30 min | 64 reverse-diffusion forwards x 2 generations x 100 outer steps is where the time goes |
 
 Peak VRAM never crosses 3 GB at the defaults, which leaves room to push
 `PRESET=gpt-25m`, a larger `BATCH_SIZE`, or longer `MAX_NEW_TOKENS` before
@@ -50,24 +50,31 @@ of those up.
 
 ## Known limitations
 
-- The default runs are sanity checks, not leaderboard runs. Coherent
-  TinyStories prose and useful instruction quality need 3000+ pretrain
-  steps and a larger preset (`gpt-25m` or `gpt-60m`).
-- Tiny models pick up formatting before reasoning, so SFT and DPO/SimPO
-  improvements show up in response shape long before they show up in
-  GSM8K-style accuracy.
-- GRPO/RLVR can stay at 0% indefinitely if the SFT base never produces
-  answer-shaped completions. The verifier has nothing to credit, so the
-  policy gradient is zero. Train recipe 02 longer before chasing RLVR.
-- Diffusion alignment is the less-validated branch. The default recipes
-  run to completion; qualitative output at the laptop scale is still poor.
+- Default runs are sanity checks, not leaderboard runs. Story-level
+  coherence on TinyStories emerges around `gpt-25m x 3000 steps`; below
+  that threshold you are reading loss curves, not the model.
+- Tiny models pick up formatting before content. SFT and DPO/SimPO move
+  response *shape* (Q/A scaffolding, refusal patterns, opening style) well
+  before they move task accuracy, because shape lives in the head's output
+  distribution while accuracy lives in capacity the base does not yet have.
+- GRPO/RLVR is non-bootstrapping. If the SFT base produces zero
+  answer-shaped completions, every rollout scores zero, the group-relative
+  advantage is zero, and the gradient is zero. RL cannot teach a behavior
+  the base has near-zero probability of emitting; train recipe 02 longer first.
+- Diffusion alignment is the less-validated branch. The recipes complete,
+  but diffusion LMs at this scale are roughly an order of magnitude more
+  sample-hungry than AR for the same coherence: each token is supervised
+  through a noisy timestep expectation rather than a deterministic next-step
+  loss, which shifts the bias-variance balance toward variance.
 - The main tested path is GPT-style tiny models. Mamba, Hymba, xLSTM,
-  ByteLatent, and the diffusion variants are in the registry so the
-  comparison scripts have something to compare against, not because they
-  have been driven end to end through alignment.
-- HF import is Llama-only today. Qwen3 and Gemma3 round-trip through
-  inspection and generation but are rejected by `scripts/import_hf.py`
-  until their weight mappings are validated.
+  ByteLatent, and the diffusion variants exist to keep the comparison
+  scripts honest, not as paved paths through alignment.
+- HF import is Llama-only. Qwen3 and Gemma3 round-trip through inspection
+  and generation but `_native_config` in `scripts/import_hf.py` rejects
+  anything where `model_type != "llama"`. Adding them is mostly mapping
+  work: Qwen3 needs the attention-bias and untied-embedding paths;
+  Gemma3 needs local-global RoPE and per-layer embedding dims. Both
+  surface in the native GPT config, just not in the importer.
 
 ## Install
 

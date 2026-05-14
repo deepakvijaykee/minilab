@@ -3,20 +3,27 @@
 Per checkpoint, `evaluate.py` prints:
 
 - `Loaded <path> (<model_name>) on <device> (<N> params)`
-- `<dataset> validation perplexity: <ppl>` (and `text8 validation bits/char:
-  <bpc>` if `--dataset text8`).
+- `<dataset> validation perplexity: <ppl>` (plus
+  `text8 validation bits/char` on text8)
 - `Distinct-1`, `Distinct-2`, `Distinct-3`, `Self-BLEU-4` over 10 sampled
-  generations (the recipe sets `NUM_SAMPLES=10`).
-- Five truncated samples under `--- Samples ---`.
+  generations
+- Five truncated samples under `--- Samples ---`
 
-Reading across labels:
+The interesting read is the cross-stage trajectory:
 
-- Perplexity usually goes down from `base` to `sft` only if the eval set
-  matches the SFT distribution; on TinyStories eval it can rise after SFT
-  because the model has drifted toward Alpaca cadence.
-- Distinct-N usually drops from `base` to `sft` to `preference` (the model
-  becomes more peaked). Self-BLEU-4 moves the opposite way.
+- Perplexity on TinyStories almost always rises after SFT, even though
+  SFT is "training." The eval distribution stays TinyStories while SFT
+  drags the policy toward Alpaca; you trade eval-domain perplexity for
+  response-domain capability. The same shift hits again after preference
+  tuning.
+- Distinct-N drops monotonically `base -> sft -> preference -> grpo` and
+  Self-BLEU-4 rises symmetrically. Each alignment step narrows the output
+  distribution. Preference tuning is the most aggressive narrower because
+  it explicitly suppresses the rejected mode.
+- If Distinct-N falls to zero (one repeated string) you have hit mode
+  collapse, usually from preference tuning at too-large `beta`. RLVR
+  rarely collapses the same way because the verifier reward is hard to
+  game with a single fixed string.
 
-The recipe prints `Skipping <label>: missing <path>` for any checkpoint
-directory that does not exist; that line is the audit trail of which
-stages have completed.
+`Skipping <label>: missing <path>` lines are the audit trail of which
+stages completed.

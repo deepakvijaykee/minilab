@@ -1,17 +1,23 @@
 # Expected signals
 
-- Diffusion loss is a weighted denoising loss, not a per-token cross-entropy,
-  so the absolute values do not match recipe 01. The shape is what matters:
-  loss should drop quickly in the first ~200 steps then settle.
-- The final checkpoint directory must contain `model.pt`, `config.json`,
-  `model_type.txt`, and `forward_process.json`. Missing
-  `forward_process.json` is the failure mode that breaks every downstream
-  diffusion recipe.
-- The `--- Samples ---` block runs unconditional reverse sampling. MDLM
-  supports it. If you switch to a model that requires a clean x_0 context
-  (some block-diffusion variants), the script prints `skipped: model
-  requires clean x_0 context for reverse scoring` instead of samples.
-- `run_metrics.json` is written under `checkpoints/local_training/diffusion/`.
+- MDLM's loss is a time-averaged denoising cross-entropy weighted by the
+  schedule. On a cosine schedule the high-noise (mostly masked)
+  timesteps get up-weighted relative to easy near-clean ones, so the
+  absolute loss is not comparable to recipe 01's AR cross-entropy. What
+  to read is the shape: a fast drop in the first ~200 steps as the model
+  learns the marginal token distribution, then a slower decline as it
+  learns context-conditioned denoising.
+- The checkpoint directory must contain `model.pt`, `config.json`,
+  `model_type.txt`, and `forward_process.json`. The last file records the
+  noise schedule; without it the downstream recipes cannot reconstruct
+  the forward process and refuse to load.
+- `--- Samples ---` runs unconditional reverse sampling from all `[MASK]`.
+  MDLM supports this because the schedule has `alpha[-1]=0`. Block
+  diffusion variants without a terminal mask prior cannot sample
+  unconditionally and print `skipped: model requires clean x_0 context
+  for reverse scoring` instead.
 
-Sample quality at 1000 steps is poor: tokens look text-like but sentences
-do not. As with recipe 01, that is the small-scale ceiling.
+Sample quality at 1000 steps is poor: text-shaped tokens, broken syntax.
+Diffusion LMs at this scale need more compute than AR for matching
+qualitative output because each token is supervised through a noisy
+expectation over timesteps rather than a single direct cross-entropy.

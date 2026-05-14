@@ -29,3 +29,9 @@ ALGORITHM=dapo bash recipes/local_training/04_grpo_tiny_math/run.sh
 DAPO is special: it removes the KL penalty (`--kl-coef 0` is enforced) and
 takes its own `--clip-ratio-low/--clip-ratio-high` instead of a single ratio.
 RLOO uses one inner epoch instead of four.
+
+The group size (`NUM_GENERATIONS`) matters more than `MAX_STEPS` for RLVR
+signal. The advantage is a within-group z-score of the verifier reward;
+it is zero whenever all completions in the group tie. At 2 generations
+most prompts tie, so most gradients are zero. Lifting to 4 or 8
+multiplies the density of non-zero gradients per step.

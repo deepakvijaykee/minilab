@@ -1,14 +1,20 @@
 # Expected signals
 
-- SFT loss drops faster than pretraining loss because most of the work is
-  adapting the response distribution, not learning the language.
-- The end-of-run samples answer three fixed prompts:
-  `Give three tips for staying healthy.`, `What is the capital of France?`,
-  `Explain gravity.`. After a 1000-step base and 500 SFT steps the answers
-  are short and on-topic but often factually wrong. That is the expected
-  ceiling at this scale.
-- `run_metrics.json` is written under `checkpoints/local_training/sft/`.
+- SFT loss drops fast, then plateaus low. The base already knows the
+  language; SFT is re-weighting the head's output distribution toward the
+  response template. Most of the gradient signal is in the first
+  100-200 steps, after which the trainer is mainly fine-tuning rare-token
+  probabilities.
+- The default Alpaca prompts (`Give three tips for staying healthy.`,
+  `What is the capital of France?`, `Explain gravity.`) are deliberately
+  broad-knowledge. A 7M model has nowhere near the capacity to memorize
+  that factual content, so expect on-topic but wrong answers. That is
+  the response template winning over the content head, which is the right
+  ordering of effects at this scale.
+- `run_metrics.json` lands under `checkpoints/local_training/sft/`.
 
-If the answers look like raw TinyStories text (kids, dogs, "once upon a
-time"), the SFT loss masking is probably not active: confirm that the loaded
-checkpoint is actually the pretrained one and not a from-scratch model.
+If the answers come out as raw TinyStories text (kids, dogs, "once upon
+a time"), the prompt loss mask is not active or the loaded checkpoint is
+being trained from scratch. Check that `--checkpoint` resolved to the
+pretrained step and that the trainer is `SFTTrainer`, not the bare
+language-model trainer.
