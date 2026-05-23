@@ -19,5 +19,7 @@ Self-BLEU-4: 0.214
 Skipping grpo: missing checkpoints/local_training/grpo/step_100
 ```
 
-The exact numbers depend on dataset slice and seed; the per-label block
-shape is stable.
+The exact numbers depend on the dataset slice and the random seed, but
+the per-label block shape is stable across runs. Comparing two runs
+across the same labels rather than reading any single block in
+isolation is the way to read this output well.

@@ -1,23 +1,39 @@
 # Expected signals
 
-- MDLM's loss is a time-averaged denoising cross-entropy weighted by the
-  schedule. On a cosine schedule the high-noise (mostly masked)
-  timesteps get up-weighted relative to easy near-clean ones, so the
-  absolute loss is not comparable to recipe 01's AR cross-entropy. What
-  to read is the shape: a fast drop in the first ~200 steps as the model
-  learns the marginal token distribution, then a slower decline as it
-  learns context-conditioned denoising.
-- The checkpoint directory must contain `model.pt`, `config.json`,
-  `model_type.txt`, and `forward_process.json`. The last file records the
-  noise schedule; without it the downstream recipes cannot reconstruct
-  the forward process and refuse to load.
-- `--- Samples ---` runs unconditional reverse sampling from all `[MASK]`.
-  MDLM supports this because the schedule has `alpha[-1]=0`. Block
-  diffusion variants without a terminal mask prior cannot sample
-  unconditionally and print `skipped: model requires clean x_0 context
-  for reverse scoring` instead.
+The MDLM loss is a time-averaged denoising cross-entropy weighted by
+the noise schedule. On a cosine schedule the high-noise timesteps,
+where most tokens are masked, are upweighted relative to the easy
+near-clean timesteps, so the absolute value of the loss is not
+directly comparable with the autoregressive cross-entropy in recipe
+01. What is comparable, and what to read instead, is the shape of the
+curve. The first roughly 200 steps are a fast drop as the model fits
+the marginal token distribution, after which the curve transitions
+into a slower decline as the model learns context-conditioned
+denoising. That slow phase is where the model is actually acquiring
+the dependencies that produce coherent samples.
 
-Sample quality at 1000 steps is poor: text-shaped tokens, broken syntax.
-Diffusion LMs at this scale need more compute than AR for matching
-qualitative output because each token is supervised through a noisy
-expectation over timesteps rather than a single direct cross-entropy.
+The checkpoint directory must contain `model.pt`, `config.json`,
+`model_type.txt`, and `forward_process.json`. The last file records
+the noise schedule, and the downstream diffusion recipes refuse to
+load a checkpoint without it because they need that schedule to
+reconstruct the forward process at training time. Treat it as part of
+the model artifact rather than as metadata that can be regenerated.
+
+The `--- Samples ---` block runs unconditional reverse sampling
+starting from an all-mask sequence. MDLM supports unconditional
+sampling because the schedule terminates at alpha equal to zero, which
+means the all-mask state is on-distribution for the model's reverse
+process. Block diffusion variants that lack a terminal mask prior
+cannot sample unconditionally and print
+`skipped: model requires clean x_0 context for reverse scoring`
+instead, which is correct behavior for those families rather than a
+sampling failure.
+
+Sample quality at a thousand steps is poor: token-shaped output with
+broken syntax. The cause is the same point as above, restated because
+it is the dominant explanation for why diffusion looks weaker than
+autoregressive at this budget. Each token is supervised through a
+noisy timestep expectation rather than against a single direct
+cross-entropy target, so the bias-variance balance of the per-token
+estimator sits in a higher-variance regime than the autoregressive
+equivalent.

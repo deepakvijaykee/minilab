@@ -18,6 +18,8 @@ GSM8K: train=500 test=50
 GSM8K test subset (50 of full split) accuracy: 3/50 = 6.0%
 ```
 
-DAPO omits the `Frozen reference` line. With `EVAL_EXAMPLES=0` the summary
-becomes `GSM8K test accuracy: <correct>/<total> = <pct>%` over the full
-test split.
+DAPO does not print the `Frozen reference` line because it has no
+reference model to load. Setting `EVAL_EXAMPLES=0` changes the summary
+line to `GSM8K test accuracy: <correct>/<total> = <pct>%` and runs the
+full GSM8K test split rather than a fixed subset, which produces a
+tighter estimate at the cost of a longer eval pass.

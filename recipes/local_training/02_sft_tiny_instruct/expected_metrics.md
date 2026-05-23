@@ -1,20 +1,30 @@
 # Expected signals
 
-- SFT loss drops fast, then plateaus low. The base already knows the
-  language; SFT is re-weighting the head's output distribution toward the
-  response template. Most of the gradient signal is in the first
-  100-200 steps, after which the trainer is mainly fine-tuning rare-token
-  probabilities.
-- The default Alpaca prompts (`Give three tips for staying healthy.`,
-  `What is the capital of France?`, `Explain gravity.`) are deliberately
-  broad-knowledge. A 7M model has nowhere near the capacity to memorize
-  that factual content, so expect on-topic but wrong answers. That is
-  the response template winning over the content head, which is the right
-  ordering of effects at this scale.
-- `run_metrics.json` lands under `checkpoints/local_training/sft/`.
+SFT loss drops quickly and then plateaus low. The base already speaks
+the language, so what the trainer is actually doing is reweighting the
+head's output distribution toward the response template. Most of the
+useful gradient signal arrives in the first 100 to 200 steps, after
+which the optimizer is mainly polishing rare-token probabilities and
+the loss curve flattens.
 
-If the answers come out as raw TinyStories text (kids, dogs, "once upon
-a time"), the prompt loss mask is not active or the loaded checkpoint is
-being trained from scratch. Check that `--checkpoint` resolved to the
-pretrained step and that the trainer is `SFTTrainer`, not the bare
-language-model trainer.
+The default Alpaca prompts (`Give three tips for staying healthy.`,
+`What is the capital of France?`, `Explain gravity.`) are deliberately
+broad-knowledge prompts. A seven million parameter model has nowhere
+near the capacity to memorize that factual content, so the natural
+outcome is on-topic but factually wrong answers. That is the response
+template winning over the content head, and at this scale it is the
+correct ordering of effects: format converges first because format
+lives in a low-dimensional subspace of the head, while content would
+require representations the base does not have.
+
+The `run_metrics.json` file is written under
+`checkpoints/local_training/sft/`, alongside the model artifacts. That
+file is the place to look for actual measured memory and timing.
+
+One failure mode is concrete enough to name. If the answers come out
+as raw TinyStories text, with children, dogs, and "once upon a time"
+appearing in response to Alpaca prompts, then either the prompt loss
+mask is not active or the loaded checkpoint is being trained from
+scratch rather than fine-tuned. The two things to verify are that
+`--checkpoint` resolved to the pretrained step and that the trainer
+in use is `SFTTrainer` rather than the bare language-model trainer.

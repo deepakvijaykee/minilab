@@ -14,7 +14,10 @@ MDLM: 27,xxx,xxx params
   ...
 ```
 
-Param count varies with tokenizer vocabulary (the diffusion model embeds
-`vocab_size + 1` to reserve the [MASK] token). For models that cannot do
-unconditional reverse sampling, the `--- Samples ---` block prints
-`skipped: model requires clean x_0 context for reverse scoring` instead.
+The parameter count moves with the tokenizer vocabulary because the
+diffusion model embeds `vocab_size + 1` entries, with the extra slot
+reserved for the `[MASK]` token. For model families that cannot
+perform unconditional reverse sampling, the `--- Samples ---` block
+prints `skipped: model requires clean x_0 context for reverse scoring`
+in place of generated text, which signals correctly that the sampler
+needs a clean prefix rather than that pretraining went wrong.

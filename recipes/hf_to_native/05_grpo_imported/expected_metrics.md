@@ -1,20 +1,31 @@
 # Expected signals
 
-- `Trainable:` and `Frozen reference:` print at startup; DAPO drops the
-  reference line because it has no reference model.
-- The eval block matches recipe 04 in `local_training/`: up to five
-  `Q/A/(predicted, expected, OK|WRONG)` lines, then
-  `GSM8K test subset (20 of full split) accuracy: <correct>/<total> = <pct>%`.
-- `run_metrics.json` is written under
-  `checkpoints/imported/<model>-grpo/step_<MAX_STEPS>/`.
-- 25 outer steps with 2 generations per prompt is below the noise floor
-  for GRPO accuracy. The signal-to-noise of group-relative advantages
-  scales with `num_generations`, and `2` is the minimum where any group
-  signal exists at all. This recipe is for confirming the loop runs on
-  imported weights, not for claiming an RLVR result.
+The `Trainable:` and `Frozen reference:` lines print at startup. DAPO
+omits the reference line because it has no reference model by design,
+which is the visible signature of having dropped the reference KL in
+favor of asymmetric ratio clipping.
 
-If completions are empty across all rollouts, the policy is emitting EOS
-immediately. Either the SimPO checkpoint collapsed the response
-distribution, or `max_new_tokens` is too small for the prompt template
-the model was instruction-tuned on. Bump `MAX_NEW_TOKENS` and confirm
-recipe 04 actually shifted the policy.
+The eval block mirrors recipe 04 in `local_training/`. It prints up
+to five `Q/A/(predicted, expected, OK|WRONG)` lines followed by a
+summary line of the form
+`GSM8K test subset (20 of full split) accuracy: <correct>/<total> = <pct>%`.
+The `run_metrics.json` file is written under
+`checkpoints/imported/<model>-grpo/step_<MAX_STEPS>/`, alongside the
+model artifacts.
+
+Twenty-five outer steps with two generations per prompt sits below
+the noise floor for any meaningful GRPO accuracy estimate. The
+signal-to-noise of group-relative advantages scales with
+`num_generations`, and two is the minimum group size at which any
+within-group signal exists at all. The recipe is structured to
+confirm that the RLVR loop runs cleanly on imported weights, not to
+make a claim about RLVR outcomes on the imported baseline.
+
+Empty completions across all rollouts point at the policy emitting
+EOS immediately. Two explanations are usually in play: either the
+SimPO checkpoint collapsed the response distribution onto an empty
+generation, or `max_new_tokens` is too small for the prompt template
+the model was instruction-tuned against. The fix is to raise
+`MAX_NEW_TOKENS` and confirm that recipe 04 actually shifted the
+policy, rather than treating the empty rollouts as an RL failure
+inside this recipe.

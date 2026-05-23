@@ -1,8 +1,13 @@
 # Hugging Face to native recipes
 
-A narrow track for curated sub-1B Hugging Face causal LMs. The point is to
-bring real pretrained baselines through the same trainers used everywhere
-else, not to build a general HF loader.
+This track is intentionally narrow. It brings curated sub-1B Hugging
+Face causal language models through the same Minilab trainers that the
+local-training track uses, so that the alignment behavior of a real
+pretrained baseline can be observed under the same code path as the
+tiny from-scratch experiments. The track is not a general Hugging Face
+loader, and it does not aspire to be one. The interesting object is
+the comparison between local pretrains and curated baselines under
+identical alignment code.
 
 Install the optional dependencies:
 
@@ -10,9 +15,11 @@ Install the optional dependencies:
 python -m pip install -e ".[data,hf]"
 ```
 
-If none of `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, or `TRANSFORMERS_CACHE` is set,
-the HF scripts cache into `.cache/huggingface/` under the repo so downloads
-stay inside the workspace.
+If none of `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, or `TRANSFORMERS_CACHE`
+is set, the HF scripts cache into `.cache/huggingface/` under the repo
+so downloads stay inside the workspace. That default exists mostly so
+the experiments are reproducible without polluting a shared system
+cache.
 
 ## Curated models
 
@@ -50,7 +57,7 @@ python scripts/hf_generate.py \
   --device cuda
 ```
 
-Import a compatible HF model to native Minilab format:
+Import a compatible HF model to the native Minilab format:
 
 ```bash
 bash recipes/hf_to_native/02_import/run.sh
@@ -72,9 +79,14 @@ python scripts/hf_inspect.py --list-presets
 
 ## Scope
 
-These scripts do not replace Minilab's native training stack. Import maps HF
-weights into the native GPT format so they can be trained by the same code as
-local pretraining and alignment runs. Today only Llama-compatible weights
-import cleanly; Qwen3 and Gemma3 round-trip through inspection and generation
-but fail import until their weight mappings are validated (see
-`scripts/import_hf.py::_native_config`).
+The import step maps Hugging Face weights into Minilab's native GPT
+format so that the resulting checkpoint loads through the same code
+path as a from-scratch checkpoint. After import, every native trainer,
+sampler, and evaluator works without modification. The constraint
+worth being explicit about is that only Llama-compatible weights
+import cleanly today: SmolLM2 works end to end, Qwen3 and Gemma3
+round-trip through inspection and generation but fail the import
+model-type guard until their weight mappings have been validated
+against the native GPT config. The guard lives in
+`scripts/import_hf.py::_native_config` and is the right place to look
+when extending the track to a new model family.

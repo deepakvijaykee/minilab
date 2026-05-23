@@ -16,5 +16,7 @@ Eval perplexity: 38.4
   she was very happy ...
 ```
 
-Param counts depend on tokenizer vocabulary; the value above is for the
-default 4096-vocab BPE tokenizer.
+The reported parameter count is for the default 4096-token BPE
+tokenizer. With a larger vocabulary the embedding and output projection
+grow proportionally and the count moves with them, which is why a
+16k-vocabulary `gpt-10m` lands closer to thirteen million.

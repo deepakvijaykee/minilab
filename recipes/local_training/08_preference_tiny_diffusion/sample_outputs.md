@@ -16,5 +16,7 @@ hh-rlhf: 1000 diffusion preference pairs
   A: ...
 ```
 
-For `ALGORITHM=vrpo` the header reads `--- After Diffusion VRPO ---` and
-the save directory becomes `diffusion_vrpo`.
+With `ALGORITHM=vrpo` the header reads `--- After Diffusion VRPO ---`
+and the save directory becomes `diffusion_vrpo`, which keeps the
+artifacts of the two algorithms cleanly separated when both are run
+against the same SFT checkpoint.

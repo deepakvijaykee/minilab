@@ -1,19 +1,32 @@
 # Expected signals
 
-- The estimator prints rough VRAM before training; if your GPU has less
-  headroom than the reported peak, drop `BATCH_SIZE` or `SEQ_LEN`
-  before the run.
-- Initial loss on a 4k-vocab model with uniform predictions is
-  `log(4096) ~= 8.3`. Default 1000-step runs usually land in the 5-6 range:
-  the easy entropy is gone, the model is climbing the long tail of
-  bigram structure. If you are still above 6 at the end, the most likely
-  cause is a vocab mismatch with the loaded `tokenizer.json`.
-- Sample quality at 1000 steps looks like fluent tokens without coherent
-  narrative. The model has the unigram and short-range bigram distribution
-  but not the story templates. Coherence is roughly a `params x steps`
-  threshold and appears on TinyStories around `gpt-25m x 3000`.
-- The trainer logs every 100 steps, evaluates every 500. TinyStories
-  has a held-out split so `Eval perplexity` prints at the end; OpenWebText
-  is the only dataset that skips eval (streaming, no fixed split).
-- `run_metrics.json` is written to the final `step_<N>` directory and
-  also to the recipe save root.
+The estimator prints a rough VRAM figure before training begins. When
+the GPU has less headroom than the reported peak, dropping
+`BATCH_SIZE` or `SEQ_LEN` before the run is far better than pushing
+through and triggering an out-of-memory during the first forward
+pass.
+
+Initial loss on a 4k-vocab model with uniform predictions is
+`log(4096)`, which is roughly 8.3 nats. The default thousand-step run
+usually lands in the 5 to 6 range. The interpretation is that the easy
+entropy has gone and the model is climbing the long tail of bigram and
+short-range context structure. If the loss is still above 6 at the end
+of the run, the most likely cause is a vocabulary mismatch with the
+loaded `tokenizer.json`, which leaves the model unable to attribute
+mass to the actual training tokens.
+
+Sample quality at a thousand steps looks like fluent tokens without
+coherent narrative. The model has captured the unigram and short-range
+bigram distribution but not the longer-range story templates. Story
+coherence on TinyStories is roughly a function of parameters times
+steps, and it appears around `gpt-25m` trained for three thousand steps.
+Below that threshold the samples will read as text-shaped but
+narratively flat.
+
+The trainer logs every 100 steps and evaluates every 500. TinyStories
+ships with a held-out split, so `Eval perplexity` prints at the end of
+the run. OpenWebText is the one dataset that skips evaluation, because
+it is streamed and has no fixed split to evaluate against. The
+`run_metrics.json` file is written to the final `step_<N>` directory
+and is also copied to the recipe save root, which is the place to look
+for actual measured memory and timing numbers.
