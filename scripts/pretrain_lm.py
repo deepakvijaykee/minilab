@@ -59,7 +59,10 @@ _MODEL_BUILD_FLAGS = (
     "yarn_beta_slow", "local_attention_window", "qwen3_next_full_attention_interval",
     "attention_k_eq_v", "per_layer_embedding_dim", "final_logit_softcap",
     "connection", "ffn", "num_experts", "top_k_experts", "post_norm",
-    "mtp_depth", "mtp_loss_weight",
+    "mtp_depth", "mtp_loss_weight", "mtp_mode",
+    "layerskip_loss_weight", "layerskip_dropout", "layerskip_min_layer",
+    "future_summary_window", "future_summary_loss_weight",
+    "jacobi_loss_weight", "jacobi_iterations",
 )
 _MAMBA_BUILD_FLAGS = ("dim", "num_layers")
 _XLSTM_BUILD_FLAGS = ("dim", "num_layers", "num_heads")
@@ -78,7 +81,16 @@ _GPT_ONLY_BUILD_FLAGS = (
     "connection",
     "mtp_depth",
     "mtp_loss_weight",
+    "mtp_mode",
+    "layerskip_loss_weight",
+    "layerskip_dropout",
+    "layerskip_min_layer",
+    "future_summary_window",
+    "future_summary_loss_weight",
+    "jacobi_loss_weight",
+    "jacobi_iterations",
 )
+_TOKEN_SUPERPOSITION_FLAGS = ("token_superposition_size", "token_superposition_steps")
 _QK_CLIP_FLAGS = ("qk_clip_threshold", "qk_clip_balance")
 _QK_CLIP_MODEL_CHOICES = {"gpt", "hybrid", "hymba", "byte_latent"}
 _LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
@@ -119,6 +131,14 @@ p.add_argument("--top-k-experts", type=int, default=None)
 p.add_argument("--post-norm", action="store_true", default=None)
 p.add_argument("--mtp-depth", type=int, default=None)
 p.add_argument("--mtp-loss-weight", type=float, default=None)
+p.add_argument("--mtp-mode", choices=["sequential", "parallel"], default=None)
+p.add_argument("--layerskip-loss-weight", type=float, default=None)
+p.add_argument("--layerskip-dropout", type=float, default=None)
+p.add_argument("--layerskip-min-layer", type=int, default=None)
+p.add_argument("--future-summary-window", type=int, default=None)
+p.add_argument("--future-summary-loss-weight", type=float, default=None)
+p.add_argument("--jacobi-loss-weight", type=float, default=None)
+p.add_argument("--jacobi-iterations", type=int, default=None)
 p.add_argument("--max-steps", type=int, default=5000)
 p.add_argument("--warmup-steps", type=int, default=100)
 p.add_argument("--save-every", type=int, default=0, help="periodic save interval (0 = save once at end)")
@@ -129,6 +149,8 @@ p.add_argument("--optimizer", choices=["adamw", "lion", "muon"], default="adamw"
 p.add_argument("--lr-schedule", choices=["cosine", "linear", "constant", "wsd"], default="cosine")
 p.add_argument("--qk-clip-threshold", type=float, default=None)
 p.add_argument("--qk-clip-balance", type=float, default=None)
+p.add_argument("--token-superposition-size", type=int, default=None)
+p.add_argument("--token-superposition-steps", type=int, default=None)
 p.add_argument("--max-examples", type=int, default=None)
 p.add_argument("--grad-checkpoint", action="store_true")
 p.add_argument("--resume-from", default="")
@@ -152,6 +174,8 @@ elif model_name == "xlstm":
     reject_supplied(args, _XLSTM_ONLY_REJECTED_FLAGS, "does not apply to --model xlstm")
 elif model_name == "byte_latent":
     reject_supplied(args, _BYTE_LATENT_REJECTED_FLAGS, "does not apply to --model byte_latent")
+if not args.resume_from and model_name != "gpt":
+    reject_supplied(args, _TOKEN_SUPERPOSITION_FLAGS, "only applies to --model gpt")
 if not args.resume_from and model_name not in _QK_CLIP_MODEL_CHOICES:
     reject_supplied(args, _QK_CLIP_FLAGS, "only applies to QK-Clip-capable attention models")
 if args.qk_clip_threshold is not None:
@@ -194,8 +218,18 @@ top_k_experts = resolve_default(args.top_k_experts, DEFAULT_TOP_K_EXPERTS)
 post_norm = resolve_default(args.post_norm, False)
 mtp_depth = resolve_default(args.mtp_depth, 0)
 mtp_loss_weight = resolve_default(args.mtp_loss_weight, 0.0)
+mtp_mode = resolve_default(args.mtp_mode, "sequential")
+layerskip_loss_weight = resolve_default(args.layerskip_loss_weight, 0.0)
+layerskip_dropout = resolve_default(args.layerskip_dropout, 0.0)
+layerskip_min_layer = resolve_default(args.layerskip_min_layer, 1)
+future_summary_window = resolve_default(args.future_summary_window, 0)
+future_summary_loss_weight = resolve_default(args.future_summary_loss_weight, 0.0)
+jacobi_loss_weight = resolve_default(args.jacobi_loss_weight, 0.0)
+jacobi_iterations = resolve_default(args.jacobi_iterations, 0)
 qk_clip_threshold = resolve_default(args.qk_clip_threshold, 0.0)
 qk_clip_balance = resolve_default(args.qk_clip_balance, 0.5)
+token_superposition_size = resolve_default(args.token_superposition_size, 1)
+token_superposition_steps = resolve_default(args.token_superposition_steps, 0)
 
 if args.num_kv_heads is not None:
     require(attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
@@ -245,6 +279,34 @@ if args.mtp_depth is not None:
 if args.mtp_loss_weight is not None:
     require(mtp_loss_weight > 0, "--mtp-loss-weight must be > 0 when supplied")
     require(mtp_depth > 0, "--mtp-loss-weight only applies when --mtp-depth > 0")
+if args.mtp_mode is not None:
+    require(mtp_depth > 0, "--mtp-mode only applies when --mtp-depth > 0")
+if args.layerskip_loss_weight is not None:
+    require(layerskip_loss_weight > 0, "--layerskip-loss-weight must be > 0 when supplied")
+if args.layerskip_dropout is not None:
+    require(layerskip_dropout > 0, "--layerskip-dropout must be > 0 when supplied")
+    require(layerskip_loss_weight > 0, "--layerskip-dropout requires --layerskip-loss-weight > 0")
+if args.layerskip_min_layer is not None:
+    require(layerskip_min_layer > 0, "--layerskip-min-layer must be > 0")
+    require(layerskip_loss_weight > 0, "--layerskip-min-layer requires --layerskip-loss-weight > 0")
+if args.future_summary_window is not None:
+    require(future_summary_window > 0, "--future-summary-window must be > 0 when supplied")
+    require(future_summary_loss_weight > 0, "--future-summary-window requires --future-summary-loss-weight > 0")
+if args.future_summary_loss_weight is not None:
+    require(future_summary_loss_weight > 0, "--future-summary-loss-weight must be > 0 when supplied")
+    require(future_summary_window > 0, "--future-summary-loss-weight requires --future-summary-window > 0")
+if args.jacobi_loss_weight is not None:
+    require(jacobi_loss_weight > 0, "--jacobi-loss-weight must be > 0 when supplied")
+    require(jacobi_iterations > 0, "--jacobi-loss-weight requires --jacobi-iterations > 0")
+if args.jacobi_iterations is not None:
+    require(jacobi_iterations > 0, "--jacobi-iterations must be > 0 when supplied")
+    require(jacobi_loss_weight > 0, "--jacobi-iterations requires --jacobi-loss-weight > 0")
+if args.token_superposition_size is not None:
+    require(token_superposition_size > 1, "--token-superposition-size must be > 1 when supplied")
+    require(token_superposition_steps > 0, "--token-superposition-size requires --token-superposition-steps > 0")
+if args.token_superposition_steps is not None:
+    require(token_superposition_steps > 0, "--token-superposition-steps must be > 0 when supplied")
+    require(token_superposition_size > 1, "--token-superposition-steps requires --token-superposition-size > 1")
 
 tok = load_tokenizer(args.tokenizer)
 max_examples = resolve_pretrain_max_examples(args.dataset, args.max_examples, 50000)
@@ -293,6 +355,14 @@ else:
         final_logit_softcap=final_logit_softcap,
         mtp_depth=mtp_depth,
         mtp_loss_weight=mtp_loss_weight,
+        mtp_mode=mtp_mode,
+        layerskip_loss_weight=layerskip_loss_weight,
+        layerskip_dropout=layerskip_dropout,
+        layerskip_min_layer=layerskip_min_layer,
+        future_summary_window=future_summary_window,
+        future_summary_loss_weight=future_summary_loss_weight,
+        jacobi_loss_weight=jacobi_loss_weight,
+        jacobi_iterations=jacobi_iterations,
     )
     model = build_lm_model(model_name, **config_kwargs)
 if args.qk_clip_threshold is not None:
@@ -308,6 +378,8 @@ tc = TrainConfig(
     log_every=100, eval_every=500, save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=args.save_dir,
     resume_from=args.resume_from, seed=args.seed,
+    token_superposition_size=token_superposition_size,
+    token_superposition_steps=token_superposition_steps,
 )
 sig = run_signature(tok, {"name": args.dataset, "split": "train", "max_examples": max_examples}, seq_len)
 trainer = LMTrainer(model, train_ds, tc, signature=sig, tokenizer_sig=tokenizer_signature(tok), eval_dataset=eval_ds)

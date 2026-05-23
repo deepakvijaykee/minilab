@@ -53,7 +53,7 @@ def validate_fixed_rope_transformer_config(config, owner):
     require(config.max_seq_len > 0, "max_seq_len must be > 0")
     require(0.0 <= config.dropout < 1.0, "dropout must be in [0, 1)")
     require(config.ffn_mult > 0, "ffn_mult must be > 0")
-    require(config.attention not in {"cosformer", "lightning", "gated_deltanet", "gemma3", "gemma4", "qwen3_next"}, (
+    require(config.attention not in {"cosformer", "lightning", "gated_deltanet", "gated_deltanet2", "gemma3", "gemma4", "qwen3_next"}, (
         f"{owner} uses a fixed RoPE transformer; choose a RoPE-compatible attention variant"
     ))
     if attention_uses_gqa(config.attention):
@@ -105,7 +105,7 @@ def _validate_simple_transformer_branch(config, owner):
         )
     if config.position == "sinusoidal":
         require(config.dim % 2 == 0, "sinusoidal position requires even dim")
-    if config.attention in {"cosformer", "lightning", "gated_deltanet"}:
+    if config.attention in {"cosformer", "lightning", "gated_deltanet", "gated_deltanet2"}:
         require(config.position == "none", f"{config.attention} owns its positional rule; set position='none'")
     if config.attention == "qwen3_next":
         require(config.position == "yarn_rope", f"Qwen3-Next-style {owner} requires position='yarn_rope'")
@@ -251,7 +251,7 @@ def apply_simple_position(pos_enc, x, seq_len, owner):
 
 
 def attention_freqs_for_attention(attention_name, freqs_cis):
-    if attention_name == "gated_deltanet":
+    if attention_name in {"gated_deltanet", "gated_deltanet2"}:
         return None
     return freqs_cis
 

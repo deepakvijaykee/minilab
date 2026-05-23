@@ -31,6 +31,7 @@ VARIANTS = [
     ("BlockSparse", {"attention": "block_sparse"}),
     ("cosFormer", {"attention": "cosformer", "position": "none"}),
     ("Lightning", {"attention": "lightning", "position": "none"}),
+    ("Gated DeltaNet-2", {"attention": "gated_deltanet2", "position": "none"}),
     ("MLA", {"attention": "mla"}),
     ("CSA", {"attention": "csa"}),
     ("HCA", {"attention": "hca"}),

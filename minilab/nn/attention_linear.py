@@ -206,3 +206,66 @@ class GatedDeltaNetAttention(nn.Module):
         out = F.dropout(out, p=self.dropout, training=self.training)
         return self.out(out.transpose(1, 2).reshape(B, T, C))
 
+
+@register_attention("gated_deltanet2")
+class GatedDeltaNet2Attention(nn.Module):
+    """Gated DeltaNet-2 mixer with channel-wise erase, write, and decay gates."""
+
+    def __init__(self, dim, num_heads, dropout=0.0, conv_kernel_size=4):
+        super().__init__()
+        require(dim > 0, "dim must be > 0")
+        require(num_heads > 0, "num_heads must be > 0")
+        require(dim % num_heads == 0, "dim must be divisible by num_heads")
+        require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
+        require(conv_kernel_size > 0, "conv_kernel_size must be > 0")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = dropout
+        self.conv_kernel_size = conv_kernel_size
+        self.in_proj_qkvz = nn.Linear(dim, 4 * dim, bias=False)
+        self.in_proj_bwa = nn.Linear(dim, 3 * dim, bias=False)
+        self.conv1d = nn.Conv1d(3 * dim, 3 * dim, kernel_size=conv_kernel_size, groups=3 * dim, padding=conv_kernel_size - 1, bias=False)
+        self.dt_bias = nn.Parameter(torch.ones(num_heads, self.head_dim))
+        self.A_log = nn.Parameter(torch.empty(num_heads, self.head_dim).uniform_(1e-3, 16.0).log_())
+        self.norm = RMSNorm(self.head_dim)
+        self.out = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
+        require(freqs_cis is None, "Gated DeltaNet-2 owns recurrent position dynamics; pass no RoPE")
+        require(attn_bias is None, "Gated DeltaNet-2 does not consume additive attention bias")
+        require(is_causal, "Gated DeltaNet-2 reference path implements causal recurrence")
+        B, T, C = x.shape
+        q, k, v, z = self.in_proj_qkvz(x).chunk(4, dim=-1)
+        b, w, a = self.in_proj_bwa(x).chunk(3, dim=-1)
+        mixed = torch.cat([q, k, v], dim=-1).transpose(1, 2)
+        mixed = F.silu(self.conv1d(mixed)[:, :, :T]).transpose(1, 2)
+        q, k, v = mixed.split(C, dim=-1)
+        q = _l2norm(q.reshape(B, T, self.num_heads, self.head_dim)).transpose(1, 2)
+        k = _l2norm(k.reshape(B, T, self.num_heads, self.head_dim)).transpose(1, 2)
+        v = v.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        z = z.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        b = torch.sigmoid(b.reshape(B, T, self.num_heads, self.head_dim)).transpose(1, 2)
+        w = torch.sigmoid(w.reshape(B, T, self.num_heads, self.head_dim)).transpose(1, 2)
+        a = a.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        decay = torch.exp(
+            -self.A_log.float().exp().view(1, self.num_heads, 1, self.head_dim)
+            * F.softplus(a.float() + self.dt_bias.float().view(1, self.num_heads, 1, self.head_dim))
+        )
+        q = q / math.sqrt(self.head_dim)
+        state = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=x.device, dtype=torch.float32)
+        outs = []
+        for t in range(T):
+            q_t = q[:, :, t].float()
+            k_t = k[:, :, t].float()
+            v_t = v[:, :, t].float()
+            b_t = b[:, :, t].float()
+            w_t = w[:, :, t].float()
+            state = state * decay[:, :, t].unsqueeze(-1)
+            erase = (state * (b_t * k_t).unsqueeze(-1)).sum(dim=-2)
+            state = state - k_t.unsqueeze(-1) * erase.unsqueeze(-2)
+            state = state + k_t.unsqueeze(-1) * (w_t * v_t).unsqueeze(-2)
+            outs.append((state * q_t.unsqueeze(-1)).sum(dim=-2))
+        out = torch.stack(outs, dim=2).to(x.dtype)
+        out = self.norm(out) * F.silu(z)
+        out = F.dropout(out, p=self.dropout, training=self.training)
+        return self.out(out.transpose(1, 2).reshape(B, T, C))

@@ -21,6 +21,7 @@ from minilab.nn.attention_sparse import (
 )
 from minilab.nn.attention_linear import (
     CosFormerAttention,
+    GatedDeltaNet2Attention,
     GatedDeltaNetAttention,
     LightningAttention2,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "BlockSparseAttention",
     "CompressedSparseAttention",
     "CosFormerAttention",
+    "GatedDeltaNet2Attention",
     "GatedDeltaNetAttention",
     "GatedGroupedQueryQKNormAttention",
     "GatedGroupedQueryQKNormPartialRoPEAttention",

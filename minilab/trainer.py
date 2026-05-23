@@ -50,6 +50,8 @@ class TrainConfig(BaseConfig):
     save_dir: str = "checkpoints"
     eval_steps: int = 50
     resume_from: str = ""
+    token_superposition_size: int = 1
+    token_superposition_steps: int = 0
 
     def __post_init__(self):
         require(self.max_steps > 0, "max_steps must be > 0")
@@ -69,6 +71,11 @@ class TrainConfig(BaseConfig):
         require(self.eval_every >= 0, "eval_every must be >= 0")
         require(self.save_every >= 0, "save_every must be >= 0")
         require(self.eval_steps > 0, "eval_steps must be > 0")
+        require(self.token_superposition_size > 0, "token_superposition_size must be > 0")
+        require(self.token_superposition_steps >= 0, "token_superposition_steps must be >= 0")
+        require(self.token_superposition_size == 1 or self.token_superposition_steps > 0, (
+            "token_superposition_size > 1 requires token_superposition_steps > 0"
+        ))
 
 
 def set_seed(seed):
@@ -126,6 +133,7 @@ _RESUME_CRITICAL_CONFIG_FIELDS = (
     "batch_size", "lr", "weight_decay", "warmup_steps",
     "max_grad_norm", "grad_accum_steps", "dtype", "optimizer", "lr_schedule", "seed",
     "muon_lr", "qk_clip_threshold", "qk_clip_balance",
+    "token_superposition_size", "token_superposition_steps",
 )
 
 def tokenizer_signature(tokenizer):
@@ -672,6 +680,16 @@ class Trainer:
 @register_trainer("lm")
 class LMTrainer(Trainer):
     def compute_loss(self, batch):
+        if (
+            self.model.training
+            and self.config.token_superposition_size > 1
+            and self.step <= self.config.token_superposition_steps
+        ):
+            return unwrap_model(self.model).token_superposition_loss(
+                batch["input_ids"],
+                batch["labels"],
+                self.config.token_superposition_size,
+            )
         return supervised_lm_batch_loss(self.model, batch)
 
 

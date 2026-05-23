@@ -27,6 +27,7 @@ _UNSUPPORTED_DIFFUSION_ATTENTIONS = {
     "cosformer",
     "lightning",
     "gated_deltanet",
+    "gated_deltanet2",
     "qwen3_next",
     "gemma3",
     "gemma4",

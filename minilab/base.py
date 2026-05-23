@@ -107,6 +107,9 @@ class BaseModel(nn.Module):
     def supports_kv_cache(self):
         return False
 
+    def token_superposition_loss(self, idx, targets, bag_size):
+        raise ValueError(f"{type(self).__name__} does not support token-superposition training")
+
     def supports_unconditional_diffusion_sampling(self):
         return True
 

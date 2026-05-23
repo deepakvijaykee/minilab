@@ -44,6 +44,7 @@ _ROPE_POSITIONS = {"rope", "gemma3_rope", "gemma4_rope", "yarn_rope", "qwen3_nex
 _BIAS_POSITIONS = {"alibi", "t5_relative", "kerple_log", "kerple_power"}
 _LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
 _PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
+_MTP_MODES = {"sequential", "parallel"}
 _CACHE_ATTENTIONS = {
     "mha",
     "gqa",
@@ -90,6 +91,14 @@ class GPTConfig(BaseConfig):
     final_logit_softcap: float = 0.0
     mtp_depth: int = 0
     mtp_loss_weight: float = 0.0
+    mtp_mode: str = "sequential"
+    layerskip_loss_weight: float = 0.0
+    layerskip_dropout: float = 0.0
+    layerskip_min_layer: int = 1
+    future_summary_window: int = 0
+    future_summary_loss_weight: float = 0.0
+    jacobi_loss_weight: float = 0.0
+    jacobi_iterations: int = 0
 
     def __post_init__(self):
         if self.num_kv_heads is None:
@@ -126,8 +135,25 @@ class GPTConfig(BaseConfig):
         require(self.final_logit_softcap >= 0, "final_logit_softcap must be >= 0")
         require(self.mtp_depth >= 0, "mtp_depth must be >= 0")
         require(self.mtp_loss_weight >= 0, "mtp_loss_weight must be >= 0")
+        require(self.mtp_mode in _MTP_MODES, f"Unknown mtp_mode: {self.mtp_mode!r}. Available: {sorted(_MTP_MODES)}")
         require((self.mtp_depth == 0) == (self.mtp_loss_weight == 0), (
             "mtp_depth and mtp_loss_weight must be enabled together"
+        ))
+        require(self.mtp_depth > 0 or self.mtp_mode == "sequential", (
+            "mtp_mode only applies when mtp_depth > 0"
+        ))
+        require(self.layerskip_loss_weight >= 0, "layerskip_loss_weight must be >= 0")
+        require(0 <= self.layerskip_dropout < 1, "layerskip_dropout must be in [0, 1)")
+        require(self.layerskip_min_layer > 0, "layerskip_min_layer must be > 0")
+        require(self.future_summary_window >= 0, "future_summary_window must be >= 0")
+        require(self.future_summary_loss_weight >= 0, "future_summary_loss_weight must be >= 0")
+        require((self.future_summary_window == 0) == (self.future_summary_loss_weight == 0), (
+            "future_summary_window and future_summary_loss_weight must be enabled together"
+        ))
+        require(self.jacobi_loss_weight >= 0, "jacobi_loss_weight must be >= 0")
+        require(self.jacobi_iterations >= 0, "jacobi_iterations must be >= 0")
+        require((self.jacobi_iterations == 0) == (self.jacobi_loss_weight == 0), (
+            "jacobi_iterations and jacobi_loss_weight must be enabled together"
         ))
 
     def _validate_attention_position_contract(self):
@@ -145,7 +171,7 @@ class GPTConfig(BaseConfig):
             )
         if self.position == "sinusoidal":
             require(self.dim % 2 == 0, "sinusoidal position requires even dim")
-        if self.attention in {"cosformer", "lightning", "gated_deltanet"}:
+        if self.attention in {"cosformer", "lightning", "gated_deltanet", "gated_deltanet2"}:
             require(self.position == "none", f"{self.attention} owns its positional rule; set position='none'")
         if self.attention == "gemma3":
             require(self.position == "gemma3_rope", "Gemma-style attention schedule requires position='gemma3_rope'")
@@ -184,6 +210,13 @@ class GPTConfig(BaseConfig):
     def _validate_connection_knobs(self):
         if self.per_layer_embedding_dim > 0:
             require(self.connection == "residual", "per-layer embeddings require residual connections")
+        if self.layerskip_loss_weight > 0 or self.layerskip_dropout > 0:
+            require(self.connection == "residual", "LayerSkip training currently requires residual connections")
+            require(self.layerskip_min_layer < self.num_layers, (
+                "layerskip_min_layer must be before the final layer"
+            ))
+        if self.layerskip_dropout > 0:
+            require(self.layerskip_loss_weight > 0, "layerskip_dropout requires layerskip_loss_weight > 0")
 
     def _validate_ffn_knobs(self):
         validate_moe_fields(self)
@@ -373,6 +406,37 @@ def _build_per_layer_embeddings(config):
     return embed, projection, norm, 1.0 / math.sqrt(2.0), config.dim ** -0.5
 
 
+def _future_multi_hot_targets(targets, window, vocab_size, dtype):
+    require(window > 0, "future multi-hot targets require window > 0")
+    target = torch.zeros((*targets.shape, vocab_size), device=targets.device, dtype=dtype)
+    valid = torch.zeros(targets.shape, device=targets.device, dtype=torch.bool)
+    T = targets.size(1)
+    for offset in range(window):
+        if T <= offset:
+            break
+        future = targets[:, offset:]
+        future_valid = future != -100
+        if not future_valid.any():
+            continue
+        rows = target[:, : T - offset].reshape(-1, vocab_size)
+        flat_future = future.reshape(-1)
+        flat_valid = future_valid.reshape(-1)
+        row_ids = flat_valid.nonzero(as_tuple=False).squeeze(1)
+        rows[row_ids, flat_future[row_ids]] = 1.0
+        valid[:, : T - offset] |= future_valid
+    return target, valid
+
+
+def _multi_hot_cross_entropy(logits, targets, bag_size):
+    target, valid = _future_multi_hot_targets(targets, bag_size, logits.size(-1), logits.dtype)
+    counts = target.sum(dim=-1)
+    valid = valid & (counts > 0)
+    if not valid.any():
+        return logits.sum() * 0.0
+    per_position = -(target * F.log_softmax(logits, dim=-1)).sum(dim=-1) / counts.clamp_min(1.0)
+    return per_position[valid].mean()
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config, block_id):
         super().__init__()
@@ -509,7 +573,16 @@ class GPT(BaseModel):
         self.mtp_modules = nn.ModuleList([
             MultiTokenPredictionModule(config, config.num_layers + i)
             for i in range(config.mtp_depth)
-        ])
+        ]) if config.mtp_mode == "sequential" else nn.ModuleList()
+        self.parallel_mtp_heads = nn.ModuleList([
+            nn.Linear(config.dim, config.vocab_size, bias=False)
+            for _ in range(config.mtp_depth)
+        ]) if config.mtp_mode == "parallel" else nn.ModuleList()
+        self.future_summary_head = (
+            nn.Linear(config.dim, config.vocab_size, bias=False)
+            if config.future_summary_window > 0
+            else None
+        )
 
         self.pos_enc, self.local_pos_enc, self.global_pos_enc = _build_gpt_position_modules(config)
 
@@ -521,6 +594,10 @@ class GPT(BaseModel):
 
     def muon_auxiliary_modules(self):
         modules = [self.tok_emb, self.lm_head]
+        if self.parallel_mtp_heads:
+            modules.append(self.parallel_mtp_heads)
+        if self.future_summary_head is not None:
+            modules.append(self.future_summary_head)
         if self.embed_tokens_per_layer is not None:
             modules.append(self.embed_tokens_per_layer)
         if self.pos_enc is not None and any(p.requires_grad for p in self.pos_enc.parameters()):
@@ -548,20 +625,41 @@ class GPT(BaseModel):
         )
 
     def forward(self, idx, targets=None):
-        logits, _, main_hidden = self.forward_hidden(idx, return_residual=True)
+        collect_layer_hiddens = targets is not None and self.config.layerskip_loss_weight > 0
+        if collect_layer_hiddens:
+            logits, _, main_hidden, layer_hiddens = self.forward_hidden(
+                idx,
+                return_residual=True,
+                return_layer_hiddens=True,
+            )
+        else:
+            logits, _, main_hidden = self.forward_hidden(idx, return_residual=True)
+            layer_hiddens = None
 
         loss = None
         if targets is not None:
             loss = causal_lm_cross_entropy(logits, targets)
             loss = loss + self._mtp_loss(main_hidden, idx, targets)
+            loss = loss + self._future_summary_loss(main_hidden, targets)
+            loss = loss + self._layerskip_loss(layer_hiddens, targets, main_hidden)
+            loss = loss + self._jacobi_forcing_loss(idx, targets)
             loss = loss + self.auxiliary_loss()
 
         return logits, loss
 
-    def forward_hidden(self, idx, return_residual=False):
+    def forward_hidden(
+        self,
+        idx,
+        return_residual=False,
+        return_layer_hiddens=False,
+        apply_layerskip_dropout=True,
+    ):
         _, T = idx.shape
         require(T <= self.config.max_seq_len, (
             f"GPT supports at most {self.config.max_seq_len} tokens, got {T}"
+        ))
+        require(not return_layer_hiddens or return_residual, (
+            "return_layer_hiddens requires return_residual"
         ))
         x = self._cast_hidden(self.tok_emb(idx))
         per_layer_inputs = self._per_layer_inputs(idx, x)
@@ -575,17 +673,21 @@ class GPT(BaseModel):
         if self.config.connection != "residual":
             x = expand_residual_stream(x, self.config.connection_expansion)
 
+        layer_hiddens = []
         for block in self.blocks:
             block_freqs = self._block_freqs(block, T, freqs_cis)
             per_layer_input = per_layer_inputs[:, :, block.block_id, :] if per_layer_inputs is not None else None
-            x = self._checkpointed_forward(
-                block,
-                x,
-                freqs_cis=block_freqs,
-                attn_bias=attn_bias,
-                is_causal=is_causal,
-                per_layer_input=per_layer_input,
-            )
+            if not self._drop_layerskip_block(block, x, apply_layerskip_dropout):
+                x = self._checkpointed_forward(
+                    block,
+                    x,
+                    freqs_cis=block_freqs,
+                    attn_bias=attn_bias,
+                    is_causal=is_causal,
+                    per_layer_input=per_layer_input,
+                )
+            if return_layer_hiddens:
+                layer_hiddens.append(x)
 
         if self.config.connection != "residual":
             x = reduce_residual_stream(x)
@@ -594,11 +696,23 @@ class GPT(BaseModel):
         x = self.ln_f(main_hidden)
         logits = apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap)
 
+        if return_layer_hiddens:
+            return logits, x, main_hidden, layer_hiddens
         if return_residual:
             return logits, x, main_hidden
         return logits, x
 
-    def forward_cached(self, idx, past_kv=None):
+    def _drop_layerskip_block(self, block, x, enabled):
+        if not enabled or not self.training or self.config.layerskip_dropout == 0:
+            return False
+        # LayerSkip uses shallower exits during training; keep the final block
+        # active so the main LM loss always has a full-depth path.
+        if block.block_id + 1 == self.config.num_layers:
+            return False
+        drop_prob = self.config.layerskip_dropout * (block.block_id + 1) / self.config.num_layers
+        return bool((torch.rand((), device=x.device) < drop_prob).item())
+
+    def forward_cached(self, idx, past_kv=None, return_hidden=False):
         require(not self.training, "forward_cached expects model.eval() at the call boundary")
         require(idx.dim() == 2, "forward_cached idx must have shape (batch, seq)")
         require(idx.size(1) > 0, "forward_cached requires a non-empty input")
@@ -645,8 +759,12 @@ class GPT(BaseModel):
             )
             next_kv.append(block_kv)
 
-        x = self.ln_f(x)
-        return apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap), next_kv
+        main_hidden = x
+        x = self.ln_f(main_hidden)
+        logits = apply_logit_softcap(self.lm_head(x), self.config.final_logit_softcap)
+        if return_hidden:
+            return logits, next_kv, main_hidden
+        return logits, next_kv
 
     def _position_inputs(self, seq_len, offset=0):
         freqs_cis, attn_bias, is_causal = None, None, True
@@ -665,7 +783,7 @@ class GPT(BaseModel):
         return freqs_cis, attn_bias, is_causal
 
     def _block_freqs(self, block, seq_len, default_freqs=None, offset=0):
-        if block.attention_name == "gated_deltanet":
+        if block.attention_name in {"gated_deltanet", "gated_deltanet2"}:
             return None
         if self.config.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"}:
             if _is_global_attention_name(block.attention_name):
@@ -695,6 +813,8 @@ class GPT(BaseModel):
     def _mtp_loss(self, main_hidden, idx, targets):
         if self.config.mtp_depth == 0 or self.config.mtp_loss_weight == 0:
             return main_hidden.sum() * 0.0
+        if self.config.mtp_mode == "parallel":
+            return self._parallel_mtp_loss(main_hidden, targets)
         mtp_losses = []
         mtp_aux = main_hidden.sum() * 0.0
         hidden = main_hidden
@@ -720,6 +840,172 @@ class GPT(BaseModel):
         if not mtp_losses:
             return main_hidden.sum() * 0.0
         return self.config.mtp_loss_weight * torch.stack(mtp_losses).mean() + mtp_aux
+
+    def _parallel_mtp_loss(self, main_hidden, targets):
+        mtp_losses = []
+        normalized = self.ln_f(main_hidden)
+        for depth, head in enumerate(self.parallel_mtp_heads, start=1):
+            if targets.size(1) <= depth:
+                break
+            mtp_target = targets[:, depth:]
+            if not (mtp_target != -100).any():
+                break
+            mtp_logits = apply_logit_softcap(
+                head(normalized[:, : targets.size(1) - depth]),
+                self.config.final_logit_softcap,
+            )
+            mtp_losses.append(F.cross_entropy(
+                mtp_logits.reshape(-1, mtp_logits.size(-1)),
+                mtp_target.reshape(-1),
+                ignore_index=-100,
+            ))
+        if not mtp_losses:
+            return main_hidden.sum() * 0.0
+        return self.config.mtp_loss_weight * torch.stack(mtp_losses).mean()
+
+    def _future_summary_loss(self, main_hidden, targets):
+        if self.future_summary_head is None or self.config.future_summary_loss_weight == 0:
+            return main_hidden.sum() * 0.0
+        summary_logits = apply_logit_softcap(
+            self.future_summary_head(self.ln_f(main_hidden)),
+            self.config.final_logit_softcap,
+        )
+        target, valid = _future_multi_hot_targets(
+            targets,
+            self.config.future_summary_window,
+            summary_logits.size(-1),
+            summary_logits.dtype,
+        )
+        if not valid.any():
+            return main_hidden.sum() * 0.0
+        per_position = F.binary_cross_entropy_with_logits(
+            summary_logits,
+            target,
+            reduction="none",
+        ).mean(dim=-1)
+        return self.config.future_summary_loss_weight * (per_position * valid).sum() / valid.sum()
+
+    def _layerskip_loss(self, layer_hiddens, targets, main_hidden):
+        if self.config.layerskip_loss_weight == 0:
+            return main_hidden.sum() * 0.0
+        require(layer_hiddens is not None, "LayerSkip loss requires collected layer hidden states")
+        losses = []
+        for layer_id, hidden in enumerate(layer_hiddens, start=1):
+            if layer_id < self.config.layerskip_min_layer or layer_id == self.config.num_layers:
+                continue
+            logits = apply_logit_softcap(self.lm_head(self.ln_f(hidden)), self.config.final_logit_softcap)
+            losses.append(causal_lm_cross_entropy(logits, targets))
+        if not losses:
+            return main_hidden.sum() * 0.0
+        return self.config.layerskip_loss_weight * torch.stack(losses).mean()
+
+    def _jacobi_forcing_loss(self, idx, targets):
+        if self.config.jacobi_loss_weight == 0:
+            return self.tok_emb.weight.sum() * 0.0
+        draft = idx
+        with torch.no_grad():
+            for _ in range(self.config.jacobi_iterations):
+                logits, _ = self.forward_hidden(draft, apply_layerskip_dropout=False)
+                predicted_next = logits.argmax(dim=-1)
+                draft = draft.clone()
+                if draft.size(1) > 1:
+                    draft[:, 1:] = predicted_next[:, :-1]
+        logits, _ = self.forward_hidden(draft, apply_layerskip_dropout=False)
+        return self.config.jacobi_loss_weight * causal_lm_cross_entropy(logits, targets)
+
+    def token_superposition_loss(self, idx, targets, bag_size):
+        require(bag_size > 1, "token_superposition_loss requires bag_size > 1")
+        collect_layer_hiddens = self.config.layerskip_loss_weight > 0
+        if collect_layer_hiddens:
+            logits, _, main_hidden, layer_hiddens = self.forward_hidden(
+                idx,
+                return_residual=True,
+                return_layer_hiddens=True,
+            )
+        else:
+            logits, _, main_hidden = self.forward_hidden(idx, return_residual=True)
+            layer_hiddens = None
+        loss = _multi_hot_cross_entropy(logits, targets, bag_size)
+        loss = loss + self._mtp_loss(main_hidden, idx, targets)
+        loss = loss + self._future_summary_loss(main_hidden, targets)
+        loss = loss + self._layerskip_loss(layer_hiddens, targets, main_hidden)
+        loss = loss + self._jacobi_forcing_loss(idx, targets)
+        loss = loss + self.auxiliary_loss()
+        return loss
+
+    @torch.no_grad()
+    def early_exit_state(self, idx, exit_layer):
+        require(self.config.connection == "residual", "early_exit_state requires residual GPT blocks")
+        require(0 < exit_layer < self.config.num_layers, "exit_layer must be in [1, num_layers)")
+        require(idx.dim() == 2 and idx.size(1) > 0, "early_exit_state requires non-empty (batch, seq) ids")
+        require(idx.size(1) <= self.config.max_seq_len, "early_exit_state input exceeds max_seq_len")
+        _, T = idx.shape
+        x = self._cast_hidden(self.tok_emb(idx))
+        per_layer_inputs = self._per_layer_inputs(idx, x)
+        freqs_cis, attn_bias, is_causal = self._position_inputs(T)
+        if self.pos_enc is not None and self.pos_enc.kind == "additive":
+            x = x + self._cast_hidden(self.pos_enc(T))
+        x = self.drop(x)
+        for block in self.blocks[:exit_layer]:
+            block_freqs = self._block_freqs(block, T, freqs_cis)
+            per_layer_input = per_layer_inputs[:, :, block.block_id, :] if per_layer_inputs is not None else None
+            x = block(x, freqs_cis=block_freqs, attn_bias=attn_bias, is_causal=is_causal, per_layer_input=per_layer_input)
+        logits = apply_logit_softcap(self.lm_head(self.ln_f(x)), self.config.final_logit_softcap)
+        return logits, x
+
+    @torch.no_grad()
+    def early_exit_logits(self, idx, exit_layer):
+        logits, _ = self.early_exit_state(idx, exit_layer)
+        return logits
+
+    @torch.no_grad()
+    def continue_from_hidden(self, hidden, start_layer):
+        require(self.config.connection == "residual", "continue_from_hidden requires residual GPT blocks")
+        require(self.config.per_layer_embedding_dim == 0, (
+            "continue_from_hidden does not support per-layer embeddings"
+        ))
+        require(0 < start_layer < self.config.num_layers, "start_layer must be in [1, num_layers)")
+        require(hidden.dim() == 3 and hidden.size(1) > 0, (
+            "continue_from_hidden requires non-empty (batch, seq, dim) hidden states"
+        ))
+        require(hidden.size(2) == self.config.dim, "continue_from_hidden hidden dim must match GPT dim")
+        require(hidden.size(1) <= self.config.max_seq_len, "continue_from_hidden input exceeds max_seq_len")
+
+        T = hidden.size(1)
+        x = hidden
+        freqs_cis, attn_bias, is_causal = self._position_inputs(T)
+        for block in self.blocks[start_layer:]:
+            block_freqs = self._block_freqs(block, T, freqs_cis)
+            x = block(x, freqs_cis=block_freqs, attn_bias=attn_bias, is_causal=is_causal)
+        return apply_logit_softcap(self.lm_head(self.ln_f(x)), self.config.final_logit_softcap)
+
+    @torch.no_grad()
+    def mtp_draft_logits(self, idx):
+        logits, _, main_hidden = self.forward_hidden(idx, return_residual=True)
+        return self.mtp_draft_logits_from_hidden(logits, main_hidden)
+
+    @torch.no_grad()
+    def mtp_draft_logits_from_hidden(self, logits, main_hidden):
+        require(self.config.mtp_mode == "parallel" and self.config.mtp_depth > 0, (
+            "mtp_draft_logits_from_hidden requires parallel MTP heads"
+        ))
+        require(logits.dim() == 3 and main_hidden.dim() == 3, (
+            "mtp_draft_logits_from_hidden requires (batch, seq, dim/vocab) tensors"
+        ))
+        require(logits.shape[:2] == main_hidden.shape[:2], (
+            "mtp_draft_logits_from_hidden logits and hidden must share batch and seq shape"
+        ))
+        require(main_hidden.size(2) == self.config.dim, (
+            "mtp_draft_logits_from_hidden hidden dim must match GPT dim"
+        ))
+        last_hidden = self.ln_f(main_hidden[:, -1:])
+        draft_logits = [logits[:, -1]]
+        for head in self.parallel_mtp_heads:
+            draft_logits.append(apply_logit_softcap(
+                head(last_hidden).squeeze(1),
+                self.config.final_logit_softcap,
+            ))
+        return draft_logits
 
     def _optimizer_transformer_blocks(self):
         return [*self.blocks, *(module.block for module in self.mtp_modules)]

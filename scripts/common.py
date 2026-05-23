@@ -86,6 +86,14 @@ def lm_model_kwargs(
     post_norm=None,
     mtp_depth=None,
     mtp_loss_weight=None,
+    mtp_mode=None,
+    layerskip_loss_weight=None,
+    layerskip_dropout=None,
+    layerskip_min_layer=None,
+    future_summary_window=None,
+    future_summary_loss_weight=None,
+    jacobi_loss_weight=None,
+    jacobi_iterations=None,
 ):
     kwargs = _base_lm_kwargs(vocab_size, dim, num_layers, max_seq_len)
     if model_name == "gpt":
@@ -115,6 +123,14 @@ def lm_model_kwargs(
             "final_logit_softcap": final_logit_softcap,
             "mtp_depth": mtp_depth,
             "mtp_loss_weight": mtp_loss_weight,
+            "mtp_mode": mtp_mode,
+            "layerskip_loss_weight": layerskip_loss_weight,
+            "layerskip_dropout": layerskip_dropout,
+            "layerskip_min_layer": layerskip_min_layer,
+            "future_summary_window": future_summary_window,
+            "future_summary_loss_weight": future_summary_loss_weight,
+            "jacobi_loss_weight": jacobi_loss_weight,
+            "jacobi_iterations": jacobi_iterations,
         })
     elif model_name in {"hybrid", "hymba"}:
         kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
