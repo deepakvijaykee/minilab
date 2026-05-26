@@ -19,6 +19,10 @@ from minilab.models.transformer_utils import (
     DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
     DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
     DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_SPARSE_BLOCK_SIZE,
+    DEFAULT_SPARSE_INDEX_DIM,
+    DEFAULT_SPARSE_LOCAL_BLOCKS,
+    DEFAULT_SPARSE_TOP_K_BLOCKS,
     DEFAULT_TOP_K_EXPERTS,
     DEFAULT_YARN_BETA_FAST,
     DEFAULT_YARN_BETA_SLOW,
@@ -86,6 +90,10 @@ class GPTConfig(BaseConfig):
     yarn_beta_slow: float = DEFAULT_YARN_BETA_SLOW
     local_attention_window: int = DEFAULT_LOCAL_ATTENTION_WINDOW
     qwen3_next_full_attention_interval: int = DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL
+    sparse_block_size: int = DEFAULT_SPARSE_BLOCK_SIZE
+    sparse_top_k_blocks: int = DEFAULT_SPARSE_TOP_K_BLOCKS
+    sparse_local_blocks: int = DEFAULT_SPARSE_LOCAL_BLOCKS
+    sparse_index_dim: int = DEFAULT_SPARSE_INDEX_DIM
     attention_k_eq_v: bool = False
     per_layer_embedding_dim: int = 0
     final_logit_softcap: float = 0.0
@@ -131,6 +139,10 @@ class GPTConfig(BaseConfig):
         require(self.yarn_beta_slow > 0, "yarn_beta_slow must be > 0")
         require(self.local_attention_window > 0, "local_attention_window must be > 0")
         require(self.qwen3_next_full_attention_interval > 0, "qwen3_next_full_attention_interval must be > 0")
+        require(self.sparse_block_size > 0, "sparse_block_size must be > 0")
+        require(self.sparse_top_k_blocks >= 0, "sparse_top_k_blocks must be >= 0")
+        require(self.sparse_local_blocks >= 0, "sparse_local_blocks must be >= 0")
+        require(self.sparse_index_dim >= 0, "sparse_index_dim must be >= 0")
         require(self.per_layer_embedding_dim >= 0, "per_layer_embedding_dim must be >= 0")
         require(self.final_logit_softcap >= 0, "final_logit_softcap must be >= 0")
         require(self.mtp_depth >= 0, "mtp_depth must be >= 0")
@@ -232,6 +244,7 @@ class GPTConfig(BaseConfig):
             or resolved_attention in _PARTIAL_ROPE_ATTENTIONS
             or self.position in {"gemma4_rope", "qwen3_next_rope"}
         )
+        uses_learned_block = resolved_attention == "learned_block_gqa"
         require_default_unless(
             self.rope_base,
             DEFAULT_ROPE_BASE,
@@ -288,6 +301,30 @@ class GPTConfig(BaseConfig):
             self.attention == "qwen3_next",
             "qwen3_next_full_attention_interval only applies to attention='qwen3_next'",
         )
+        require_default_unless(
+            self.sparse_block_size,
+            DEFAULT_SPARSE_BLOCK_SIZE,
+            uses_learned_block,
+            "sparse_block_size only applies to attention='learned_block_gqa'",
+        )
+        require_default_unless(
+            self.sparse_top_k_blocks,
+            DEFAULT_SPARSE_TOP_K_BLOCKS,
+            uses_learned_block,
+            "sparse_top_k_blocks only applies to attention='learned_block_gqa'",
+        )
+        require_default_unless(
+            self.sparse_local_blocks,
+            DEFAULT_SPARSE_LOCAL_BLOCKS,
+            uses_learned_block,
+            "sparse_local_blocks only applies to attention='learned_block_gqa'",
+        )
+        require_default_unless(
+            self.sparse_index_dim,
+            DEFAULT_SPARSE_INDEX_DIM,
+            uses_learned_block,
+            "sparse_index_dim only applies to attention='learned_block_gqa'",
+        )
         require(
             not self.attention_k_eq_v or self.attention == "gemma4",
             "attention_k_eq_v only applies to attention='gemma4'",
@@ -341,6 +378,18 @@ def _build_transformer_attention(config, block_id):
                 config.num_kv_heads,
                 config.dropout,
                 rope_fraction=config.rope_partial_rotary_factor,
+            )
+        elif attention == "learned_block_gqa":
+            index_dim = getattr(config, "sparse_index_dim", DEFAULT_SPARSE_INDEX_DIM)
+            attn = attn_cls(
+                config.dim,
+                config.num_heads,
+                config.num_kv_heads,
+                config.dropout,
+                block_size=getattr(config, "sparse_block_size", DEFAULT_SPARSE_BLOCK_SIZE),
+                top_k_blocks=getattr(config, "sparse_top_k_blocks", DEFAULT_SPARSE_TOP_K_BLOCKS),
+                local_blocks=getattr(config, "sparse_local_blocks", DEFAULT_SPARSE_LOCAL_BLOCKS),
+                index_dim=None if index_dim == 0 else index_dim,
             )
         else:
             attn = attn_cls(config.dim, config.num_heads, config.num_kv_heads, config.dropout)

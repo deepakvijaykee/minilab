@@ -41,6 +41,10 @@ from minilab.models.transformer_utils import (
     DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
     DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
     DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_SPARSE_BLOCK_SIZE,
+    DEFAULT_SPARSE_INDEX_DIM,
+    DEFAULT_SPARSE_LOCAL_BLOCKS,
+    DEFAULT_SPARSE_TOP_K_BLOCKS,
     DEFAULT_TOP_K_EXPERTS,
     DEFAULT_YARN_BETA_FAST,
     DEFAULT_YARN_BETA_SLOW,
@@ -57,6 +61,7 @@ _MODEL_BUILD_FLAGS = (
     "rope_base", "rope_local_base", "rope_global_base", "rope_scaling_factor",
     "rope_original_max_seq_len", "rope_partial_rotary_factor", "yarn_beta_fast",
     "yarn_beta_slow", "local_attention_window", "qwen3_next_full_attention_interval",
+    "sparse_block_size", "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
     "attention_k_eq_v", "per_layer_embedding_dim", "final_logit_softcap",
     "connection", "ffn", "num_experts", "top_k_experts", "post_norm",
     "mtp_depth", "mtp_loss_weight", "mtp_mode",
@@ -77,6 +82,10 @@ _GPT_ONLY_BUILD_FLAGS = (
     "rope_local_base",
     "rope_global_base",
     "attention_k_eq_v",
+    "sparse_block_size",
+    "sparse_top_k_blocks",
+    "sparse_local_blocks",
+    "sparse_index_dim",
     "per_layer_embedding_dim",
     "connection",
     "mtp_depth",
@@ -121,6 +130,10 @@ p.add_argument("--yarn-beta-fast", type=float, default=None)
 p.add_argument("--yarn-beta-slow", type=float, default=None)
 p.add_argument("--local-attention-window", type=int, default=None)
 p.add_argument("--qwen3-next-full-attention-interval", type=int, default=None)
+p.add_argument("--sparse-block-size", type=int, default=None)
+p.add_argument("--sparse-top-k-blocks", type=int, default=None)
+p.add_argument("--sparse-local-blocks", type=int, default=None)
+p.add_argument("--sparse-index-dim", type=int, default=None, help="0 uses the attention head dimension")
 p.add_argument("--attention-k-eq-v", action="store_true", default=None)
 p.add_argument("--per-layer-embedding-dim", type=int, default=None)
 p.add_argument("--final-logit-softcap", type=float, default=None)
@@ -208,6 +221,10 @@ qwen3_next_full_attention_interval = resolve_default(
     args.qwen3_next_full_attention_interval,
     DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
 )
+sparse_block_size = resolve_default(args.sparse_block_size, DEFAULT_SPARSE_BLOCK_SIZE)
+sparse_top_k_blocks = resolve_default(args.sparse_top_k_blocks, DEFAULT_SPARSE_TOP_K_BLOCKS)
+sparse_local_blocks = resolve_default(args.sparse_local_blocks, DEFAULT_SPARSE_LOCAL_BLOCKS)
+sparse_index_dim = resolve_default(args.sparse_index_dim, DEFAULT_SPARSE_INDEX_DIM)
 attention_k_eq_v = resolve_default(args.attention_k_eq_v, False)
 per_layer_embedding_dim = resolve_default(args.per_layer_embedding_dim, 0)
 final_logit_softcap = resolve_default(args.final_logit_softcap, 0.0)
@@ -251,6 +268,16 @@ if args.local_attention_window is not None:
         attention in _LOCAL_WINDOW_ATTENTIONS
         or resolved_attention in {"sliding_window", "sliding_window_gqa_qknorm"},
         "--local-attention-window only applies to local/sliding-window attention",
+    )
+if (
+    args.sparse_block_size is not None
+    or args.sparse_top_k_blocks is not None
+    or args.sparse_local_blocks is not None
+    or args.sparse_index_dim is not None
+):
+    require(
+        attention == "learned_block_gqa",
+        "--sparse-* flags only apply to --attention learned_block_gqa",
     )
 if args.rope_base is not None:
     require(position in {"rope", "yarn_rope"}, "--rope-base only applies to --position rope or yarn_rope")
@@ -350,6 +377,10 @@ else:
         yarn_beta_slow=yarn_beta_slow,
         local_attention_window=local_attention_window,
         qwen3_next_full_attention_interval=qwen3_next_full_attention_interval,
+        sparse_block_size=sparse_block_size,
+        sparse_top_k_blocks=sparse_top_k_blocks,
+        sparse_local_blocks=sparse_local_blocks,
+        sparse_index_dim=sparse_index_dim,
         attention_k_eq_v=attention_k_eq_v,
         per_layer_embedding_dim=per_layer_embedding_dim,
         final_logit_softcap=final_logit_softcap,

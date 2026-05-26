@@ -17,6 +17,7 @@ from minilab.nn.attention_standard import (
 from minilab.nn.attention_sparse import (
     BlockSparseAttention,
     InterleavedHeadAttention,
+    LearnedBlockSparseGQAAttention,
     SlidingWindowAttention,
 )
 from minilab.nn.attention_linear import (
@@ -48,6 +49,7 @@ __all__ = [
     "HeavilyCompressedAttention",
     "InterleavedHeadAttention",
     "KeyValueTiedGroupedQueryQKNormAttention",
+    "LearnedBlockSparseGQAAttention",
     "LightningAttention2",
     "MultiHeadAttention",
     "MultiHeadLatentAttention",

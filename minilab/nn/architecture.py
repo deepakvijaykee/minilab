@@ -12,6 +12,7 @@ GQA_ATTENTIONS = {
     "gated_gqa_qknorm_partial_rope",
     "gqa_qknorm_kv_tied",
     "gqa_qknorm_partial_rope",
+    "learned_block_gqa",
     "sliding_window_gqa_qknorm",
 }
 
