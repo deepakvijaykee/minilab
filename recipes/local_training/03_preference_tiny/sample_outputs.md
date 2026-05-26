@@ -16,5 +16,7 @@ hh: 1000 examples for dpo
   A: ...
 ```
 
-For reference-free algorithms (SimPO, ORPO, CPO, RePO) the `Frozen reference`
-line is absent and the save directory becomes `preference_<algorithm>`.
+For the reference-free algorithms (SimPO, ORPO, CPO, RePO) the
+`Frozen reference` line is absent, because the trainer never loads a
+second copy of the policy, and the save directory is named after the
+algorithm rather than carrying the `preference_dpo` suffix.

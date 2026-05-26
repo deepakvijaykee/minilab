@@ -13,6 +13,9 @@ hh: 200 examples for simpo
   A: ...
 ```
 
-For `ALGORITHM=dpo` the script prints an extra `Frozen reference: <path>`
-line above the dataset line and the save directory becomes
-`smollm2-135m-dpo`.
+With `ALGORITHM=dpo` the script prints an extra `Frozen reference:
+<path>` line above the dataset line, because the DPO trainer needs to
+load and announce a second checkpoint, and the save directory becomes
+`smollm2-135m-dpo` so the artifacts of the two algorithms remain
+cleanly separated when both have been run against the same SFT
+checkpoint.

@@ -1,14 +1,19 @@
 # minilab
 
-Minilab is my small-scale language-model training lab.
+Minilab is my small-scale language-model training lab. The premise is that
+the full pretraining to alignment loop, pretraining followed by SFT,
+preference optimization, and RLVR, should fit on a single consumer GPU.
+On an 8GB laptop I can run every stage end to end in minutes, watch each
+checkpoint change the next one, and form intuition about what each step
+actually contributes to the model.
 
-The goal is to make the full pretraining -> SFT -> preference optimization
--> RLVR loop runnable on a single consumer GPU, ideally an 8GB laptop GPU.
-
-This is not a distributed training framework. It is not trying to replace
-TRL, torchtune, Axolotl, or Megatron. It is for understanding and debugging
-post-training methods in small, inspectable experiments where I can see
-what each step does to the model.
+That framing matters because most post-training behavior is easier to
+reason about at this scale than at production scale. A 10M parameter base
+exposes the bias-variance tradeoffs of DPO, the reward-density failure
+mode of GRPO, and the formatting-before-content asymmetry of SFT in
+single-digit minutes per stage. Production frameworks like TRL, torchtune,
+Axolotl, and Megatron solve a different problem: throughput and scale.
+Minilab solves visibility.
 
 The main path is:
 
@@ -16,19 +21,22 @@ The main path is:
 tokenizer -> tiny GPT pretraining -> SFT -> DPO/SimPO -> GRPO with GSM8K verifier -> eval
 ```
 
-Each step is a recipe under `recipes/local_training/`, runnable as one
-`bash run.sh`. The diffusion branch (recipes `06`-`09`) mirrors the same
-shape with MDLM in place of GPT.
+Every stage lives under `recipes/local_training/` and runs as a single
+`bash run.sh`. The diffusion branch (recipes `06` through `09`) follows
+the same arc with MDLM in place of GPT, so the two families can be
+compared step for step rather than only at the endpoints.
 
 ## Cost on my laptop
 
-Hardware: NVIDIA RTX 5060 Laptop, 8GB VRAM.
-Main tested path: `gpt-10m`, 4k-vocab BPE tokenizer, FP32 + AdamW, grad
-checkpointing where the recipe enables it.
-
-Wall times include the first `torch.compile` cold-start (~30-60s) and the
-first-run HF dataset download; both cache after that. Peak VRAM is also
-recorded in `run_metrics.json` as `max_memory_reserved_gb`.
+The reference machine is an NVIDIA RTX 5060 Laptop with 8GB of VRAM. The
+main tested configuration is `gpt-10m` with a 4k vocabulary BPE tokenizer,
+FP32 training under AdamW, and gradient checkpointing wherever a recipe
+turns it on. Wall times below include the first `torch.compile` cold start,
+which adds roughly 30 to 60 seconds, and the first HF dataset download.
+Both cache between runs, so the first invocation of any stage is the slow
+one. Peak VRAM is also written into `run_metrics.json` as
+`max_memory_reserved_gb`, which is what to trust over the table when
+sizing a longer experiment.
 
 | Stage | Steps | Peak VRAM | Wall time | Result |
 | --- | ---: | ---: | ---: | --- |
@@ -43,38 +51,61 @@ recorded in `run_metrics.json` as `max_memory_reserved_gb`.
 | 08 diffusion DPO | 300 | ~2.5 GB | ~6 min | trainable plus frozen reference both fit on 8GB; preference loss stays finite |
 | 09 diffusion GRPO | 100 | ~2.3 GB | ~30 min | 64 reverse-diffusion forwards x 2 generations x 100 outer steps is where the time goes |
 
-Peak VRAM never crosses 3 GB at the defaults, which leaves room to push
-`PRESET=gpt-25m`, a larger `BATCH_SIZE`, or longer `MAX_NEW_TOKENS` before
-the 8GB limit bites. Run `scripts/estimate_vram.py` before pushing any
-of those up.
+Peak VRAM stays under 3 GB across the defaults, which leaves comfortable
+headroom to scale up to `PRESET=gpt-25m`, a larger `BATCH_SIZE`, or longer
+`MAX_NEW_TOKENS` before the 8GB ceiling becomes a problem. The natural
+workflow is to call `scripts/estimate_vram.py` first so that any of these
+knobs that would overshoot is caught before the run starts rather than
+several minutes in.
 
-## Known limitations
+## What the defaults can and cannot show
 
-- Default runs are sanity checks, not leaderboard runs. Story-level
-  coherence on TinyStories emerges around `gpt-25m x 3000 steps`; below
-  that threshold you are reading loss curves, not the model.
-- Tiny models pick up formatting before content. SFT and DPO/SimPO move
-  response *shape* (Q/A scaffolding, refusal patterns, opening style) well
-  before they move task accuracy, because shape lives in the head's output
-  distribution while accuracy lives in capacity the base does not yet have.
-- GRPO/RLVR is non-bootstrapping. If the SFT base produces zero
-  answer-shaped completions, every rollout scores zero, the group-relative
-  advantage is zero, and the gradient is zero. RL cannot teach a behavior
-  the base has near-zero probability of emitting; train recipe 02 longer first.
-- Diffusion alignment is the less-validated branch. The recipes complete,
-  but diffusion LMs at this scale are roughly an order of magnitude more
-  sample-hungry than AR for the same coherence: each token is supervised
-  through a noisy timestep expectation rather than a deterministic next-step
-  loss, which shifts the bias-variance balance toward variance.
-- The main tested path is GPT-style tiny models. Mamba, Hymba, xLSTM,
-  ByteLatent, and the diffusion variants exist to keep the comparison
-  scripts honest, not as paved paths through alignment.
-- HF import is Llama-only. Qwen3 and Gemma3 round-trip through inspection
-  and generation but `_native_config` in `scripts/import_hf.py` rejects
-  anything where `model_type != "llama"`. Adding them is mostly mapping
-  work: Qwen3 needs the attention-bias and untied-embedding paths;
-  Gemma3 needs local-global RoPE and per-layer embedding dims. Both
-  surface in the native GPT config, just not in the importer.
+The defaults are sized so that the entire loop runs in a coffee break, and
+that choice has consequences worth stating up front. The interesting object
+to study at this scale is the loss curve and the qualitative shift between
+checkpoints, not absolute task performance. Story-level coherence on
+TinyStories emerges around `gpt-25m` trained for roughly 3000 steps. Below
+that threshold the model has the unigram and short-range statistics but
+not the longer-range templates, and reading the samples gives a misleading
+impression of what training has done.
+
+Tiny models pick up formatting much faster than content. Both SFT and
+DPO or SimPO move response shape, meaning Q and A scaffolding, refusal
+patterns, opening style, well before they move task accuracy. Shape lives
+in the final softmax distribution where a few thousand examples are
+enough to re-weight common tokens. Accuracy lives in representations the
+base has not yet learned, and re-weighting cannot conjure them. This is
+the dominant aesthetic shift between recipes 01 and 03.
+
+GRPO and RLVR are non-bootstrapping in a strict sense. If the SFT base
+produces zero answer-shaped completions, every rollout scores zero, the
+group-relative advantage is zero, and the gradient is zero. RL cannot
+teach a behavior the base assigns near-zero probability to in the first
+place; the practical fix is to train recipe 02 longer rather than to
+push GRPO hyperparameters.
+
+The diffusion branch is the less-validated track. Recipes complete and
+metrics behave, but at matched parameters and matched compute, masked
+diffusion language models reach a given coherence at roughly an order of
+magnitude more samples than an autoregressive model. Each token is
+supervised through a stochastic timestep expectation rather than a
+deterministic next-step target, so the same gradient budget carries
+strictly less information per token. The bias-variance balance shifts
+toward variance and convergence is correspondingly slower.
+
+The main tested family is GPT-style tiny models. Mamba, Hymba, xLSTM,
+ByteLatent, and the diffusion variants are wired into the registries
+mainly so the comparison scripts have something honest to compare
+against. They are not paved paths through alignment.
+
+HF import currently accepts only Llama-compatible weights. Qwen3 and
+Gemma3 round-trip cleanly through inspection and generation, but
+`_native_config` in `scripts/import_hf.py` rejects anything whose
+`model_type` is not `llama`. Wiring them up is mostly mapping work
+rather than capability work: Qwen3 needs the attention-bias and untied
+embedding paths, and Gemma3 needs local-global RoPE and per-layer
+embedding dimensions. Both surface in the native GPT config; only the
+importer is missing the bridge.
 
 ## Install
 
@@ -94,9 +125,9 @@ python -m pip install -e ".[dev]"      # pytest and ruff
 
 ## Local training recipes
 
-The main path lives in `recipes/local_training/`. Install the data extra
-first because the recipes load TinyStories, Alpaca, HH-RLHF or
-UltraFeedback, and GSM8K through Hugging Face Datasets:
+The main path lives under `recipes/local_training/`. The recipes pull
+TinyStories, Alpaca, HH-RLHF or UltraFeedback, and GSM8K through Hugging
+Face Datasets, so the data extra needs to be installed first:
 
 ```bash
 python -m pip install -e ".[data]"
@@ -122,8 +153,9 @@ bash recipes/local_training/08_preference_tiny_diffusion/run.sh
 bash recipes/local_training/09_grpo_tiny_diffusion_math/run.sh
 ```
 
-The diffusion branch is parallel to the AR branch stage for stage, without
-treating diffusion models as next-token predictors:
+The diffusion branch mirrors the autoregressive branch stage for stage, but
+keeps the diffusion objective at every stage rather than collapsing the
+model into a next-token predictor for alignment:
 
 | Stage | AR path | Diffusion path |
 | --- | --- | --- |
@@ -132,13 +164,19 @@ treating diffusion models as next-token predictors:
 | Preference tuning | DPO/IPO/SimPO/etc. over response log-probs | DPO/VRPO over diffusion loss proxies |
 | RLVR | GRPO/RLOO/etc. with generated completions | GRPO over reverse denoising trajectories |
 
-Every recipe carries a `README.md`, `config.yaml`, `run.sh`,
-`expected_metrics.md`, and `sample_outputs.md`. Scale up with environment
-overrides like `PRESET=gpt-25m`, `MAX_STEPS=3000`, or `ALGORITHM=simpo`.
+Each recipe ships a `README.md`, `config.yaml`, `run.sh`,
+`expected_metrics.md`, and `sample_outputs.md`. Environment overrides
+like `PRESET=gpt-25m`, `MAX_STEPS=3000`, or `ALGORITHM=simpo` are the
+intended way to scale a stage up without touching the script.
 
 ## Tiny presets
 
-Presets are pre-sized model configs that fit common laptop budgets:
+A preset is a pre-sized model configuration chosen to fit a common laptop
+memory budget. The point of having a handful of these rather than asking
+the user to set every dimension is that it makes cross-family comparisons
+honest: `gpt-25m`, `mamba-25m`, and `mdlm-25m` are roughly matched in
+parameter count, so a behavioral difference between them is closer to a
+difference in inductive bias than in capacity.
 
 | Preset | Family | Default context | Approx params | Use case |
 | --- | --- | ---: | ---: | --- |
@@ -148,8 +186,10 @@ Presets are pre-sized model configs that fit common laptop budgets:
 | `mamba-25m` | Mamba | 512 | ~22M-29M | SSM comparison runs |
 | `mdlm-25m` | MDLM | 512 | ~26M-31M | diffusion LM experiments |
 
-Parameter counts vary with tokenizer vocabulary size. The ranges above
-cover the recipe default 4k vocabulary through a 16k vocabulary.
+The parameter count moves with the tokenizer vocabulary because the
+embedding matrix dominates non-attention parameters at this scale. The
+ranges above cover the recipe default 4k vocabulary through a 16k
+vocabulary.
 
 Use presets directly:
 
@@ -170,20 +210,24 @@ python scripts/estimate_vram.py \
   --num-generations 4
 ```
 
-Training runs automatically write PyTorch allocator measurements to
-`run_metrics.json` in the final checkpoint directory and in the recipe save
-directory. On CUDA, this includes `max_memory_allocated_gb` and
-`max_memory_reserved_gb` from `torch.cuda` peak memory stats.
+Every training run writes PyTorch allocator measurements into
+`run_metrics.json`, both in the final checkpoint directory and in the
+recipe save directory. On CUDA that file records `max_memory_allocated_gb`
+and `max_memory_reserved_gb` from `torch.cuda` peak memory statistics,
+which together are a more reliable picture of what the run actually used
+than the estimator's a-priori guess.
 
 ## Hugging Face bridge
 
-The HF bridge is for curated sub-1B causal LMs: inspect them, generate
-from them, or import compatible checkpoints into the native Minilab
-format so they go through the same trainers as everything else. This is
-not a general HF loader. Only Llama-compatible weights are wired up today
-(SmolLM2 works; Qwen3 and Gemma3 round-trip through inspection and
-generation but are rejected by import until their weight mappings are
-validated).
+The HF bridge handles curated sub-1B causal LMs. The intent is narrow and
+worth being explicit about: inspect them, generate from them, or import a
+compatible checkpoint into the native Minilab format so that it goes
+through the same trainers as everything else. It is not a general HF
+loader, and it does not aim to be. Today only Llama-compatible weights
+import cleanly. SmolLM2 works end to end; Qwen3 and Gemma3 round-trip
+through inspection and generation but the import path rejects them
+until their weight mappings have been validated against the native GPT
+config.
 
 ```bash
 python -m pip install -e ".[data,hf]"
@@ -195,15 +239,17 @@ bash recipes/hf_to_native/04_preference_imported/run.sh
 bash recipes/hf_to_native/05_grpo_imported/run.sh
 ```
 
-Curated aliases include `smollm2-135m`, `smollm2-360m`, `gemma3-270m`, and
-`qwen3-0.6b`, plus instruct/base variants where available. The full list
-comes from `scripts/hf_inspect.py --list-presets`. Recipes live in
-`recipes/hf_to_native/`.
+Curated aliases include `smollm2-135m`, `smollm2-360m`, `gemma3-270m`,
+and `qwen3-0.6b`, with instruct or base variants where the upstream
+release provides them. The full list comes from
+`scripts/hf_inspect.py --list-presets`, and the recipes that drive the
+import-and-train flow live under `recipes/hf_to_native/`.
 
 ## Running scripts directly
 
-If you would rather skip the recipe wrappers, the underlying scripts take
-the same flags:
+The recipe wrappers are convenience, not necessity. The underlying
+scripts accept the same flags, so anything a recipe does can be driven
+from the command line directly:
 
 ```bash
 python scripts/train_tokenizer.py --save tokenizer.json
@@ -230,28 +276,32 @@ python scripts/grpo_diffusion.py --tokenizer tokenizer.json --checkpoint checkpo
 
 ## What else is in here
 
-Beyond the main path, the registry includes alternative implementations
-that are present mostly so the comparison scripts have something to
-compare against:
+Beyond the main path the registries carry a set of alternative
+implementations. These exist primarily so the comparison scripts have
+real, equivalently-sized baselines to compare against rather than
+strawmen.
 
-- Other LM families: Mamba/Mamba-2, Hybrid, Hymba, xLSTM, ByteLatent.
-- Diffusion LMs: MDLM, SEDD, D3PM, block diffusion.
-- Preference-optimization variants: IPO, CPO, ORPO, RePO, KTO alongside
-  DPO and SimPO.
-- Online RL variants: RLOO, GSPO, DAPO, PPO alongside GRPO.
-- Tokenizer variants: BPE, WordPiece, Unigram, character, byte.
+- Other LM families: Mamba and Mamba-2, Hybrid, Hymba, xLSTM, ByteLatent.
+- Diffusion LMs: MDLM, SEDD, D3PM, and block diffusion.
+- Preference-optimization variants: IPO, CPO, ORPO, RePO, and KTO
+  alongside DPO and SimPO.
+- Online RL variants: RLOO, GSPO, DAPO, and PPO alongside GRPO.
+- Tokenizer variants: BPE, WordPiece, Unigram, character, and byte.
 
-The comparison scripts (`scripts/compare_attention.py`,
-`scripts/compare_position.py`, `scripts/compare_connection.py`,
-`scripts/compare_diffusion.py`) are the closest thing to first-class entry
-points for these. The full alignment pipeline has only been driven end to
-end on GPT-style models.
+The natural entry points for these are the comparison scripts
+(`scripts/compare_attention.py`, `scripts/compare_position.py`,
+`scripts/compare_connection.py`, and `scripts/compare_diffusion.py`).
+The full alignment pipeline has only been driven end to end on GPT-style
+models, so for the alternatives the recommendation is to use them as
+controlled ablations rather than as production paths through alignment.
 
 ## Package contents
 
-The package is registry-based: models, tokenizers, attention layers, position
-encodings, feed-forward layers, trainers, schedulers, samplers, and tasks are
-selected by string names.
+The package is organized around registries. Models, tokenizers, attention
+layers, position encodings, feed-forward layers, trainers, schedulers,
+samplers, and tasks are all selected by string name, which keeps the
+scripts thin and makes swapping a component for a comparison run a
+one-line change.
 
 Package areas:
 

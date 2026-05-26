@@ -16,5 +16,7 @@ GSM8K: train=100 test=20
 GSM8K test subset (20 of full split) accuracy: 1/20 = 5.0%
 ```
 
-Numbers will vary widely seed to seed at this scale; a single-digit accuracy
-at the default scale is the expected ballpark, not a useful signal.
+The accuracy number varies widely seed to seed at this scale. A
+single-digit value is the expected ballpark for the default budget
+rather than a useful signal about the RLVR run, and reading it as one
+overinterprets noise.

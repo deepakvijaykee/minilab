@@ -13,4 +13,6 @@ Alpaca: 500 examples
   A: ...
 ```
 
-Param count is for SmolLM2-135M. For `smollm2-360m` it is around 360M.
+The parameter count above is for SmolLM2-135M; for `smollm2-360m` it
+is around 360M, with the rest of the block shape identical because
+the trainer logging is shared across model sizes.

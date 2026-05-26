@@ -15,6 +15,9 @@ alpaca: 2000 diffusion SFT examples
   A: ...
 ```
 
-Response text comes out of reverse diffusion (the script calls
-`sample_with_prompt`), so the quality is bounded by the base diffusion
-checkpoint, not by how many SFT steps you ran.
+The response text comes out of reverse diffusion through
+`sample_with_prompt`, not from an autoregressive sampler. Response
+quality is therefore bounded above by the base diffusion checkpoint
+rather than by the SFT step count, and running more SFT steps will
+not extract better text from a base that does not yet denoise to
+coherent output.

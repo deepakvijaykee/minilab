@@ -1,18 +1,25 @@
 # 00 Train tokenizer
 
-Trains a small BPE tokenizer on TinyStories. Every downstream recipe in
-`local_training/` loads the resulting `tokenizer.json`, so this is always the
-first step.
+This recipe trains a small BPE tokenizer on TinyStories. Every downstream
+recipe in `local_training/` loads the resulting `tokenizer.json`, so the
+choice made here propagates through pretraining, SFT, preference
+optimization, and RLVR. Vocabulary size is the only meaningful decision
+the recipe exposes, but it is consequential, because the embedding matrix
+dominates the non-attention parameter count at the laptop scale.
 
 ```bash
 bash recipes/local_training/00_train_tokenizer/run.sh
 ```
 
-It builds a 4k-vocab BPE tokenizer over 5000 TinyStories rows and writes to
+By default the recipe builds a 4096-token BPE vocabulary over 5000
+TinyStories rows and writes the result to
 `checkpoints/local_training/tokenizer.json`. Downstream recipes read that
 path unless `TOKENIZER` is overridden.
 
-A 4k vocab keeps the embedding matrix tiny (about 1M params at `dim=256`),
-which is what makes `gpt-10m` actually 10M-ish on a laptop. Bumping the vocab
-to 16k pushes the same preset toward ~13M parameters; the README preset table
-covers that range.
+The 4k choice is what keeps `gpt-10m` actually around ten million
+parameters on a laptop. At `dim=256` a 4096-token embedding matrix is
+roughly one million parameters, which leaves the transformer blocks to
+account for the rest of the budget. Pushing the vocabulary up to 16k
+moves the same preset toward roughly thirteen million parameters, almost
+entirely through the embedding and output projection. The preset table
+in the root README covers that range.

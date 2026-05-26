@@ -1,14 +1,20 @@
 # Local training recipes
 
-The end-to-end path for local, single-device training. Start with the
-tokenizer, then branch into either the autoregressive GPT track or the
-diffusion MDLM track. Both branches go through SFT, preference optimization,
-RLVR, and evaluation.
+This directory holds the end-to-end path for local, single-device
+training. Every run begins with the tokenizer in recipe 00, then branches
+into either the autoregressive GPT track or the diffusion MDLM track.
+Both branches pass through pretraining, SFT, preference optimization,
+and RLVR before landing in evaluation, so reading the two tracks side by
+side is the cleanest way to see how the same alignment idea changes
+shape when the underlying density model changes.
 
-Defaults are sized for a laptop GPU and a short run. They are good for
-checking that the loop works on your machine, not for chasing quality. Bump
-`MAX_STEPS`, `MAX_EXAMPLES`, `PRESET`, and the batch settings once the full
-path runs end to end.
+The defaults are deliberately small. They make the full loop runnable in
+a few minutes per stage, which is the right scale for confirming that
+the pipeline works end to end on a given machine and for forming
+intuition about how each stage changes the previous one. They are not
+sized for quality. Once the path runs cleanly, the right next move is
+to scale `MAX_STEPS`, `MAX_EXAMPLES`, `PRESET`, and the batch settings
+up rather than to change the structure of the pipeline.
 
 Install the data extra before running the track:
 
@@ -37,8 +43,11 @@ bash recipes/local_training/08_preference_tiny_diffusion/run.sh
 bash recipes/local_training/09_grpo_tiny_diffusion_math/run.sh
 ```
 
-The diffusion branch mirrors the AR branch stage for stage but stays diffusion
-native; nothing is treated as a next-token model.
+The diffusion branch mirrors the autoregressive branch stage for stage,
+but keeps a diffusion objective at every stage rather than reducing the
+model to a next-token predictor for alignment. This is the more
+informative comparison: it isolates whether a behavior depends on the
+alignment algorithm or on the underlying density model.
 
 | Recipe | What it trains | Default objective |
 | --- | --- | --- |
@@ -77,10 +86,13 @@ python scripts/estimate_vram.py --model gpt-25m --method grpo --seq-len 512 --ba
 python scripts/estimate_vram.py --model mdlm-25m --method diffusion_grpo --seq-len 512 --batch-size 1 --num-generations 2
 ```
 
-Every training recipe writes `run_metrics.json` to the final checkpoint
-directory and copies it into the recipe save directory. On CUDA the file
-includes `max_memory_allocated_gb` and `max_memory_reserved_gb` from
-`torch.cuda` peak memory stats; on CPU those keys are absent. Open
-`run_metrics.json` after a run for actual numbers; the per-recipe
-`expected_metrics.md` files describe what to look for, not measured
-benchmarks.
+Every training recipe writes `run_metrics.json` into the final
+checkpoint directory and copies it into the recipe save directory. On
+CUDA the file records `max_memory_allocated_gb` and
+`max_memory_reserved_gb` from `torch.cuda` peak memory statistics. On
+CPU those keys are simply absent rather than zeroed. The convention
+across the lab is that `run_metrics.json` carries the actual measured
+numbers, while each recipe's `expected_metrics.md` describes the shape
+of the curve and what to read from it. The two documents complement
+each other: one says what happened, the other says what should have
+happened and why.

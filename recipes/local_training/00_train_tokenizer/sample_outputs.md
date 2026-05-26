@@ -7,6 +7,8 @@ Saved checkpoints/local_training/tokenizer.json (vocab=4096)
   "Once upon a time there was a little girl named Lily." -> 14 tokens, roundtrip OK
 ```
 
-Numbers will vary with the dataset slice and tokenizer type; the shape is
-what matters. WordPiece prints `decodes as "..."` instead of `roundtrip OK`
-because its WordPiece detokenizer is not a strict inverse.
+The exact character count and token count vary with the dataset slice
+and the tokenizer family. The shape of the three lines is what matters
+for sanity. WordPiece is the one exception worth flagging again: it
+prints `decodes as "..."` in place of `roundtrip OK` because its
+detokenizer is not a strict inverse of the encoder.

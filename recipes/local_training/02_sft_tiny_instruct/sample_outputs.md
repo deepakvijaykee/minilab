@@ -21,4 +21,8 @@ Alpaca: 2000 examples
   A: ...
 ```
 
-The exact answer text is not stable across seeds; the "Q/A" shape is.
+The exact answer text moves seed to seed, which is the expected behavior
+at this scale because the head is undertrained on factual content and
+sampling temperature surfaces that uncertainty. The Q and A scaffolding,
+in contrast, is stable across seeds and is the actual thing this stage
+is trying to install.
