@@ -45,6 +45,9 @@ from minilab.models.transformer_utils import (
     DEFAULT_SPARSE_INDEX_DIM,
     DEFAULT_SPARSE_LOCAL_BLOCKS,
     DEFAULT_SPARSE_TOP_K_BLOCKS,
+    DEFAULT_LIGHTHOUSE_NUM_LEVELS,
+    DEFAULT_LIGHTHOUSE_POOLING_FACTOR,
+    DEFAULT_LIGHTHOUSE_TOP_K,
     DEFAULT_TOP_K_EXPERTS,
     DEFAULT_YARN_BETA_FAST,
     DEFAULT_YARN_BETA_SLOW,
@@ -62,6 +65,7 @@ _MODEL_BUILD_FLAGS = (
     "rope_original_max_seq_len", "rope_partial_rotary_factor", "yarn_beta_fast",
     "yarn_beta_slow", "local_attention_window", "qwen3_next_full_attention_interval",
     "sparse_block_size", "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
+    "lighthouse_num_levels", "lighthouse_pooling_factor", "lighthouse_top_k",
     "attention_k_eq_v", "per_layer_embedding_dim", "final_logit_softcap",
     "connection", "ffn", "num_experts", "top_k_experts", "post_norm",
     "mtp_depth", "mtp_loss_weight", "mtp_mode",
@@ -86,6 +90,9 @@ _GPT_ONLY_BUILD_FLAGS = (
     "sparse_top_k_blocks",
     "sparse_local_blocks",
     "sparse_index_dim",
+    "lighthouse_num_levels",
+    "lighthouse_pooling_factor",
+    "lighthouse_top_k",
     "per_layer_embedding_dim",
     "connection",
     "mtp_depth",
@@ -134,6 +141,9 @@ p.add_argument("--sparse-block-size", type=int, default=None)
 p.add_argument("--sparse-top-k-blocks", type=int, default=None)
 p.add_argument("--sparse-local-blocks", type=int, default=None)
 p.add_argument("--sparse-index-dim", type=int, default=None, help="0 uses the attention head dimension")
+p.add_argument("--lighthouse-num-levels", type=int, default=None)
+p.add_argument("--lighthouse-pooling-factor", type=int, default=None)
+p.add_argument("--lighthouse-top-k", type=int, default=None)
 p.add_argument("--attention-k-eq-v", action="store_true", default=None)
 p.add_argument("--per-layer-embedding-dim", type=int, default=None)
 p.add_argument("--final-logit-softcap", type=float, default=None)
@@ -225,6 +235,9 @@ sparse_block_size = resolve_default(args.sparse_block_size, DEFAULT_SPARSE_BLOCK
 sparse_top_k_blocks = resolve_default(args.sparse_top_k_blocks, DEFAULT_SPARSE_TOP_K_BLOCKS)
 sparse_local_blocks = resolve_default(args.sparse_local_blocks, DEFAULT_SPARSE_LOCAL_BLOCKS)
 sparse_index_dim = resolve_default(args.sparse_index_dim, DEFAULT_SPARSE_INDEX_DIM)
+lighthouse_num_levels = resolve_default(args.lighthouse_num_levels, DEFAULT_LIGHTHOUSE_NUM_LEVELS)
+lighthouse_pooling_factor = resolve_default(args.lighthouse_pooling_factor, DEFAULT_LIGHTHOUSE_POOLING_FACTOR)
+lighthouse_top_k = resolve_default(args.lighthouse_top_k, DEFAULT_LIGHTHOUSE_TOP_K)
 attention_k_eq_v = resolve_default(args.attention_k_eq_v, False)
 per_layer_embedding_dim = resolve_default(args.per_layer_embedding_dim, 0)
 final_logit_softcap = resolve_default(args.final_logit_softcap, 0.0)
@@ -278,6 +291,15 @@ if (
     require(
         attention == "learned_block_gqa",
         "--sparse-* flags only apply to --attention learned_block_gqa",
+    )
+if (
+    args.lighthouse_num_levels is not None
+    or args.lighthouse_pooling_factor is not None
+    or args.lighthouse_top_k is not None
+):
+    require(
+        model_name == "gpt" and attention == "lighthouse_mha",
+        "--lighthouse-* flags only apply to --model gpt --attention lighthouse_mha",
     )
 if args.rope_base is not None:
     require(position in {"rope", "yarn_rope"}, "--rope-base only applies to --position rope or yarn_rope")
@@ -381,6 +403,9 @@ else:
         sparse_top_k_blocks=sparse_top_k_blocks,
         sparse_local_blocks=sparse_local_blocks,
         sparse_index_dim=sparse_index_dim,
+        lighthouse_num_levels=lighthouse_num_levels,
+        lighthouse_pooling_factor=lighthouse_pooling_factor,
+        lighthouse_top_k=lighthouse_top_k,
         attention_k_eq_v=attention_k_eq_v,
         per_layer_embedding_dim=per_layer_embedding_dim,
         final_logit_softcap=final_logit_softcap,

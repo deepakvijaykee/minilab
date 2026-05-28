@@ -31,6 +31,7 @@ _UNSUPPORTED_DIFFUSION_ATTENTIONS = {
     "qwen3_next",
     "gemma3",
     "gemma4",
+    "lighthouse_mha",
 }
 
 

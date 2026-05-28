@@ -282,6 +282,8 @@ real, equivalently-sized baselines to compare against rather than
 strawmen.
 
 - Other LM families: Mamba and Mamba-2, Hybrid, Hymba, xLSTM, ByteLatent.
+- Attention ablations: MHA/MQA/GQA, sparse/local/block routes, MLA,
+  compressed attention, and a scoped training-time Lighthouse reference.
 - Diffusion LMs: MDLM, SEDD, D3PM, and block diffusion.
 - Preference-optimization variants: IPO, CPO, ORPO, RePO, and KTO
   alongside DPO and SimPO.
@@ -355,5 +357,3 @@ Package areas:
 
 Core dependencies are `torch`, `numpy`, `regex`, `tqdm`, and `pyyaml`. Optional
 extras add `datasets`, `aim`, `flash-attn`, `pytest`, and `ruff`.
-</content>
-</invoke>

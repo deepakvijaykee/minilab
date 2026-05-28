@@ -28,6 +28,9 @@ DEFAULT_SPARSE_BLOCK_SIZE = 128
 DEFAULT_SPARSE_TOP_K_BLOCKS = 32
 DEFAULT_SPARSE_LOCAL_BLOCKS = 1
 DEFAULT_SPARSE_INDEX_DIM = 0
+DEFAULT_LIGHTHOUSE_NUM_LEVELS = 3
+DEFAULT_LIGHTHOUSE_POOLING_FACTOR = 2
+DEFAULT_LIGHTHOUSE_TOP_K = 32
 DEFAULT_NUM_EXPERTS = 8
 DEFAULT_TOP_K_EXPERTS = 2
 
@@ -57,7 +60,18 @@ def validate_fixed_rope_transformer_config(config, owner):
     require(config.max_seq_len > 0, "max_seq_len must be > 0")
     require(0.0 <= config.dropout < 1.0, "dropout must be in [0, 1)")
     require(config.ffn_mult > 0, "ffn_mult must be > 0")
-    require(config.attention not in {"cosformer", "lightning", "gated_deltanet", "gated_deltanet2", "gemma3", "gemma4", "qwen3_next"}, (
+    require(config.attention != "lighthouse_mha", (
+        f"Lighthouse attention is wired through GPT, not {owner}"
+    ))
+    require(config.attention not in {
+        "cosformer",
+        "lightning",
+        "gated_deltanet",
+        "gated_deltanet2",
+        "gemma3",
+        "gemma4",
+        "qwen3_next",
+    }, (
         f"{owner} uses a fixed RoPE transformer; choose a RoPE-compatible attention variant"
     ))
     if attention_uses_gqa(config.attention):
@@ -113,6 +127,9 @@ def _validate_simple_transformer_branch(config, owner):
         require(config.position == "none", f"{config.attention} owns its positional rule; set position='none'")
     if config.attention == "qwen3_next":
         require(config.position == "yarn_rope", f"Qwen3-Next-style {owner} requires position='yarn_rope'")
+    require(config.attention != "lighthouse_mha", (
+        f"Lighthouse attention is wired through GPT, not {owner}"
+    ))
 
     resolved_attention = resolve_deepseek_v4_attention(config.attention, 0)
     uses_local_window = config.attention in _LOCAL_WINDOW_ATTENTIONS or resolved_attention in _LOCAL_WINDOW_ATTENTIONS

@@ -29,6 +29,12 @@ VARIANTS = [
     ("IHA", {"attention": "iha"}),
     ("Sliding", {"attention": "sliding_window"}),
     ("BlockSparse", {"attention": "block_sparse"}),
+    ("Lighthouse MHA", {
+        "attention": "lighthouse_mha",
+        "lighthouse_num_levels": 2,
+        "lighthouse_pooling_factor": 2,
+        "lighthouse_top_k": 32,
+    }),
     ("cosFormer", {"attention": "cosformer", "position": "none"}),
     ("Lightning", {"attention": "lightning", "position": "none"}),
     ("Gated DeltaNet-2", {"attention": "gated_deltanet2", "position": "none"}),

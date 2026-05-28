@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,9 @@ from minilab.models.transformer_utils import (
     DEFAULT_SPARSE_INDEX_DIM,
     DEFAULT_SPARSE_LOCAL_BLOCKS,
     DEFAULT_SPARSE_TOP_K_BLOCKS,
+    DEFAULT_LIGHTHOUSE_NUM_LEVELS,
+    DEFAULT_LIGHTHOUSE_POOLING_FACTOR,
+    DEFAULT_LIGHTHOUSE_TOP_K,
     DEFAULT_TOP_K_EXPERTS,
     DEFAULT_YARN_BETA_FAST,
     DEFAULT_YARN_BETA_SLOW,
@@ -57,6 +60,23 @@ _CACHE_ATTENTIONS = {
     "gqa_qknorm",
     "gqa_qknorm_partial_rope",
     "gqa_qknorm_kv_tied",
+}
+_GPT_COMPAT_DEFAULT_FIELDS = {
+    "sparse_block_size",
+    "sparse_top_k_blocks",
+    "sparse_local_blocks",
+    "sparse_index_dim",
+    "lighthouse_num_levels",
+    "lighthouse_pooling_factor",
+    "lighthouse_top_k",
+    "mtp_mode",
+    "layerskip_loss_weight",
+    "layerskip_dropout",
+    "layerskip_min_layer",
+    "future_summary_window",
+    "future_summary_loss_weight",
+    "jacobi_loss_weight",
+    "jacobi_iterations",
 }
 
 
@@ -94,6 +114,9 @@ class GPTConfig(BaseConfig):
     sparse_top_k_blocks: int = DEFAULT_SPARSE_TOP_K_BLOCKS
     sparse_local_blocks: int = DEFAULT_SPARSE_LOCAL_BLOCKS
     sparse_index_dim: int = DEFAULT_SPARSE_INDEX_DIM
+    lighthouse_num_levels: int = DEFAULT_LIGHTHOUSE_NUM_LEVELS
+    lighthouse_pooling_factor: int = DEFAULT_LIGHTHOUSE_POOLING_FACTOR
+    lighthouse_top_k: int = DEFAULT_LIGHTHOUSE_TOP_K
     attention_k_eq_v: bool = False
     per_layer_embedding_dim: int = 0
     final_logit_softcap: float = 0.0
@@ -107,6 +130,21 @@ class GPTConfig(BaseConfig):
     future_summary_loss_weight: float = 0.0
     jacobi_loss_weight: float = 0.0
     jacobi_iterations: int = 0
+
+    @classmethod
+    def from_dict(cls, d):
+        require(isinstance(d, dict), f"{cls.__name__} config must be a JSON object")
+        valid = set(cls.__dataclass_fields__)
+        provided = set(d)
+        unknown = provided - valid
+        missing = valid - provided
+        require(not unknown, f"Unknown {cls.__name__} fields: {sorted(unknown)}")
+        remaining = missing - _GPT_COMPAT_DEFAULT_FIELDS
+        require(not remaining, f"Missing {cls.__name__} fields: {sorted(remaining)}")
+        data = dict(d)
+        for name in sorted(missing & _GPT_COMPAT_DEFAULT_FIELDS):
+            data[name] = _dataclass_default(cls, name)
+        return cls(**data)
 
     def __post_init__(self):
         if self.num_kv_heads is None:
@@ -143,6 +181,9 @@ class GPTConfig(BaseConfig):
         require(self.sparse_top_k_blocks >= 0, "sparse_top_k_blocks must be >= 0")
         require(self.sparse_local_blocks >= 0, "sparse_local_blocks must be >= 0")
         require(self.sparse_index_dim >= 0, "sparse_index_dim must be >= 0")
+        require(self.lighthouse_num_levels > 0, "lighthouse_num_levels must be > 0")
+        require(self.lighthouse_pooling_factor > 1, "lighthouse_pooling_factor must be > 1")
+        require(self.lighthouse_top_k > 0, "lighthouse_top_k must be > 0")
         require(self.per_layer_embedding_dim >= 0, "per_layer_embedding_dim must be >= 0")
         require(self.final_logit_softcap >= 0, "final_logit_softcap must be >= 0")
         require(self.mtp_depth >= 0, "mtp_depth must be >= 0")
@@ -192,6 +233,10 @@ class GPTConfig(BaseConfig):
         if self.attention == "qwen3_next":
             require(self.position in {"qwen3_next_rope", "yarn_rope"}, (
                 "Qwen3-Next-style schedule requires position='qwen3_next_rope' or 'yarn_rope'"
+            ))
+        if self.attention == "lighthouse_mha":
+            require(self.position not in _BIAS_POSITIONS, (
+                "Lighthouse attention does not support additive attention-bias positions"
             ))
         resolved_attention = resolve_deepseek_v4_attention(self.attention, 0)
         qwen_rope_attention = (
@@ -245,6 +290,7 @@ class GPTConfig(BaseConfig):
             or self.position in {"gemma4_rope", "qwen3_next_rope"}
         )
         uses_learned_block = resolved_attention == "learned_block_gqa"
+        uses_lighthouse = resolved_attention == "lighthouse_mha"
         require_default_unless(
             self.rope_base,
             DEFAULT_ROPE_BASE,
@@ -325,6 +371,24 @@ class GPTConfig(BaseConfig):
             uses_learned_block,
             "sparse_index_dim only applies to attention='learned_block_gqa'",
         )
+        require_default_unless(
+            self.lighthouse_num_levels,
+            DEFAULT_LIGHTHOUSE_NUM_LEVELS,
+            uses_lighthouse,
+            "lighthouse_num_levels only applies to attention='lighthouse_mha'",
+        )
+        require_default_unless(
+            self.lighthouse_pooling_factor,
+            DEFAULT_LIGHTHOUSE_POOLING_FACTOR,
+            uses_lighthouse,
+            "lighthouse_pooling_factor only applies to attention='lighthouse_mha'",
+        )
+        require_default_unless(
+            self.lighthouse_top_k,
+            DEFAULT_LIGHTHOUSE_TOP_K,
+            uses_lighthouse,
+            "lighthouse_top_k only applies to attention='lighthouse_mha'",
+        )
         require(
             not self.attention_k_eq_v or self.attention == "gemma4",
             "attention_k_eq_v only applies to attention='gemma4'",
@@ -380,16 +444,15 @@ def _build_transformer_attention(config, block_id):
                 rope_fraction=config.rope_partial_rotary_factor,
             )
         elif attention == "learned_block_gqa":
-            index_dim = getattr(config, "sparse_index_dim", DEFAULT_SPARSE_INDEX_DIM)
             attn = attn_cls(
                 config.dim,
                 config.num_heads,
                 config.num_kv_heads,
                 config.dropout,
-                block_size=getattr(config, "sparse_block_size", DEFAULT_SPARSE_BLOCK_SIZE),
-                top_k_blocks=getattr(config, "sparse_top_k_blocks", DEFAULT_SPARSE_TOP_K_BLOCKS),
-                local_blocks=getattr(config, "sparse_local_blocks", DEFAULT_SPARSE_LOCAL_BLOCKS),
-                index_dim=None if index_dim == 0 else index_dim,
+                block_size=config.sparse_block_size,
+                top_k_blocks=config.sparse_top_k_blocks,
+                local_blocks=config.sparse_local_blocks,
+                index_dim=None if config.sparse_index_dim == 0 else config.sparse_index_dim,
             )
         else:
             attn = attn_cls(config.dim, config.num_heads, config.num_kv_heads, config.dropout)
@@ -402,6 +465,15 @@ def _build_transformer_attention(config, block_id):
             config.num_heads,
             config.dropout,
             window_size=config.local_attention_window,
+        )
+    if attention == "lighthouse_mha":
+        return attention, attn_cls(
+            config.dim,
+            config.num_heads,
+            config.dropout,
+            num_levels=config.lighthouse_num_levels,
+            pooling_factor=config.lighthouse_pooling_factor,
+            top_k=config.lighthouse_top_k,
         )
     return attention, attn_cls(config.dim, config.num_heads, config.dropout)
 
@@ -578,6 +650,12 @@ def _resolve_attention_name(config, block_id):
 
 def _is_gemma_global_layer(block_id):
     return (block_id + 1) % 6 == 0
+
+
+def _dataclass_default(cls, name):
+    default = cls.__dataclass_fields__[name].default
+    require(default is not MISSING, f"{cls.__name__}.{name} has no compatibility default")
+    return default
 
 
 class MultiTokenPredictionModule(nn.Module):

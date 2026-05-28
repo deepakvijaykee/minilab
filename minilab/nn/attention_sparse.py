@@ -84,6 +84,187 @@ def _learned_block_attention_bias(q_idx, k_idx, block_size, top_k_blocks, local_
     return _bool_to_additive_bias(allowed.repeat_interleave(kv_group_size, dim=1), dtype)
 
 
+def _lighthouse_metadata(T, num_levels, pooling_factor, device):
+    levels, starts, sizes = [], [], []
+    for level in range(num_levels):
+        size = pooling_factor ** level
+        count = math.ceil(T / size)
+        start = torch.arange(count, device=device, dtype=torch.long) * size
+        levels.append(torch.full((count,), level, device=device, dtype=torch.long))
+        starts.append(start)
+        sizes.append((T - start).clamp(max=size))
+    levels = torch.cat(levels)
+    starts = torch.cat(starts)
+    sizes = torch.cat(sizes)
+    return levels, starts, sizes, starts + sizes - 1
+
+
+def _lighthouse_pyramid(x, num_levels, pooling_factor):
+    B, H, T, D = x.shape
+    pooled = []
+    for level in range(num_levels):
+        size = pooling_factor ** level
+        count = math.ceil(T / size)
+        pad = count * size - T
+        level_x = F.pad(x, (0, 0, 0, pad)) if pad else x
+        summed = level_x.reshape(B, H, count, size, D).sum(dim=3)
+        actual = torch.full((count,), size, device=x.device, dtype=x.dtype)
+        if pad:
+            actual[-1] = size - pad
+        pooled.append(summed / actual.view(1, 1, count, 1))
+    return torch.cat(pooled, dim=2)
+
+
+def _lighthouse_scores(q, k, num_levels, pooling_factor):
+    B, H, T, _ = q.shape
+    base = torch.maximum(q.norm(dim=-1), k.norm(dim=-1)).detach()
+    scores = []
+    for level in range(num_levels):
+        size = pooling_factor ** level
+        count = math.ceil(T / size)
+        pad = count * size - T
+        level_base = F.pad(base, (0, pad), value=float("-inf")) if pad else base
+        scores.append(level_base.reshape(B, H, count, size).amax(dim=-1))
+    return torch.cat(scores, dim=2)
+
+
+def _lighthouse_scatter_range(start, size, T):
+    lo = start + size - 1
+    hi = min(T, start + 2 * size - 1)
+    return lo, hi
+
+
+def _lighthouse_select_indices(scores, levels, starts, sizes, ends, num_levels, top_k, T):
+    level0 = (levels == 0).nonzero(as_tuple=False).squeeze(1)
+    coarsest = (levels == num_levels - 1).nonzero(as_tuple=False).squeeze(1)
+    candidates = (levels != num_levels - 1).nonzero(as_tuple=False).squeeze(1)
+    selected_indices = coarsest.tolist()
+    if candidates.numel() > 0 and top_k > 0:
+        candidate_order = torch.argsort(
+            ends.index_select(0, candidates) * num_levels
+            + levels.index_select(0, candidates)
+        )
+        prefix_top_scores = []
+        for idx in candidates.index_select(0, candidate_order).tolist():
+            # Admit entries when they enter the prefix top-k at their own end.
+            # A later token can add a route, but cannot evict an earlier route.
+            score = float(scores[idx].item())
+            if len(prefix_top_scores) < top_k:
+                prefix_top_scores.append(score)
+                selected_indices.append(idx)
+                continue
+            weakest = min(range(len(prefix_top_scores)), key=lambda i: prefix_top_scores[i])
+            if score > prefix_top_scores[weakest]:
+                prefix_top_scores[weakest] = score
+                selected_indices.append(idx)
+
+    coverage = torch.zeros(T, device=scores.device, dtype=torch.bool)
+    selected = torch.tensor(selected_indices, device=scores.device, dtype=torch.long)
+    for idx in selected.tolist():
+        lo, hi = _lighthouse_scatter_range(int(starts[idx].item()), int(sizes[idx].item()), T)
+        if lo < hi:
+            coverage[lo:hi] = True
+    holes = (~coverage).nonzero(as_tuple=False).squeeze(1)
+    if holes.numel() > 0:
+        # Level-0 entries preserve dense causal outputs where shifted coarse
+        # scatter ranges leave prefix positions uncovered.
+        selected = torch.cat([selected, level0.index_select(0, holes)])
+
+    selected = torch.unique(selected)
+    order = torch.argsort(ends.index_select(0, selected) * num_levels + levels.index_select(0, selected))
+    return selected.index_select(0, order)
+
+
+@register_attention("lighthouse_mha")
+class LighthouseAttention(nn.Module):
+    """Training-time Lighthouse-style MHA reference path.
+
+    This keeps the paper's dataflow visible in PyTorch: symmetric Q/K/V
+    pyramids, parameter-free norm selection, dense SDPA over selected entries,
+    and causal shifted scatter-back. It is not an optimized long-context kernel.
+    """
+
+    def __init__(self, dim, num_heads, dropout=0.0, num_levels=3, pooling_factor=2, top_k=32):
+        super().__init__()
+        require(dim > 0, "dim must be > 0")
+        require(num_heads > 0, "num_heads must be > 0")
+        require(dim % num_heads == 0, "dim must be divisible by num_heads")
+        require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
+        require(num_levels > 0, "num_levels must be > 0")
+        require(pooling_factor > 1, "pooling_factor must be > 1")
+        require(top_k > 0, "top_k must be > 0")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = dropout
+        self.num_levels = num_levels
+        self.pooling_factor = pooling_factor
+        self.top_k = top_k
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
+        require(attn_bias is None, "Lighthouse attention does not support external attention bias")
+        require(is_causal, "Lighthouse attention is a causal training-time attention path")
+        B, T, C = x.shape
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if freqs_cis is not None:
+            q, k = apply_rotary_emb(q, k, *freqs_cis)
+
+        levels, starts, sizes, ends = _lighthouse_metadata(T, self.num_levels, self.pooling_factor, x.device)
+        q_entries = _lighthouse_pyramid(q, self.num_levels, self.pooling_factor)
+        k_entries = _lighthouse_pyramid(k, self.num_levels, self.pooling_factor)
+        v_entries = _lighthouse_pyramid(v, self.num_levels, self.pooling_factor)
+        scores = _lighthouse_scores(q, k, self.num_levels, self.pooling_factor)
+
+        batch_outputs = []
+        for b in range(B):
+            head_outputs = []
+            for h in range(self.num_heads):
+                selected = _lighthouse_select_indices(
+                    scores[b, h],
+                    levels,
+                    starts,
+                    sizes,
+                    ends,
+                    self.num_levels,
+                    self.top_k,
+                    T,
+                )
+                q_sel = q_entries[b, h].index_select(0, selected)
+                k_sel = k_entries[b, h].index_select(0, selected)
+                v_sel = v_entries[b, h].index_select(0, selected)
+                selected_ends = ends.index_select(0, selected)
+                allowed = selected_ends.view(-1, 1) >= selected_ends.view(1, -1)
+                bias = _bool_to_additive_bias(allowed, x.dtype)
+                attended = F.scaled_dot_product_attention(
+                    q_sel.view(1, 1, q_sel.size(0), self.head_dim),
+                    k_sel.view(1, 1, k_sel.size(0), self.head_dim),
+                    v_sel.view(1, 1, v_sel.size(0), self.head_dim),
+                    attn_mask=bias,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
+                ).view(q_sel.size(0), self.head_dim)
+                head_outputs.append(self._scatter_selected(attended, selected, starts, sizes, T))
+            batch_outputs.append(torch.stack(head_outputs, dim=0))
+
+        out = torch.stack(batch_outputs, dim=0)
+        return self.out(out.transpose(1, 2).reshape(B, T, C))
+
+    def _scatter_selected(self, attended, selected, starts, sizes, T):
+        out = attended.new_zeros(T, self.head_dim)
+        for row, idx in enumerate(selected.tolist()):
+            lo, hi = _lighthouse_scatter_range(int(starts[idx].item()), int(sizes[idx].item()), T)
+            if lo < hi:
+                positions = torch.arange(lo, hi, device=attended.device)
+                out.index_add_(0, positions, attended[row].expand(hi - lo, -1))
+        return out
+
+
 @register_attention("iha")
 class InterleavedHeadAttention(nn.Module):
     """Cross-head mixing: each pseudo Q/K is a learned linear combination of all H original Q/K."""
