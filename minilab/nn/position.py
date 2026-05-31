@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
 from minilab.registry import register_position
 
 
@@ -14,6 +14,11 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(self, dim, max_seq_len, base=10000.0):
         super().__init__()
+        require_integer(dim, "RoPE dim")
+        require_integer(max_seq_len, "RoPE max_seq_len")
+        require_finite_number(dim, "RoPE dim")
+        require_finite_number(max_seq_len, "RoPE max_seq_len")
+        require_finite_number(base, "RoPE base")
         require(dim > 0, "RoPE dim must be > 0")
         require(dim % 2 == 0, f"RoPE requires even dim, got {dim}")
         require(max_seq_len > 0, "RoPE max_seq_len must be > 0")
@@ -23,12 +28,15 @@ class RotaryEmbedding(nn.Module):
         self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len):
+        require_integer(seq_len, "RoPE cache seq_len")
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
     def forward(self, seq_len, offset=0):
+        require_integer(seq_len, "RoPE seq_len")
+        require_integer(offset, "RoPE offset")
         require(offset >= 0, "RoPE offset must be >= 0")
         end = offset + seq_len
         if end > self.cos_cached.size(0):
@@ -46,6 +54,13 @@ class ProportionalRotaryEmbedding(RotaryEmbedding):
 
     def __init__(self, dim, max_seq_len, base=10000.0, partial_rotary_factor=1.0, factor=1.0):
         nn.Module.__init__(self)
+        require_integer(dim, "proportional RoPE dim")
+        require_integer(max_seq_len, "proportional RoPE max_seq_len")
+        require_finite_number(dim, "proportional RoPE dim")
+        require_finite_number(max_seq_len, "proportional RoPE max_seq_len")
+        require_finite_number(base, "proportional RoPE base")
+        require_finite_number(partial_rotary_factor, "partial_rotary_factor")
+        require_finite_number(factor, "proportional RoPE factor")
         require(dim > 0, "proportional RoPE dim must be > 0")
         require(dim % 2 == 0, f"proportional RoPE requires even dim, got {dim}")
         require(max_seq_len > 0, "proportional RoPE max_seq_len must be > 0")
@@ -80,6 +95,19 @@ class YaRNRotaryEmbedding(RotaryEmbedding):
         attention_factor=None,
     ):
         nn.Module.__init__(self)
+        require_integer(dim, "YaRN dim")
+        require_integer(max_seq_len, "YaRN max_seq_len")
+        require_integer(original_max_seq_len, "YaRN original_max_seq_len")
+        for name, value in (
+            ("YaRN dim", dim),
+            ("YaRN max_seq_len", max_seq_len),
+            ("YaRN base", base),
+            ("YaRN factor", factor),
+            ("YaRN original_max_seq_len", original_max_seq_len),
+            ("YaRN beta_fast", beta_fast),
+            ("YaRN beta_slow", beta_slow),
+        ):
+            require_finite_number(value, name)
         require(dim > 0, "YaRN dim must be > 0")
         require(dim % 2 == 0, f"YaRN requires even dim, got {dim}")
         require(max_seq_len > 0, "YaRN max_seq_len must be > 0")
@@ -91,6 +119,7 @@ class YaRNRotaryEmbedding(RotaryEmbedding):
         require(beta_fast > beta_slow, "YaRN beta_fast must be > beta_slow")
         if attention_factor is None:
             attention_factor = 1.0 if factor <= 1.0 else 0.1 * math.log(factor) + 1.0
+        require_finite_number(attention_factor, "YaRN attention_factor")
         require(attention_factor > 0, "YaRN attention_factor must be > 0")
         self.attention_factor = attention_factor
         inv_freq = self._build_yarn_inv_freq(dim, base, factor, original_max_seq_len, beta_fast, beta_slow)
@@ -129,6 +158,10 @@ class NoPosition(nn.Module):
 
     def __init__(self, dim, max_seq_len):
         super().__init__()
+        require_integer(dim, "NoPosition dim")
+        require_integer(max_seq_len, "NoPosition max_seq_len")
+        require_finite_number(dim, "NoPosition dim")
+        require_finite_number(max_seq_len, "NoPosition max_seq_len")
         require(dim > 0, "NoPosition dim must be > 0")
         require(max_seq_len > 0, "NoPosition max_seq_len must be > 0")
 
@@ -143,6 +176,10 @@ class ALiBi(nn.Module):
 
     def __init__(self, num_heads, max_seq_len):
         super().__init__()
+        require_integer(num_heads, "ALiBi num_heads")
+        require_integer(max_seq_len, "ALiBi max_seq_len")
+        require_finite_number(num_heads, "ALiBi num_heads")
+        require_finite_number(max_seq_len, "ALiBi max_seq_len")
         require(num_heads > 0, "ALiBi num_heads must be > 0")
         require(max_seq_len > 0, "ALiBi max_seq_len must be > 0")
         slopes = self._get_slopes(num_heads)
@@ -183,6 +220,17 @@ class T5RelativePositionBias(nn.Module):
 
     def __init__(self, num_heads, max_seq_len, num_buckets=32, max_distance=128):
         super().__init__()
+        require_integer(num_heads, "T5 relative bias num_heads")
+        require_integer(max_seq_len, "T5 relative bias max_seq_len")
+        require_integer(num_buckets, "T5 relative bias num_buckets")
+        require_integer(max_distance, "T5 relative bias max_distance")
+        for name, value in (
+            ("T5 relative bias num_heads", num_heads),
+            ("T5 relative bias max_seq_len", max_seq_len),
+            ("T5 relative bias num_buckets", num_buckets),
+            ("T5 relative bias max_distance", max_distance),
+        ):
+            require_finite_number(value, name)
         require(num_heads > 0, "T5 relative bias num_heads must be > 0")
         require(max_seq_len > 0, "T5 relative bias max_seq_len must be > 0")
         require(num_buckets > 1, "T5 relative bias num_buckets must be > 1")
@@ -229,6 +277,10 @@ class _KERPLEBase(nn.Module):
 
     def __init__(self, num_heads, max_seq_len):
         super().__init__()
+        require_integer(num_heads, "KERPLE num_heads")
+        require_integer(max_seq_len, "KERPLE max_seq_len")
+        require_finite_number(num_heads, "KERPLE num_heads")
+        require_finite_number(max_seq_len, "KERPLE max_seq_len")
         require(num_heads > 0, "KERPLE num_heads must be > 0")
         require(max_seq_len > 0, "KERPLE max_seq_len must be > 0")
         init = math.log(math.expm1(1.0))
@@ -288,6 +340,10 @@ class LearnedPosition(nn.Module):
 
     def __init__(self, dim, max_seq_len):
         super().__init__()
+        require_integer(dim, "learned position dim")
+        require_integer(max_seq_len, "learned position max_seq_len")
+        require_finite_number(dim, "learned position dim")
+        require_finite_number(max_seq_len, "learned position max_seq_len")
         require(dim > 0, "learned position dim must be > 0")
         require(max_seq_len > 0, "learned position max_seq_len must be > 0")
         self.emb = nn.Embedding(max_seq_len, dim)
@@ -305,6 +361,10 @@ class SinusoidalPosition(nn.Module):
 
     def __init__(self, dim, max_seq_len):
         super().__init__()
+        require_integer(dim, "sinusoidal position dim")
+        require_integer(max_seq_len, "sinusoidal position max_seq_len")
+        require_finite_number(dim, "sinusoidal position dim")
+        require_finite_number(max_seq_len, "sinusoidal position max_seq_len")
         require(dim > 0, "sinusoidal position dim must be > 0")
         require(dim % 2 == 0, f"sinusoidal position requires even dim, got {dim}")
         require(max_seq_len > 0, "sinusoidal position max_seq_len must be > 0")

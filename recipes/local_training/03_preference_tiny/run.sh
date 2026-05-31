@@ -24,16 +24,23 @@ python scripts/estimate_vram.py \
   --seq-len "$SEQ_LEN" \
   --batch-size "$BATCH_SIZE"
 
-python scripts/preference.py \
-  --algorithm "$ALGORITHM" \
-  --dataset "$DATASET" \
-  --tokenizer "$TOKENIZER" \
-  --checkpoint "$SFT_CHECKPOINT" \
-  --save-dir "$SAVE_DIR" \
-  --seq-len "$SEQ_LEN" \
-  --max-steps "$MAX_STEPS" \
-  --warmup-steps "$WARMUP_STEPS" \
-  --batch-size "$BATCH_SIZE" \
-  --lr "$LR" \
-  --beta "$BETA" \
+cmd=(
+  python scripts/preference.py
+  --algorithm "$ALGORITHM"
+  --dataset "$DATASET"
+  --tokenizer "$TOKENIZER"
+  --checkpoint "$SFT_CHECKPOINT"
+  --save-dir "$SAVE_DIR"
+  --seq-len "$SEQ_LEN"
+  --max-steps "$MAX_STEPS"
+  --warmup-steps "$WARMUP_STEPS"
+  --batch-size "$BATCH_SIZE"
+  --lr "$LR"
   --max-examples "$MAX_EXAMPLES"
+)
+
+if [[ "$ALGORITHM" != "repo" ]]; then
+  cmd+=(--beta "$BETA")
+fi
+
+"${cmd[@]}"

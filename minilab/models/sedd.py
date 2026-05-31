@@ -16,6 +16,7 @@ from minilab.models.diffusion_base import (
     loss_normalizer,
     supervised_diffusion_mask,
     validate_clean_tokens,
+    validate_infill_tokens,
     validate_loss_mask,
 )
 from minilab.registry import register_model
@@ -43,6 +44,7 @@ class SEDD(DiffusionBackboneMixin, BaseModel):
         return (self.tok_emb, self.score_head)
 
     def forward(self, z_t, t):
+        validate_infill_tokens(z_t, z_t == self.mask_token_id, self.config, "SEDD forward")
         x = self._diffusion_backbone_forward(z_t, t, "SEDD")
         scores = self.score_head(x)
         return scores.scatter(-1, z_t.unsqueeze(-1), torch.zeros_like(scores[..., :1]))

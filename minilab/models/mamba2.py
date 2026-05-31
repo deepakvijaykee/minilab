@@ -2,8 +2,8 @@ from dataclasses import dataclass
 
 import torch.nn as nn
 
-from minilab.base import BaseModel
-from minilab.checks import require
+from minilab.base import BaseModel, validate_token_ids
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.nn.norm import RMSNorm
 from minilab.nn.ssm import Mamba2Mixer
@@ -29,6 +29,15 @@ class Mamba2Config(BaseConfig):
     A_init_max: float = 16.0
 
     def __post_init__(self):
+        require_finite_fields(self, (
+            "vocab_size", "dim", "num_layers", "max_seq_len", "dropout",
+            "d_state", "d_conv", "expand", "headdim", "ngroups", "dt_min",
+            "dt_max", "dt_init_floor", "A_init_min", "A_init_max",
+        ))
+        require_integer_fields(self, (
+            "vocab_size", "dim", "num_layers", "max_seq_len",
+            "d_state", "d_conv", "expand", "headdim", "ngroups",
+        ))
         require(self.vocab_size > 0, "vocab_size must be > 0")
         require(self.dim > 0, "dim must be > 0")
         require(self.num_layers > 0, "num_layers must be > 0")
@@ -96,9 +105,7 @@ class Mamba2LM(BaseModel):
         return self._causal_lm_forward(idx, targets)
 
     def forward_hidden(self, idx):
-        require(idx.size(1) <= self.config.max_seq_len, (
-            f"Mamba2LM supports at most {self.config.max_seq_len} tokens, got {idx.size(1)}"
-        ))
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "Mamba2LM")
         x = self._cast_hidden(self.tok_emb(idx))
         x = self.drop(x)
         for block in self.blocks:

@@ -1,6 +1,6 @@
 import torch
 
-from minilab.checks import require
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.nn.architecture import (
     GQA_ATTENTIONS,
     MOE_FFNS,
@@ -51,6 +51,15 @@ def validate_fixed_rope_transformer_config(config, owner):
     """Shared contract for small stacks that always use full-context RoPE."""
     if config.num_kv_heads is None:
         config.num_kv_heads = config.num_heads
+    require_finite_fields(config, (
+        "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads", "max_seq_len",
+        "dropout", "ffn_mult", "num_experts", "top_k_experts",
+    ))
+    require_integer_fields(config, (
+        "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+        "max_seq_len", "num_experts", "top_k_experts",
+    ))
+    require(config.vocab_size > 0, "vocab_size must be > 0")
     require(config.dim > 0, "dim must be > 0")
     require(config.num_layers > 0, "num_layers must be > 0")
     require(config.num_heads > 0, "num_heads must be > 0")
@@ -82,6 +91,18 @@ def validate_fixed_rope_transformer_config(config, owner):
 
 
 def _validate_simple_lm_fields(config):
+    require_finite_fields(config, (
+        "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads", "max_seq_len",
+        "dropout", "ffn_mult", "num_experts", "top_k_experts", "rope_base",
+        "rope_scaling_factor", "rope_original_max_seq_len", "rope_partial_rotary_factor",
+        "yarn_beta_fast", "yarn_beta_slow", "local_attention_window",
+        "qwen3_next_full_attention_interval", "final_logit_softcap",
+    ))
+    require_integer_fields(config, (
+        "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+        "max_seq_len", "num_experts", "top_k_experts", "rope_original_max_seq_len",
+        "local_attention_window", "qwen3_next_full_attention_interval",
+    ))
     require(config.vocab_size > 0, "vocab_size must be > 0")
     require(config.dim > 0, "dim must be > 0")
     require(config.num_layers > 0, "num_layers must be > 0")

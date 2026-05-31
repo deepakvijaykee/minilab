@@ -48,10 +48,18 @@ class HFTokenizer(BaseTokenizer):
                 "HF tokenizer support requires transformers. "
                 "Install with: python -m pip install -e \".[hf]\""
             ) from exc
-        self._tokenizer = AutoTokenizer.from_pretrained(str(self._resolved_path()))
+        resolved_path = self._resolved_path()
+        expected_vocab_size = self._vocab_size
+        self._tokenizer = AutoTokenizer.from_pretrained(str(resolved_path))
         if self._tokenizer.pad_token_id is None and self._tokenizer.eos_token is not None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
-        self._vocab_size = len(self._tokenizer)
+        actual_vocab_size = len(self._tokenizer)
+        require(expected_vocab_size in (0, actual_vocab_size), (
+            "HF tokenizer vocab_size mismatch: "
+            f"state declares {expected_vocab_size}, but tokenizer at {resolved_path} has {actual_vocab_size}. "
+            "Use the tokenizer directory that was saved with this Minilab tokenizer state."
+        ))
+        self._vocab_size = actual_vocab_size
 
     def encode(self, text):
         self._ensure_loaded()

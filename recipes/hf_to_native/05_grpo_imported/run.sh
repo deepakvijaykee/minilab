@@ -19,17 +19,24 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-64}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-100}"
 EVAL_EXAMPLES="${EVAL_EXAMPLES:-20}"
 
-python scripts/grpo.py \
-  --algorithm "$ALGORITHM" \
-  --tokenizer "$TOKENIZER" \
-  --checkpoint "$POLICY_CHECKPOINT" \
-  --save-dir "$SAVE_DIR" \
-  --seq-len "$SEQ_LEN" \
-  --max-steps "$MAX_STEPS" \
-  --warmup-steps "$WARMUP_STEPS" \
-  --batch-size "$BATCH_SIZE" \
-  --lr "$LR" \
-  --num-generations "$NUM_GENERATIONS" \
-  --max-new-tokens "$MAX_NEW_TOKENS" \
-  --max-examples "$MAX_EXAMPLES" \
+cmd=(
+  python scripts/grpo.py
+  --algorithm "$ALGORITHM"
+  --tokenizer "$TOKENIZER"
+  --checkpoint "$POLICY_CHECKPOINT"
+  --save-dir "$SAVE_DIR"
+  --seq-len "$SEQ_LEN"
+  --max-steps "$MAX_STEPS"
+  --warmup-steps "$WARMUP_STEPS"
+  --batch-size "$BATCH_SIZE"
+  --lr "$LR"
+  --max-new-tokens "$MAX_NEW_TOKENS"
+  --max-examples "$MAX_EXAMPLES"
   --eval-examples "$EVAL_EXAMPLES"
+)
+
+if [[ "$ALGORITHM" != "ppo" ]]; then
+  cmd+=(--num-generations "$NUM_GENERATIONS")
+fi
+
+"${cmd[@]}"

@@ -61,7 +61,7 @@ p.add_argument("--warmup-steps", type=int, default=100)
 p.add_argument("--save-every", type=int, default=0, help="periodic save interval (0 = save once at end)")
 p.add_argument("--batch-size", type=int, default=8)
 p.add_argument("--lr", type=float, default=1e-5)
-p.add_argument("--beta", type=float, default=0.1)
+p.add_argument("--beta", type=float, default=None, help="defaults to 0.1 for beta-based preference objectives")
 p.add_argument("--cpo-alpha", type=float, default=None, help="defaults to 1.0 for CPO")
 p.add_argument("--simpo-gamma", type=float, default=None, help="defaults to 0.5 for SimPO")
 p.add_argument("--repo-margin", type=float, default=None, help="defaults to 0.5 for RePO")
@@ -78,9 +78,12 @@ if args.algorithm != "simpo":
     require(args.simpo_gamma is None, "--simpo-gamma only applies to --algorithm simpo")
 if args.algorithm != "repo":
     require(args.repo_margin is None, "--repo-margin only applies to --algorithm repo")
+else:
+    require(args.beta is None, "--beta does not apply to --algorithm repo")
 if args.algorithm != "kto":
     require(args.kto_desirable_weight is None, "--kto-desirable-weight only applies to --algorithm kto")
     require(args.kto_undesirable_weight is None, "--kto-undesirable-weight only applies to --algorithm kto")
+beta = resolve_default(args.beta, 0.1)
 cpo_alpha = resolve_default(args.cpo_alpha, 1.0)
 simpo_gamma = resolve_default(args.simpo_gamma, 0.5)
 repo_margin = resolve_default(args.repo_margin, 0.5)
@@ -122,30 +125,30 @@ sig = run_signature(tok, {"name": args.dataset, "algorithm": args.algorithm, "ma
 tok_sig = tokenizer_signature(tok)
 
 if args.algorithm == "dpo":
-    tc = DPOTrainConfig(dpo_beta=args.beta, **base_kwargs)
+    tc = DPOTrainConfig(dpo_beta=beta, **base_kwargs)
     trainer = DPOTrainer(model, ds, tc, ref_model_path=ref_path, signature=sig, tokenizer_sig=tok_sig)
 elif args.algorithm == "ipo":
-    tc = DPOTrainConfig(dpo_beta=args.beta, **base_kwargs)
+    tc = DPOTrainConfig(dpo_beta=beta, **base_kwargs)
     trainer = IPOTrainer(model, ds, tc, ref_model_path=ref_path, signature=sig, tokenizer_sig=tok_sig)
 elif args.algorithm == "kto":
     tc = KTOTrainConfig(
-        dpo_beta=args.beta,
+        dpo_beta=beta,
         kto_desirable_weight=kto_desirable_weight,
         kto_undesirable_weight=kto_undesirable_weight,
         **base_kwargs,
     )
     trainer = KTOTrainer(model, ds, tc, ref_model_path=ref_path, signature=sig, tokenizer_sig=tok_sig)
 elif args.algorithm == "orpo":
-    tc = ORPOTrainConfig(orpo_beta=args.beta, **base_kwargs)
+    tc = ORPOTrainConfig(orpo_beta=beta, **base_kwargs)
     trainer = ORPOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)
 elif args.algorithm == "cpo":
-    tc = CPOTrainConfig(dpo_beta=args.beta, cpo_alpha=cpo_alpha, **base_kwargs)
+    tc = CPOTrainConfig(dpo_beta=beta, cpo_alpha=cpo_alpha, **base_kwargs)
     trainer = CPOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)
 elif args.algorithm == "repo":
     tc = RePOTrainConfig(repo_margin=repo_margin, **base_kwargs)
     trainer = RePOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)
 else:
-    tc = SimPOTrainConfig(dpo_beta=args.beta, simpo_gamma=simpo_gamma, **base_kwargs)
+    tc = SimPOTrainConfig(dpo_beta=beta, simpo_gamma=simpo_gamma, **base_kwargs)
     trainer = SimPOTrainer(model, ds, tc, signature=sig, tokenizer_sig=tok_sig)
 
 trainer.train()

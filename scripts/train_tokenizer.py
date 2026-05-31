@@ -14,6 +14,7 @@ from minilab.tokenizers import available_tokenizers, build_tokenizer
 from minilab.tokenizers.byte import BYTE_VOCAB_SIZE
 
 _VERBOSE_TOKENIZERS = {"bpe", "unigram", "wordpiece"}
+_TRAINABLE_TOKENIZERS = tuple(name for name in available_tokenizers() if name != "hf")
 
 
 def _load_tokenizer_corpus(dataset, num_texts):
@@ -42,7 +43,7 @@ def _load_tokenizer_corpus(dataset, num_texts):
 
 
 p = argparse.ArgumentParser()
-p.add_argument("--type", choices=available_tokenizers(), default="bpe")
+p.add_argument("--type", choices=_TRAINABLE_TOKENIZERS, default="bpe")
 p.add_argument("--dataset", choices=PRETRAIN_DATASET_CHOICES, default=None)
 p.add_argument("--vocab-size", type=int, default=None)
 p.add_argument("--num-texts", type=int, default=None)

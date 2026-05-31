@@ -13,15 +13,15 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from minilab.base import BaseModel, apply_conditional_diffusion_mask, unwrap_model
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.diffusion import forward_process_signature
-from minilab.nn.optimizers import Lion, Muon
+from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER, Lion, Muon
 from minilab.registry import register_trainer
 
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-_OPTIMIZERS = {"adamw", "lion", "muon"}
+_OPTIMIZERS = {"adamw", "lion", "muon", "soft_muon"}
 _LR_SCHEDULES = {"cosine", "linear", "constant", "wsd"}
 _DECAYING_LR_SCHEDULES = {"cosine", "linear", "wsd"}
 
@@ -32,6 +32,7 @@ class TrainConfig(BaseConfig):
     batch_size: int = 32
     lr: float = 3e-4
     muon_lr: float = 0.02
+    soft_muon_power: float = DEFAULT_SOFT_MUON_POWER
     weight_decay: float = 0.1
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
@@ -52,12 +53,28 @@ class TrainConfig(BaseConfig):
     resume_from: str = ""
     token_superposition_size: int = 1
     token_superposition_steps: int = 0
+    rl_metrics_every: int = 0
+    rl_trace_samples: int = 0
 
     def __post_init__(self):
+        require_integer_fields(self, (
+            "max_steps", "batch_size", "warmup_steps", "grad_accum_steps", "seed",
+            "log_every", "eval_every", "save_every", "eval_steps",
+            "token_superposition_size", "token_superposition_steps",
+            "rl_metrics_every", "rl_trace_samples",
+        ))
+        for name in (
+            "lr", "muon_lr", "soft_muon_power", "weight_decay", "max_grad_norm",
+            "qk_clip_threshold", "qk_clip_balance",
+        ):
+            require_finite_number(getattr(self, name), name)
         require(self.max_steps > 0, "max_steps must be > 0")
         require(self.batch_size > 0, "batch_size must be > 0")
         require(self.lr >= 0, "lr must be >= 0")
         require(self.muon_lr >= 0, "muon_lr must be >= 0")
+        require(self.soft_muon_power == DEFAULT_SOFT_MUON_POWER, (
+            "soft_muon_power currently supports the fixed p=0.4 coefficient profile"
+        ))
         require(self.weight_decay >= 0, "weight_decay must be >= 0")
         require(self.warmup_steps >= 0, "warmup_steps must be >= 0")
         require(self.max_grad_norm > 0, "max_grad_norm must be > 0")
@@ -73,6 +90,8 @@ class TrainConfig(BaseConfig):
         require(self.eval_steps > 0, "eval_steps must be > 0")
         require(self.token_superposition_size > 0, "token_superposition_size must be > 0")
         require(self.token_superposition_steps >= 0, "token_superposition_steps must be >= 0")
+        require(self.rl_metrics_every >= 0, "rl_metrics_every must be >= 0")
+        require(self.rl_trace_samples >= 0, "rl_trace_samples must be >= 0")
         require(self.token_superposition_size == 1 or self.token_superposition_steps > 0, (
             "token_superposition_size > 1 requires token_superposition_steps > 0"
         ))
@@ -132,7 +151,7 @@ def optimizer_decay_groups(model, params, weight_decay):
 _RESUME_CRITICAL_CONFIG_FIELDS = (
     "batch_size", "lr", "weight_decay", "warmup_steps",
     "max_grad_norm", "grad_accum_steps", "dtype", "optimizer", "lr_schedule", "seed",
-    "muon_lr", "qk_clip_threshold", "qk_clip_balance",
+    "muon_lr", "soft_muon_power", "qk_clip_threshold", "qk_clip_balance",
     "token_superposition_size", "token_superposition_steps",
 )
 
@@ -153,6 +172,16 @@ def run_signature(tokenizer, dataset_desc, seq_len):
         "seq_len": seq_len,
     }, sort_keys=True).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def _fill_legacy_resume_defaults(saved_cfg, current_values):
+    if "soft_muon_power" in saved_cfg:
+        return
+    if current_values["soft_muon_power"] != DEFAULT_SOFT_MUON_POWER:
+        return
+    if "optimizer" in saved_cfg and saved_cfg["optimizer"] == "soft_muon":
+        return
+    saved_cfg["soft_muon_power"] = DEFAULT_SOFT_MUON_POWER
 
 
 def validate_checkpoint_tokenizer(checkpoint, tokenizer):
@@ -258,13 +287,15 @@ class Trainer:
             f"Current={self.signature[:12]}..."
         ))
         self._resume_scheduler_total_steps = saved_meta["scheduler_total_steps"]
+        require_integer(self._resume_scheduler_total_steps, "scheduler_total_steps")
         require(self._resume_scheduler_total_steps > 0, "scheduler_total_steps must be > 0")
         saved_cfg = saved_meta["config"]
         require(isinstance(saved_cfg, dict), f"Resume config metadata at {meta_path} must be a JSON object")
         critical = _RESUME_CRITICAL_CONFIG_FIELDS + type(self)._extra_critical_fields
+        current_values = self.config.to_dict()
+        _fill_legacy_resume_defaults(saved_cfg, current_values)
         missing_critical = [k for k in critical if k not in saved_cfg]
         require(not missing_critical, f"Resume metadata missing critical config fields: {missing_critical}")
-        current_values = self.config.to_dict()
         mismatches = []
         for k in critical:
             saved_value = saved_cfg[k]
@@ -334,13 +365,33 @@ class Trainer:
 
     def _build_optimizer(self):
         model = unwrap_model(self.model)
-        if self.config.optimizer == "muon":
+        if self.config.optimizer in {"muon", "soft_muon"}:
             hidden, aux_matrices, biases = model.muon_parameter_groups()
+            soft_muon = self.config.optimizer == "soft_muon"
             return Muon([
-                {"params": hidden, "use_muon": True, "lr": self.config.muon_lr, "weight_decay": self.config.weight_decay},
-                {"params": aux_matrices, "use_muon": False, "lr": self.config.lr, "weight_decay": self.config.weight_decay},
-                {"params": biases, "use_muon": False, "lr": self.config.lr, "weight_decay": 0.0},
-            ], lr=self.config.muon_lr)
+                {
+                    "params": hidden,
+                    "use_muon": True,
+                    "soft_muon": soft_muon,
+                    "soft_muon_power": self.config.soft_muon_power,
+                    "lr": self.config.muon_lr,
+                    "weight_decay": self.config.weight_decay,
+                },
+                {
+                    "params": aux_matrices,
+                    "use_muon": False,
+                    "soft_muon": False,
+                    "lr": self.config.lr,
+                    "weight_decay": self.config.weight_decay,
+                },
+                {
+                    "params": biases,
+                    "use_muon": False,
+                    "soft_muon": False,
+                    "lr": self.config.lr,
+                    "weight_decay": 0.0,
+                },
+            ], lr=self.config.muon_lr, soft_muon=soft_muon, soft_muon_power=self.config.soft_muon_power)
         groups = optimizer_decay_groups(model, self.model.parameters(), self.config.weight_decay)
         if self.config.optimizer == "adamw":
             return torch.optim.AdamW(groups, lr=self.config.lr, betas=(0.9, 0.95))
@@ -527,15 +578,21 @@ class Trainer:
         if Path(self.config.save_dir, "run_metrics.json").exists():
             print(f"  wrote {Path(self.config.save_dir) / 'run_metrics.json'}")
 
+    def _finish_failed_run_metrics(self, exc):
+        return self._finish_run_metrics(
+            "failed",
+            {"type": type(exc).__name__, "message": str(exc)},
+        )
+
     def _run_train_loop_with_metrics(self, loop_fn):
         self._begin_run_metrics()
         try:
             loop_fn()
-        except BaseException as exc:
-            self._finish_run_metrics(
-                "failed",
-                {"type": type(exc).__name__, "message": str(exc)},
-            )
+        except KeyboardInterrupt as exc:
+            self._finish_failed_run_metrics(exc)
+            raise
+        except Exception as exc:
+            self._finish_failed_run_metrics(exc)
             raise
         return self._finish_run_metrics("completed")
 

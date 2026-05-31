@@ -1,8 +1,10 @@
 import torch
 
 from minilab.base import BaseModel, unwrap_model
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
+from minilab.config import BaseConfig
 from minilab.diffusion_sampling import (
+    absorbing_unmask_probability as _absorbing_unmask_probability,
     d3pm_reverse_timesteps,
     dream_remask_step,
     dream_sample_tokens,
@@ -54,7 +56,18 @@ def _sample_next_token(logits, temperature, top_k=0, top_p=1.0):
     return torch.multinomial(logits.softmax(-1), 1)
 
 
-def _require_greedy_verified_decode(prompt_ids, max_new_tokens, max_ctx, context, temperature, repetition_penalty):
+def _require_greedy_verified_decode(
+    prompt_ids,
+    max_new_tokens,
+    max_ctx,
+    context,
+    temperature,
+    top_k,
+    top_p,
+    repetition_penalty,
+):
+    require_integer(max_new_tokens, "max_new_tokens")
+    require_integer(top_k, "top_k")
     require(prompt_ids.size(0) == 1, f"{context} currently supports batch_size=1")
     require(prompt_ids.size(1) > 0, f"{context} requires a non-empty prompt")
     require(max_new_tokens >= 0, "max_new_tokens must be >= 0")
@@ -62,7 +75,33 @@ def _require_greedy_verified_decode(prompt_ids, max_new_tokens, max_ctx, context
         f"{context} requires prompt length + max_new_tokens <= max_seq_len"
     ))
     require(temperature == 0, f"{context} currently supports exact greedy decoding only")
+    require(top_k == 0, f"{context} does not support top_k")
+    require(top_p == 1.0, f"{context} does not support top_p")
     require(repetition_penalty == 1.0, f"{context} does not support repetition_penalty")
+
+
+def _validate_prompt_token_ids(prompt_ids, vocab_size, context):
+    require(torch.is_tensor(prompt_ids), f"{context} prompt_ids must be a tensor")
+    require(prompt_ids.dim() == 2, f"{context} prompt_ids must have shape (batch, seq)")
+    require(prompt_ids.dtype == torch.long, f"{context} prompt_ids must use dtype torch.long")
+    require(prompt_ids.size(1) > 0, f"{context} requires a non-empty prompt")
+    require(type(vocab_size) is int and vocab_size > 0, (
+        f"{context} requires model.config.vocab_size to be a positive integer"
+    ))
+    require((prompt_ids >= 0).all() and (prompt_ids < vocab_size).all(), (
+        f"{context} prompt token ids must be in [0, {vocab_size})"
+    ))
+
+
+def _config_vocab_size(model_core, context):
+    require(isinstance(model_core.config, BaseConfig), (
+        f"{context} requires model.config to inherit BaseConfig"
+    ))
+    config_state = model_core.config.to_dict()
+    require("vocab_size" in config_state, (
+        f"{context} requires model.config.vocab_size to validate prompt token ids"
+    ))
+    return config_state["vocab_size"]
 
 
 def _stop_requested(ids, prompt_len, stop_texts, tokenizer):
@@ -127,6 +166,9 @@ def _append_verified_greedy_cached(model, ids, draft, cache, prefix_logits):
 
 
 def _candidate_tree_paths(draft_logits, tree_width, tree_depth, max_tree_paths):
+    require_integer(tree_width, "tree_width")
+    require_integer(tree_depth, "tree_depth")
+    require_integer(max_tree_paths, "max_tree_paths")
     require(tree_width > 0, "tree_width must be > 0")
     require(tree_depth > 0, "tree_depth must be > 0")
     require(max_tree_paths > 0, "max_tree_paths must be > 0")
@@ -181,12 +223,6 @@ def _append_verified_tree_greedy(model, ids, paths):
     return torch.cat([ids, paths[best_path : best_path + 1, :best_accepted]], dim=1), best_accepted
 
 
-def _absorbing_unmask_probability(fwd, t_now, t_next):
-    alpha_now = fwd.alpha_at(t_now.unsqueeze(0)).item()
-    alpha_next = fwd.alpha_at(t_next.unsqueeze(0)).item()
-    return (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
-
-
 def _fill_remaining_masks(model, z, mask_id, batch_size):
     still_masked = z == mask_id
     if not still_masked.any():
@@ -235,8 +271,16 @@ def generate(
     """Autoregressive sampling. temperature=0 for greedy.
     stop_texts: list of strings that trigger early stopping (batch_size=1 only, requires tokenizer)."""
     _require_eval_model(model, "generate")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
-    require(prompt_ids.size(1) > 0, "generate requires a non-empty prompt")
+    model_core = _require_base_model(model, "generate")
+    _validate_prompt_token_ids(prompt_ids, _config_vocab_size(model_core, "generate"), "generate")
+    for name, value in (
+        ("temperature", temperature),
+        ("top_p", top_p),
+        ("repetition_penalty", repetition_penalty),
+    ):
+        require_finite_number(value, name)
+    require_integer(max_new_tokens, "max_new_tokens")
+    require_integer(top_k, "top_k")
     require(max_new_tokens >= 0, "max_new_tokens must be >= 0")
     require(temperature >= 0, "temperature must be >= 0")
     require(top_k >= 0, "top_k must be >= 0")
@@ -245,7 +289,6 @@ def generate(
     if stop_texts:
         require(tokenizer is not None, "stop_texts requires tokenizer")
         require(prompt_ids.size(0) == 1, "stop_texts only supported for batch_size=1")
-    model_core = _require_base_model(model, "generate")
     device = next(model.parameters()).device
     ids = prompt_ids.to(device)
     if max_new_tokens == 0:
@@ -333,7 +376,13 @@ def generate_mtp_speculative(
     """Greedy draft/verify decoding using parallel MTP heads."""
     _require_eval_model(model, "generate_mtp_speculative")
     model_core = _require_base_model(model, "generate_mtp_speculative")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    _validate_prompt_token_ids(
+        prompt_ids,
+        _config_vocab_size(model_core, "generate_mtp_speculative"),
+        "generate_mtp_speculative",
+    )
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
     if stop_texts:
@@ -344,14 +393,16 @@ def generate_mtp_speculative(
         model_core.config.max_seq_len,
         "generate_mtp_speculative",
         temperature,
+        top_k,
+        top_p,
         repetition_penalty,
     )
-    require(hasattr(model_core, "mtp_draft_logits"), "generate_mtp_speculative requires GPT parallel MTP support")
-    require(model_core.config.mtp_mode == "parallel" and model_core.config.mtp_depth > 0, (
+    require(model_core.supports_parallel_mtp_drafting(), (
         "generate_mtp_speculative requires a GPT checkpoint trained with mtp_mode='parallel'"
     ))
     if draft_tokens is None:
         draft_tokens = model_core.config.mtp_depth + 1
+    require_integer(draft_tokens, "draft_tokens")
     require(0 < draft_tokens <= model_core.config.mtp_depth + 1, (
         "draft_tokens must be in [1, mtp_depth + 1]"
     ))
@@ -388,7 +439,13 @@ def generate_mtp_speculative_cached(
     """Greedy MTP draft/verify decoding that reuses the verifier KV cache."""
     _require_eval_model(model, "generate_mtp_speculative_cached")
     model_core = _require_base_model(model, "generate_mtp_speculative_cached")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    _validate_prompt_token_ids(
+        prompt_ids,
+        _config_vocab_size(model_core, "generate_mtp_speculative_cached"),
+        "generate_mtp_speculative_cached",
+    )
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
     if stop_texts:
@@ -399,19 +456,19 @@ def generate_mtp_speculative_cached(
         model_core.config.max_seq_len,
         "generate_mtp_speculative_cached",
         temperature,
+        top_k,
+        top_p,
         repetition_penalty,
     )
-    require(hasattr(model_core, "mtp_draft_logits_from_hidden"), (
-        "generate_mtp_speculative_cached requires GPT parallel MTP cached drafting support"
-    ))
-    require(model_core.config.mtp_mode == "parallel" and model_core.config.mtp_depth > 0, (
+    require(model_core.supports_parallel_mtp_drafting(), (
         "generate_mtp_speculative_cached requires a GPT checkpoint trained with mtp_mode='parallel'"
     ))
-    require(model_core.supports_kv_cache(), (
+    require(model_core.supports_cached_parallel_mtp_drafting(), (
         "generate_mtp_speculative_cached requires a cache-compatible residual GPT checkpoint"
     ))
     if draft_tokens is None:
         draft_tokens = model_core.config.mtp_depth + 1
+    require_integer(draft_tokens, "draft_tokens")
     require(0 < draft_tokens <= model_core.config.mtp_depth + 1, (
         "draft_tokens must be in [1, mtp_depth + 1]"
     ))
@@ -460,9 +517,17 @@ def generate_mtp_tree(
     """Greedy Medusa-style MTP tree proposals with exact batched verification."""
     _require_eval_model(model, "generate_mtp_tree")
     model_core = _require_base_model(model, "generate_mtp_tree")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    _validate_prompt_token_ids(
+        prompt_ids,
+        _config_vocab_size(model_core, "generate_mtp_tree"),
+        "generate_mtp_tree",
+    )
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
+    require_integer(tree_width, "tree_width")
+    require_integer(max_tree_paths, "max_tree_paths")
     require(tree_width > 0, "tree_width must be > 0")
     require(max_tree_paths > 0, "max_tree_paths must be > 0")
     if stop_texts:
@@ -473,14 +538,16 @@ def generate_mtp_tree(
         model_core.config.max_seq_len,
         "generate_mtp_tree",
         temperature,
+        top_k,
+        top_p,
         repetition_penalty,
     )
-    require(hasattr(model_core, "mtp_draft_logits"), "generate_mtp_tree requires GPT parallel MTP support")
-    require(model_core.config.mtp_mode == "parallel" and model_core.config.mtp_depth > 0, (
+    require(model_core.supports_parallel_mtp_drafting(), (
         "generate_mtp_tree requires a GPT checkpoint trained with mtp_mode='parallel'"
     ))
     if tree_depth is None:
         tree_depth = model_core.config.mtp_depth + 1
+    require_integer(tree_depth, "tree_depth")
     require(tree_depth > 0, "tree_depth must be > 0")
     require(tree_depth <= model_core.config.mtp_depth + 1, (
         "tree_depth must be in [1, mtp_depth + 1]"
@@ -517,9 +584,16 @@ def generate_self_speculative(
     """LayerSkip-style greedy self-speculative decoding with full-model verification."""
     _require_eval_model(model, "generate_self_speculative")
     model_core = _require_base_model(model, "generate_self_speculative")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    _validate_prompt_token_ids(
+        prompt_ids,
+        _config_vocab_size(model_core, "generate_self_speculative"),
+        "generate_self_speculative",
+    )
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
+    require_integer(draft_tokens, "draft_tokens")
     require(draft_tokens > 0, "draft_tokens must be > 0")
     if stop_texts:
         require(tokenizer is not None, "stop_texts requires tokenizer")
@@ -529,11 +603,14 @@ def generate_self_speculative(
         model_core.config.max_seq_len,
         "generate_self_speculative",
         temperature,
+        top_k,
+        top_p,
         repetition_penalty,
     )
-    require(hasattr(model_core, "early_exit_logits"), "generate_self_speculative requires GPT early-exit support")
+    require(model_core.supports_early_exit(), "generate_self_speculative requires GPT early-exit support")
     if exit_layer is None:
         exit_layer = max(1, model_core.config.num_layers // 2)
+    require_integer(exit_layer, "exit_layer")
     require(0 < exit_layer < model_core.config.num_layers, "exit_layer must be in [1, num_layers)")
 
     device = next(model.parameters()).device
@@ -570,9 +647,16 @@ def generate_self_speculative_shared(
     """LayerSkip-style greedy self-speculative decoding with shared verification activations."""
     _require_eval_model(model, "generate_self_speculative_shared")
     model_core = _require_base_model(model, "generate_self_speculative_shared")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    _validate_prompt_token_ids(
+        prompt_ids,
+        _config_vocab_size(model_core, "generate_self_speculative_shared"),
+        "generate_self_speculative_shared",
+    )
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
+    require_integer(draft_tokens, "draft_tokens")
     require(draft_tokens > 0, "draft_tokens must be > 0")
     if stop_texts:
         require(tokenizer is not None, "stop_texts requires tokenizer")
@@ -582,19 +666,19 @@ def generate_self_speculative_shared(
         model_core.config.max_seq_len,
         "generate_self_speculative_shared",
         temperature,
+        top_k,
+        top_p,
         repetition_penalty,
     )
-    require(hasattr(model_core, "early_exit_state"), (
+    require(model_core.supports_early_exit(), (
         "generate_self_speculative_shared requires GPT early-exit state support"
     ))
-    require(hasattr(model_core, "continue_from_hidden"), (
-        "generate_self_speculative_shared requires GPT hidden continuation support"
-    ))
-    require(model_core.config.per_layer_embedding_dim == 0, (
-        "generate_self_speculative_shared does not support per-layer embeddings"
+    require(model_core.supports_hidden_continuation(), (
+        "generate_self_speculative_shared requires residual GPT hidden continuation without per-layer embeddings"
     ))
     if exit_layer is None:
         exit_layer = max(1, model_core.config.num_layers // 2)
+    require_integer(exit_layer, "exit_layer")
     require(0 < exit_layer < model_core.config.num_layers, "exit_layer must be in [1, num_layers)")
 
     device = next(model.parameters()).device
@@ -636,7 +720,15 @@ def generate_jacobi(
     """Greedy Jacobi-style parallel drafts with full-model verification."""
     _require_eval_model(model, "generate_jacobi")
     model_core = _require_base_model(model, "generate_jacobi")
-    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
+    _validate_prompt_token_ids(
+        prompt_ids,
+        _config_vocab_size(model_core, "generate_jacobi"),
+        "generate_jacobi",
+    )
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
+    require_integer(block_size, "block_size")
+    require_integer(iterations, "iterations")
     require(block_size > 0, "block_size must be > 0")
     require(iterations > 0, "iterations must be > 0")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
@@ -649,6 +741,8 @@ def generate_jacobi(
         model_core.config.max_seq_len,
         "generate_jacobi",
         temperature,
+        top_k,
+        top_p,
         repetition_penalty,
     )
 
@@ -688,6 +782,13 @@ def sample_diffusion(model, fwd, batch_size, seq_len, num_steps=None, temperatur
     _require_terminal_mask_prior(fwd, "sample_diffusion")
     if num_steps is None:
         num_steps = min(256, fwd.num_timesteps)
+    for name, value in (
+        ("temperature", temperature),
+    ):
+        require_finite_number(value, name)
+    require_integer(batch_size, "batch_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(num_steps, "num_steps")
     require(batch_size > 0 and seq_len > 0, "batch_size and seq_len must be > 0")
     require(0 < num_steps <= fwd.num_timesteps, "num_steps must be in [1, fwd.num_timesteps]")
     require(temperature >= 0, "temperature must be >= 0")
@@ -703,6 +804,14 @@ def sample_diffusion_cached(model, fwd, batch_size, seq_len, num_steps=None, tem
     _require_terminal_mask_prior(fwd, "sample_diffusion_cached")
     if num_steps is None:
         num_steps = min(256, fwd.num_timesteps)
+    for name, value in (
+        ("temperature", temperature),
+    ):
+        require_finite_number(value, name)
+    require_integer(batch_size, "batch_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(num_steps, "num_steps")
+    require_integer(cache_interval, "cache_interval")
     require(batch_size > 0 and seq_len > 0, "batch_size and seq_len must be > 0")
     require(0 < num_steps <= fwd.num_timesteps, "num_steps must be in [1, fwd.num_timesteps]")
     require(temperature >= 0, "temperature must be >= 0")
@@ -728,6 +837,13 @@ def sample_sedd(model, fwd, batch_size, seq_len, num_steps=None, temperature=1.0
     _require_sampler_contract(model, fwd, "sedd_log_scores", "sample_sedd")
     if num_steps is None:
         num_steps = min(256, fwd.num_timesteps)
+    for name, value in (
+        ("temperature", temperature),
+    ):
+        require_finite_number(value, name)
+    require_integer(batch_size, "batch_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(num_steps, "num_steps")
     require(batch_size > 0 and seq_len > 0, "batch_size and seq_len must be > 0")
     require(0 < num_steps <= fwd.num_timesteps, "num_steps must be in [1, fwd.num_timesteps]")
     require(temperature >= 0, "temperature must be >= 0")
@@ -773,6 +889,13 @@ def sample_d3pm(model, fwd, batch_size, seq_len, num_steps=None, temperature=1.0
     _require_sampler_contract(model, fwd, "d3pm_x0_logits", "sample_d3pm")
     if num_steps is None:
         num_steps = min(256, fwd.num_timesteps)
+    for name, value in (
+        ("temperature", temperature),
+    ):
+        require_finite_number(value, name)
+    require_integer(batch_size, "batch_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(num_steps, "num_steps")
     require(0 < num_steps <= fwd.num_timesteps, (
         "D3PM num_steps must be in [1, fwd.num_timesteps]"
     ))
@@ -805,10 +928,12 @@ def sample_d3pm(model, fwd, batch_size, seq_len, num_steps=None, temperature=1.0
 def infill(model, fwd, tokens, mask_positions, num_steps=None, temperature=1.0):
     """Fill masked positions while keeping context fixed. Unique to diffusion models."""
     _require_eval_model(model, "infill")
+    require_finite_number(temperature, "temperature")
     require(temperature >= 0, "temperature must be >= 0")
     parameterization = _reverse_parameterization(model)
     if num_steps is None:
         num_steps = min(128, fwd.num_timesteps)
+    require_integer(num_steps, "num_steps")
     require(num_steps > 0, "num_steps must be > 0")
     model_config = _require_absorbing_forward_process(model, fwd, "infill")
     validate_infill_tokens(tokens, mask_positions.to(tokens.device), model_config, "infill")
@@ -846,6 +971,12 @@ def sample_diffusion_semi_ar(
     model_config = _require_absorbing_forward_process(model, fwd, "sample_diffusion_semi_ar")
     require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
     require(prompt_ids.dtype == torch.long, "prompt_ids must contain integer token ids")
+    for name, value in (
+        ("temperature", temperature),
+    ):
+        require_finite_number(value, name)
+    require_integer(max_new_tokens, "max_new_tokens")
+    require_integer(block_size, "block_size")
     require(max_new_tokens >= 0, "max_new_tokens must be >= 0")
     require(block_size > 0, "block_size must be > 0")
     require(temperature >= 0, "temperature must be >= 0")
@@ -898,6 +1029,14 @@ def sample_diffusion_dream(
     model_config = _require_sampler_contract(model, fwd, "clean_logits", "sample_diffusion_dream")
     require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
     require(prompt_ids.dtype == torch.long, "prompt_ids must contain integer token ids")
+    for name, value in (
+        ("temperature", temperature),
+        ("top_p", top_p),
+        ("alg_temp", alg_temp),
+    ):
+        require_finite_number(value, name)
+    require_integer(max_new_tokens, "max_new_tokens")
+    require_integer(top_k, "top_k")
     require(max_new_tokens >= 0, "max_new_tokens must be >= 0")
     require(temperature >= 0, "temperature must be >= 0")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
@@ -906,6 +1045,7 @@ def sample_diffusion_dream(
     require(alg_temp >= 0, "alg_temp must be >= 0")
     if steps is None:
         steps = max(1, max_new_tokens)
+    require_integer(steps, "steps")
     require(steps > 0, "steps must be > 0")
     require(prompt_ids.size(1) + max_new_tokens <= model_config.max_seq_len, (
         f"Dream sampling supports at most {model_config.max_seq_len} tokens, "

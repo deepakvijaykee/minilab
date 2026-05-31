@@ -118,7 +118,7 @@ else:
 trainer.train()
 model = trainer.model
 
-print("\n--- After Diffusion DPO ---")
+print(f"\n--- After Diffusion {args.algorithm.upper()} ---")
 model.eval()
 sample_steps = min(128, fwd.num_timesteps)
 if not model.supports_unconditional_diffusion_sampling():

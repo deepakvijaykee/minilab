@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minilab.base import BaseModel
-from minilab.checks import require
+from minilab.base import BaseModel, validate_token_ids
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
 from minilab.models.transformer_utils import (
@@ -156,6 +156,29 @@ class GPTConfig(BaseConfig):
         self._validate_ffn_knobs()
 
     def _validate_core_fields(self):
+        require_finite_fields(self, (
+            "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads", "max_seq_len",
+            "dropout", "ffn_mult", "norm_eps", "connection_expansion", "num_experts",
+            "top_k_experts", "rope_base", "rope_local_base", "rope_global_base",
+            "rope_scaling_factor", "rope_original_max_seq_len", "rope_partial_rotary_factor",
+            "yarn_beta_fast", "yarn_beta_slow", "local_attention_window",
+            "qwen3_next_full_attention_interval", "sparse_block_size", "sparse_top_k_blocks",
+            "sparse_local_blocks", "sparse_index_dim", "lighthouse_num_levels",
+            "lighthouse_pooling_factor", "lighthouse_top_k", "per_layer_embedding_dim",
+            "final_logit_softcap", "mtp_depth", "mtp_loss_weight", "layerskip_loss_weight",
+            "layerskip_dropout", "layerskip_min_layer", "future_summary_window",
+            "future_summary_loss_weight", "jacobi_loss_weight", "jacobi_iterations",
+        ))
+        require_integer_fields(self, (
+            "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+            "max_seq_len", "connection_expansion", "num_experts", "top_k_experts",
+            "rope_original_max_seq_len", "local_attention_window",
+            "qwen3_next_full_attention_interval", "sparse_block_size",
+            "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
+            "lighthouse_num_levels", "lighthouse_pooling_factor", "lighthouse_top_k",
+            "per_layer_embedding_dim", "mtp_depth", "layerskip_min_layer",
+            "future_summary_window", "jacobi_iterations",
+        ))
         require(self.vocab_size > 0, "vocab_size must be > 0")
         require(self.dim > 0, "dim must be > 0")
         require(self.num_layers > 0, "num_layers must be > 0")
@@ -265,12 +288,22 @@ class GPTConfig(BaseConfig):
             ))
 
     def _validate_connection_knobs(self):
+        require_default_unless(
+            self.connection_expansion,
+            4,
+            self.connection != "residual",
+            "connection_expansion only applies to HC/mHC connections",
+        )
         if self.per_layer_embedding_dim > 0:
             require(self.connection == "residual", "per-layer embeddings require residual connections")
         if self.layerskip_loss_weight > 0 or self.layerskip_dropout > 0:
             require(self.connection == "residual", "LayerSkip training currently requires residual connections")
             require(self.layerskip_min_layer < self.num_layers, (
                 "layerskip_min_layer must be before the final layer"
+            ))
+        else:
+            require(self.layerskip_min_layer == 1, (
+                "layerskip_min_layer only applies when LayerSkip loss/dropout is enabled"
             ))
         if self.layerskip_dropout > 0:
             require(self.layerskip_loss_weight > 0, "layerskip_dropout requires layerskip_loss_weight > 0")
@@ -781,10 +814,8 @@ class GPT(BaseModel):
         return_layer_hiddens=False,
         apply_layerskip_dropout=True,
     ):
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "GPT")
         _, T = idx.shape
-        require(T <= self.config.max_seq_len, (
-            f"GPT supports at most {self.config.max_seq_len} tokens, got {T}"
-        ))
         require(not return_layer_hiddens or return_residual, (
             "return_layer_hiddens requires return_residual"
         ))
@@ -841,8 +872,7 @@ class GPT(BaseModel):
 
     def forward_cached(self, idx, past_kv=None, return_hidden=False):
         require(not self.training, "forward_cached expects model.eval() at the call boundary")
-        require(idx.dim() == 2, "forward_cached idx must have shape (batch, seq)")
-        require(idx.size(1) > 0, "forward_cached requires a non-empty input")
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "forward_cached")
         require(self.config.connection == "residual", "forward_cached currently supports residual GPT blocks")
         require(self.config.per_layer_embedding_dim == 0, "forward_cached does not support per-layer embeddings")
         require(not self._gradient_checkpointing, "forward_cached does not use gradient checkpointing")
@@ -860,6 +890,9 @@ class GPT(BaseModel):
             past_kv = [None] * len(self.blocks)
         else:
             require(len(past_kv) == len(self.blocks), "past_kv must have one entry per GPT block")
+            require(all(item is not None and len(item) == 2 for item in past_kv), (
+                "past_kv entries must be fully populated (key, value) pairs"
+            ))
             past_len = past_kv[0][0].size(2)
             for key, value in past_kv:
                 require(key.size(0) == B and value.size(0) == B, "past_kv batch size must match idx")
@@ -901,7 +934,6 @@ class GPT(BaseModel):
             elif self.pos_enc.kind == "bias":
                 require(offset == 0, "relative position bias does not support cached offset scoring")
                 attn_bias = self.pos_enc(seq_len).unsqueeze(0)
-                is_causal = False
             else:
                 require(self.pos_enc.kind in {"additive", "none"}, f"Unknown position kind: {self.pos_enc.kind}")
                 require(offset == 0 or self.pos_enc.kind == "none", (
@@ -1064,8 +1096,7 @@ class GPT(BaseModel):
     def early_exit_state(self, idx, exit_layer):
         require(self.config.connection == "residual", "early_exit_state requires residual GPT blocks")
         require(0 < exit_layer < self.config.num_layers, "exit_layer must be in [1, num_layers)")
-        require(idx.dim() == 2 and idx.size(1) > 0, "early_exit_state requires non-empty (batch, seq) ids")
-        require(idx.size(1) <= self.config.max_seq_len, "early_exit_state input exceeds max_seq_len")
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "early_exit_state")
         _, T = idx.shape
         x = self._cast_hidden(self.tok_emb(idx))
         per_layer_inputs = self._per_layer_inputs(idx, x)
@@ -1133,6 +1164,18 @@ class GPT(BaseModel):
                 self.config.final_logit_softcap,
             ))
         return draft_logits
+
+    def supports_parallel_mtp_drafting(self):
+        return self.config.mtp_mode == "parallel" and self.config.mtp_depth > 0
+
+    def supports_cached_parallel_mtp_drafting(self):
+        return self.supports_parallel_mtp_drafting() and self.supports_kv_cache()
+
+    def supports_early_exit(self):
+        return self.config.connection == "residual"
+
+    def supports_hidden_continuation(self):
+        return self.config.connection == "residual" and self.config.per_layer_embedding_dim == 0
 
     def _optimizer_transformer_blocks(self):
         return [*self.blocks, *(module.block for module in self.mtp_modules)]

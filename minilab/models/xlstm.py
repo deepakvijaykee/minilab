@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minilab.base import BaseModel
-from minilab.checks import require
+from minilab.base import BaseModel, validate_token_ids
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.nn.norm import RMSNorm
 from minilab.registry import register_model
@@ -30,6 +30,15 @@ class XLSTMConfig(BaseConfig):
     ffn_round_up_to_multiple_of: int = 64
 
     def __post_init__(self):
+        require_finite_fields(self, (
+            "vocab_size", "dim", "num_layers", "num_heads", "max_seq_len", "dropout",
+            "norm_eps", "qk_dim_factor", "v_dim_factor", "gate_soft_cap",
+            "output_logit_soft_cap", "ffn_proj_factor", "ffn_round_up_to_multiple_of",
+        ))
+        require_integer_fields(self, (
+            "vocab_size", "dim", "num_layers", "num_heads", "max_seq_len",
+            "ffn_round_up_to_multiple_of",
+        ))
         require(self.vocab_size > 0, "vocab_size must be > 0")
         require(self.dim > 0, "dim must be > 0")
         require(self.num_layers > 0, "num_layers must be > 0")
@@ -209,9 +218,7 @@ class XLSTMLM(BaseModel):
         return self._causal_lm_forward(idx, targets)
 
     def forward_hidden(self, idx):
-        require(idx.size(1) <= self.config.max_seq_len, (
-            f"XLSTMLM supports at most {self.config.max_seq_len} tokens, got {idx.size(1)}"
-        ))
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "XLSTMLM")
         x = self._cast_hidden(self.tok_emb(idx))
         x = self.drop(x)
         for block in self.blocks:

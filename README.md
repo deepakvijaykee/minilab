@@ -245,6 +245,30 @@ release provides them. The full list comes from
 `scripts/hf_inspect.py --list-presets`, and the recipes that drive the
 import-and-train flow live under `recipes/hf_to_native/`.
 
+## Post-training transfer lab
+
+Minilab also exposes the mechanism-transfer lane from `rl-experiments` under
+the same local LM loop. `scripts/grpo.py` can run GRPO-family baselines,
+candidate-target methods, influence-allocation methods, replay/freshness
+probes, reward-uncertainty variants, and VPO on GSM8K or tiny verifier tasks,
+with optional JSONL metrics, trajectory traces, local staleness sweeps, and
+tiny code-repair/tool-call verifier tasks:
+
+```bash
+python scripts/grpo.py \
+  --algorithm tpo \
+  --task format_answer \
+  --tokenizer tokenizer.json \
+  --checkpoint checkpoints/sft/step_500 \
+  --rl-metrics-every 1 \
+  --rl-trace-samples 8
+```
+
+The design remains laptop-scale: local rollouts, deterministic verifiers,
+component rewards, failure galleries, and memory metrics rather than a
+production rollout cluster. See `docs/post_training_transfer_lab.md`.
+Planned sweeps and result slots live in `docs/research_questions.md`.
+
 ## Running scripts directly
 
 The recipe wrappers are convenience, not necessity. The underlying

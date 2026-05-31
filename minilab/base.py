@@ -107,6 +107,18 @@ class BaseModel(nn.Module):
     def supports_kv_cache(self):
         return False
 
+    def supports_parallel_mtp_drafting(self):
+        return False
+
+    def supports_cached_parallel_mtp_drafting(self):
+        return False
+
+    def supports_early_exit(self):
+        return False
+
+    def supports_hidden_continuation(self):
+        return False
+
     def token_superposition_loss(self, idx, targets, bag_size):
         raise ValueError(f"{type(self).__name__} does not support token-superposition training")
 
@@ -222,6 +234,19 @@ def unwrap_model(model):
     return model
 
 
+def validate_token_ids(ids, vocab_size, max_seq_len, context):
+    require(torch.is_tensor(ids), f"{context} token ids must be a tensor")
+    require(ids.dim() == 2, f"{context} token ids must have shape (batch, seq)")
+    require(ids.dtype == torch.long, f"{context} token ids must use dtype torch.long")
+    require(ids.size(1) > 0, f"{context} requires a non-empty token sequence")
+    require(ids.size(1) <= max_seq_len, (
+        f"{context} supports at most {max_seq_len} tokens, got {ids.size(1)}"
+    ))
+    require(((ids >= 0) & (ids < vocab_size)).all(), (
+        f"{context} token ids must be in [0, {vocab_size})"
+    ))
+
+
 class BaseTokenizer:
 
     def save(self, path):
@@ -241,10 +266,12 @@ class BaseTokenizer:
             require(state["type"] == expected_state["type"], (
                 f"Tokenizer state was saved as {state['type']!r}, cannot load as {cls.__name__}."
             ))
-        if hasattr(tok, "_set_state_base_dir"):
-            tok._set_state_base_dir(path.parent)
+        tok._set_state_base_dir(path.parent)
         tok._set_state(state)
         return tok
+
+    def _set_state_base_dir(self, path):
+        return None
 
     def _get_state(self):
         raise NotImplementedError

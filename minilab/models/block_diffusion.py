@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from minilab.base import BaseModel, apply_conditional_diffusion_mask
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
 from minilab.models.diffusion_base import (
     apply_subs_clean_logits,
     DiffusionBackboneMixin,
@@ -22,6 +22,7 @@ from minilab.models.diffusion_base import (
     loss_normalizer,
     supervised_diffusion_mask,
     validate_clean_tokens,
+    validate_infill_tokens,
     validate_loss_mask,
 )
 from minilab.registry import register_model
@@ -35,6 +36,8 @@ class BlockDiffusionConfig(DiffusionModelConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_finite_number(self.block_size, "block_size")
+        require_integer(self.block_size, "block_size")
         require(self.block_size > 0, "block_size must be > 0")
 
 
@@ -45,6 +48,10 @@ def block_diffusion_attention_mask(seq_len, block_size, cross_attention=True, de
     with `seq_len` tokens in each half. The returned mask has shape
     `(2 * seq_len, 2 * seq_len)`.
     """
+    require_finite_number(seq_len, "seq_len")
+    require_finite_number(block_size, "block_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(block_size, "block_size")
     require(seq_len > 0, "seq_len must be > 0")
     require(block_size > 0, "block_size must be > 0")
     if not cross_attention:
@@ -71,6 +78,12 @@ def block_mask_to_attn_bias(allow_mask, dtype):
 
 
 def sample_block_times(batch_size, seq_len, block_size, device, antithetic=False):
+    require_finite_number(batch_size, "batch_size")
+    require_finite_number(seq_len, "seq_len")
+    require_finite_number(block_size, "block_size")
+    require_integer(batch_size, "batch_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(block_size, "block_size")
     require(batch_size > 0, "batch_size must be > 0")
     require(seq_len > 0, "seq_len must be > 0")
     require(block_size > 0, "block_size must be > 0")
@@ -181,6 +194,7 @@ class BlockDiffusionLM(DiffusionBackboneMixin, BaseModel):
         return z_t, mask, block_t
 
     def forward(self, z_t, t, x_0=None):
+        validate_infill_tokens(z_t, z_t == self.mask_token_id, self.config, "BlockDiffusionLM forward")
         require(z_t.size(1) <= self.config.max_seq_len, (
             f"BlockDiffusionLM supports at most {self.config.max_seq_len} clean tokens, got {z_t.size(1)}"
         ))

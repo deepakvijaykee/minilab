@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
 from minilab.registry import register_ffn
 
 
@@ -68,6 +68,7 @@ class SwitchMoEFFN(nn.Module):
         super().__init__()
         _validate_moe_config(dim, hidden_dim, num_experts, 1, aux_loss_coef, "SwitchMoEFFN")
         require(top_k == 1, "SwitchMoEFFN implements Switch top-1 routing; set top_k=1")
+        require_finite_number(capacity_factor, "capacity_factor")
         require(capacity_factor > 0, "capacity_factor must be > 0")
         self.num_experts = num_experts
         self.top_k = 1
@@ -116,6 +117,7 @@ class ExpertChoiceMoEFFN(nn.Module):
     ):
         super().__init__()
         _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, "ExpertChoiceMoEFFN")
+        require_finite_number(capacity_factor, "capacity_factor")
         require(capacity_factor > 0, "capacity_factor must be > 0")
         self.num_experts = num_experts
         self.top_k = top_k
@@ -250,6 +252,7 @@ class AuxFreeMoEFFN(nn.Module):
     ):
         super().__init__()
         _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, "AuxFreeMoEFFN")
+        require_finite_number(bias_update_rate, "bias_update_rate")
         require(bias_update_rate >= 0, "bias_update_rate must be >= 0")
         self.num_experts = num_experts
         self.top_k = top_k
@@ -311,6 +314,7 @@ class BaseMoEFFN(nn.Module):
         super().__init__()
         _validate_moe_config(dim, hidden_dim, num_experts, 1, aux_loss_coef, "BaseMoEFFN")
         require(top_k == 1, "BaseMoEFFN implements one expert per token; set top_k=1")
+        require_finite_number(capacity_factor, "capacity_factor")
         require(capacity_factor >= 1.0, "BASE balanced assignment requires capacity_factor >= 1")
         self.num_experts = num_experts
         self.top_k = 1
@@ -388,6 +392,10 @@ class _GELUTanhExpert(_ExpertBase):
 
 
 def _expert_projections(dim, hidden_dim):
+    require_integer(dim, "expert dim")
+    require_integer(hidden_dim, "expert hidden_dim")
+    require_finite_number(dim, "expert dim")
+    require_finite_number(hidden_dim, "expert hidden_dim")
     require(dim > 0, "expert dim must be > 0")
     require(hidden_dim > 0, "expert hidden_dim must be > 0")
     return (
@@ -398,6 +406,21 @@ def _expert_projections(dim, hidden_dim):
 
 
 def _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, name):
+    for field_name, value in (
+        (f"{name} dim", dim),
+        (f"{name} hidden_dim", hidden_dim),
+        ("num_experts", num_experts),
+        ("top_k", top_k),
+    ):
+        require_integer(value, field_name)
+    for field_name, value in (
+        (f"{name} dim", dim),
+        (f"{name} hidden_dim", hidden_dim),
+        ("num_experts", num_experts),
+        ("top_k", top_k),
+        ("aux_loss_coef", aux_loss_coef),
+    ):
+        require_finite_number(value, field_name)
     require(dim > 0, f"{name} dim must be > 0")
     require(hidden_dim > 0, f"{name} hidden_dim must be > 0")
     require(num_experts > 0, "num_experts must be > 0")

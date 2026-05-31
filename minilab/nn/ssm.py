@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
 from minilab.nn.norm import RMSNorm
 
 
@@ -23,6 +23,23 @@ class MambaMixer(nn.Module):
         dt_init_floor=1e-4,
     ):
         super().__init__()
+        for name, value in (
+            ("Mamba dim", dim),
+            ("Mamba d_state", d_state),
+            ("Mamba d_conv", d_conv),
+            ("Mamba expand", expand),
+        ):
+            require_integer(value, name)
+        for name, value in (
+            ("Mamba dim", dim),
+            ("Mamba d_state", d_state),
+            ("Mamba d_conv", d_conv),
+            ("Mamba expand", expand),
+            ("Mamba dt_min", dt_min),
+            ("Mamba dt_max", dt_max),
+            ("Mamba dt_init_floor", dt_init_floor),
+        ):
+            require_finite_number(value, name)
         require(dim > 0, "Mamba dim must be > 0")
         require(d_state > 0, "Mamba d_state must be > 0")
         require(d_conv > 0, "Mamba d_conv must be > 0")
@@ -34,6 +51,8 @@ class MambaMixer(nn.Module):
         self.d_conv = d_conv
         self.d_inner = expand * dim
         self.dt_rank = math.ceil(dim / 16) if dt_rank is None else dt_rank
+        require_integer(self.dt_rank, "Mamba dt_rank")
+        require_finite_number(self.dt_rank, "Mamba dt_rank")
         require(self.dt_rank > 0, "Mamba dt_rank must be > 0")
 
         self.in_proj = nn.Linear(dim, 2 * self.d_inner, bias=False)
@@ -104,6 +123,29 @@ class Mamba2Mixer(nn.Module):
         A_init_max=16.0,
     ):
         super().__init__()
+        for name, value in (
+            ("Mamba2 dim", dim),
+            ("Mamba2 d_state", d_state),
+            ("Mamba2 d_conv", d_conv),
+            ("Mamba2 expand", expand),
+            ("Mamba2 headdim", headdim),
+            ("Mamba2 ngroups", ngroups),
+        ):
+            require_integer(value, name)
+        for name, value in (
+            ("Mamba2 dim", dim),
+            ("Mamba2 d_state", d_state),
+            ("Mamba2 d_conv", d_conv),
+            ("Mamba2 expand", expand),
+            ("Mamba2 headdim", headdim),
+            ("Mamba2 ngroups", ngroups),
+            ("Mamba2 dt_min", dt_min),
+            ("Mamba2 dt_max", dt_max),
+            ("Mamba2 dt_init_floor", dt_init_floor),
+            ("Mamba2 A_init_min", A_init_min),
+            ("Mamba2 A_init_max", A_init_max),
+        ):
+            require_finite_number(value, name)
         require(dim > 0, "Mamba2 dim must be > 0")
         require(d_state > 0, "Mamba2 d_state must be > 0")
         require(d_conv > 0, "Mamba2 d_conv must be > 0")

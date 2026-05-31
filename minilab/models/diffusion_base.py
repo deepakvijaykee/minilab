@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from minilab.checks import require
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
     DEFAULT_NUM_EXPERTS,
@@ -55,6 +55,15 @@ class DiffusionModelConfig(BaseConfig):
     def __post_init__(self):
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_heads
+        require_finite_fields(self, (
+            "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+            "max_seq_len", "dropout", "ffn_mult", "num_experts", "top_k_experts",
+            "mask_token_id",
+        ))
+        require_integer_fields(self, (
+            "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+            "max_seq_len", "num_experts", "top_k_experts", "mask_token_id",
+        ))
         require(self.vocab_size > 1, "diffusion vocab_size must include at least one clean token plus [MASK]")
         require(self.dim > 0, "dim must be > 0")
         require(self.num_layers > 0, "num_layers must be > 0")
@@ -83,15 +92,25 @@ class DiffusionModelConfig(BaseConfig):
 
 
 def validate_clean_tokens(x_0, config, context):
+    require(x_0.dim() == 2, f"{context} clean tokens must have shape (batch, seq)")
     require(x_0.dtype == torch.long, f"{context} requires integer token ids")
+    require(x_0.size(1) > 0, f"{context} requires at least one token")
+    require(x_0.size(1) <= config.max_seq_len, (
+        f"{context} supports at most {config.max_seq_len} tokens, got {x_0.size(1)}"
+    ))
     require((x_0 >= 0).all(), f"{context} clean tokens must be non-negative")
     require((x_0 < config.mask_token_id).all(), f"{context} clean tokens must exclude the reserved [MASK] token")
 
 
 def validate_infill_tokens(tokens, mask_positions, config, context):
+    require(tokens.dim() == 2, f"{context} tokens must have shape (batch, seq)")
     require(tokens.shape == mask_positions.shape, f"{context} tokens and mask_positions must have the same shape")
     require(mask_positions.dtype == torch.bool, f"{context} mask_positions must be a bool tensor")
     require(tokens.dtype == torch.long, f"{context} requires integer token ids")
+    require(tokens.size(1) > 0, f"{context} requires at least one token")
+    require(tokens.size(1) <= config.max_seq_len, (
+        f"{context} supports at most {config.max_seq_len} tokens, got {tokens.size(1)}"
+    ))
     require((tokens >= 0).all(), f"{context} tokens must be non-negative")
     require((tokens <= config.mask_token_id).all(), (
         f"{context} tokens must be clean token ids or the reserved [MASK] placeholder"

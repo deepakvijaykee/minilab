@@ -1,6 +1,6 @@
 import time
 
-from minilab.base import unwrap_model
+from minilab.base import BaseModel, unwrap_model
 from minilab.checks import require
 
 
@@ -30,6 +30,13 @@ def optimizer_state_bytes(model, optimizer="adamw", dtype_bytes=4):
         return params * dtype_bytes
     if optimizer == "sgd":
         return 0
+    if optimizer in {"muon", "soft_muon"}:
+        model = unwrap_model(model)
+        require(isinstance(model, BaseModel), "Muon-family optimizer memory estimates require a BaseModel")
+        hidden, auxiliary, biases = model.muon_parameter_groups()
+        hidden_params = sum(p.numel() for p in hidden if p.requires_grad)
+        adamw_params = sum(p.numel() for group in (auxiliary, biases) for p in group if p.requires_grad)
+        return (hidden_params + 2 * adamw_params) * dtype_bytes
     raise ValueError(f"Unknown optimizer: {optimizer!r}")
 
 

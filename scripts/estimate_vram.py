@@ -13,9 +13,11 @@ from common import (
     build_lm_model,
     diffusion_model_kwargs,
     lm_model_kwargs,
+    resolve_default,
 )
 from minilab.checks import require
 from minilab.diagnostics import optimizer_state_bytes
+from minilab.online_rl import ONLINE_RL_REFERENCE_ALGORITHMS
 from minilab.models.transformer_utils import DEFAULT_NUM_EXPERTS, DEFAULT_TOP_K_EXPERTS
 from minilab.presets import (
     DIFFUSION_MODEL_PRESETS,
@@ -29,15 +31,17 @@ REFERENCE_METHODS = {
     "dpo",
     "ipo",
     "kto",
-    "ppo",
-    "grpo",
-    "gspo",
-    "rloo",
     "diffusion_dpo",
     "diffusion_vrpo",
     "diffusion_grpo",
+} | ONLINE_RL_REFERENCE_ALGORITHMS
+GROUP_ROLLOUT_METHODS = {
+    "grpo", "drgrpo", "gspo", "rloo", "dapo",
+    "tpo", "tpo_no_anchor", "group_pg", "vpo",
+    "dg", "kondo", "uncertainty_dg", "filtered_dg", "reward_variance_dg",
+    "aspo", "r2vpo", "replay_dg", "fresh_dg",
+    "diffusion_grpo",
 }
-GROUP_ROLLOUT_METHODS = {"grpo", "gspo", "rloo", "dapo", "diffusion_grpo"}
 ROLLOUT_METHODS = {"ppo"} | GROUP_ROLLOUT_METHODS
 DIFFUSION_METHODS = {
     "diffusion_pretrain",
@@ -58,9 +62,23 @@ METHODS = (
     "kto",
     "ppo",
     "grpo",
+    "drgrpo",
     "gspo",
     "rloo",
     "dapo",
+    "tpo",
+    "tpo_no_anchor",
+    "group_pg",
+    "vpo",
+    "dg",
+    "kondo",
+    "uncertainty_dg",
+    "filtered_dg",
+    "reward_variance_dg",
+    "aspo",
+    "r2vpo",
+    "replay_dg",
+    "fresh_dg",
     "diffusion_pretrain",
     "diffusion_sft",
     "diffusion_dpo",
@@ -100,11 +118,19 @@ def _resolve_spec(args):
             "seq_len": 256,
         }
 
-    spec["dim"] = args.dim or spec["dim"]
-    spec["num_layers"] = args.num_layers or spec["num_layers"]
+    spec["dim"] = resolve_default(args.dim, spec["dim"])
+    spec["num_layers"] = resolve_default(args.num_layers, spec["num_layers"])
+    if spec["model"] in {"mamba", "mamba2"}:
+        require(args.num_heads is None, "--num-heads does not apply to Mamba-family models")
+    else:
+        require("num_heads" in spec, f"{spec['model']} VRAM estimation requires num_heads")
+        spec["num_heads"] = resolve_default(args.num_heads, spec["num_heads"])
+    spec["seq_len"] = resolve_default(args.seq_len, spec["seq_len"])
+    require(spec["dim"] > 0, "--dim must be > 0")
+    require(spec["num_layers"] > 0, "--num-layers must be > 0")
+    require(spec["seq_len"] > 0, "--seq-len must be > 0")
     if spec["model"] not in {"mamba", "mamba2"}:
-        spec["num_heads"] = args.num_heads or spec.get("num_heads", 8)
-    spec["seq_len"] = args.seq_len or spec["seq_len"]
+        require(spec["num_heads"] > 0, "--num-heads must be > 0")
     return spec
 
 
@@ -117,7 +143,7 @@ def _build_model(spec, vocab_size):
             mask_token_id=mask_token_id,
             dim=spec["dim"],
             num_layers=spec["num_layers"],
-            num_heads=spec.get("num_heads", 8),
+            num_heads=spec["num_heads"],
             num_kv_heads=None,
             max_seq_len=spec["seq_len"],
             attention="mha",
@@ -147,18 +173,20 @@ def _build_model(spec, vocab_size):
 
 def _activation_bytes(spec, args):
     batch = args.batch_size
-    seq_len = args.seq_len or spec["seq_len"]
+    seq_len = spec["seq_len"]
     if args.method in ROLLOUT_METHODS:
         seq_len += args.max_new_tokens
     if args.method in GROUP_ROLLOUT_METHODS:
         batch *= args.num_generations
+    if args.method == "vpo":
+        batch *= args.vpo_num_candidates
 
     checkpoint_factor = 2.5 if args.grad_checkpoint else 7.0
     hidden = batch * seq_len * spec["dim"] * spec["num_layers"] * args.activation_dtype_bytes * checkpoint_factor
 
     attention = 0
     if spec["model"] in TRANSFORMER_FAMILIES:
-        heads = spec.get("num_heads", 1)
+        heads = spec["num_heads"]
         attention = batch * spec["num_layers"] * heads * seq_len * seq_len * args.activation_dtype_bytes
         if args.grad_checkpoint:
             attention *= 0.35
@@ -169,10 +197,12 @@ def _activation_bytes(spec, args):
 def _generation_cache_bytes(spec, args):
     if args.method not in ROLLOUT_METHODS or spec["model"] not in TRANSFORMER_FAMILIES:
         return 0
-    seq_len = (args.seq_len or spec["seq_len"]) + args.max_new_tokens
+    seq_len = spec["seq_len"] + args.max_new_tokens
     batch = args.batch_size
     if args.method in GROUP_ROLLOUT_METHODS:
         batch *= args.num_generations
+    if args.method == "vpo":
+        batch *= args.vpo_num_candidates
     return int(batch * spec["num_layers"] * 2 * seq_len * spec["dim"] * args.activation_dtype_bytes)
 
 
@@ -185,6 +215,9 @@ def _estimate(args):
     )
     require(args.batch_size > 0, "--batch-size must be > 0")
     require(args.num_generations > 0, "--num-generations must be > 0")
+    require(args.vpo_num_candidates > 0, "--vpo-num-candidates must be > 0")
+    if args.method == "vpo":
+        require(args.vpo_num_candidates > 1, "VPO requires --vpo-num-candidates > 1")
     require(args.max_new_tokens >= 0, "--max-new-tokens must be >= 0")
     require(args.vocab_size > 0, "--vocab-size must be > 0")
 
@@ -223,8 +256,9 @@ def main():
     p.add_argument("--num-heads", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--num-generations", type=int, default=4)
+    p.add_argument("--vpo-num-candidates", type=int, default=3)
     p.add_argument("--max-new-tokens", type=int, default=128)
-    p.add_argument("--optimizer", choices=["adamw", "lion", "sgd"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon", "sgd"], default="adamw")
     p.add_argument("--grad-checkpoint", action="store_true")
     p.add_argument("--param-dtype-bytes", type=int, default=4, help="model weights are fp32 by default under autocast")
     p.add_argument("--grad-dtype-bytes", type=int, default=4)
@@ -238,10 +272,12 @@ def main():
     print("Estimated VRAM (rough planning estimate)")
     print(f"- model: {args.model} ({spec['model']}, {params:,} params)")
     print(f"- method: {args.method}")
-    print(f"- sequence length: {args.seq_len or spec['seq_len']}")
+    print(f"- sequence length: {spec['seq_len']}")
     print(f"- batch size: {args.batch_size}")
     if args.method in GROUP_ROLLOUT_METHODS:
         print(f"- rollout generations: {args.num_generations}")
+    if args.method == "vpo":
+        print(f"- VPO candidates per set: {args.vpo_num_candidates}")
     if args.method in ROLLOUT_METHODS:
         print(f"- max new tokens: {args.max_new_tokens}")
     print()

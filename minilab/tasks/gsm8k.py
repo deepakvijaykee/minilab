@@ -46,19 +46,41 @@ def parse_gold_answer(answer_text):
 
 
 def reward(completion_text, expected):
+    return reward_components(completion_text, expected)["reward"]
+
+
+def reward_components(completion_text, expected):
     predicted = extract_answer(completion_text)
-    return accuracy_reward(predicted, expected) if predicted is not None else 0.0
+    format_score = 1.0 if predicted is not None else 0.0
+    answer_score = accuracy_reward(predicted, expected) if predicted is not None else 0.0
+    return {
+        "format": format_score,
+        "answer": answer_score,
+        "reward": answer_score,
+    }
 
 
 def batch_reward(tokenizer, answers, batch, completions, completion_mask):
-    rewards = [
-        reward(
+    require(completions.dim() == 2, "GSM8K completions must have shape (batch, seq)")
+    require(completions.size(0) > 0, "GSM8K reward batch requires at least one completion")
+    require(completion_mask.shape == completions.shape, "GSM8K completion_mask must match completions")
+    require(completion_mask.dtype == torch.bool, "GSM8K completion_mask must be bool")
+    require("idx" in batch, "GSM8K reward batch is missing idx")
+    require(batch["idx"].shape == (completions.size(0),), "GSM8K idx must have shape (batch,)")
+    require(((0 <= batch["idx"]) & (batch["idx"] < len(answers))).all(), (
+        "GSM8K idx values must reference answers"
+    ))
+    rows = [
+        reward_components(
             tokenizer.decode(completions[b][completion_mask[b]].tolist()),
             answers[batch["idx"][b].item()],
         )
         for b in range(completions.size(0))
     ]
-    return torch.tensor(rewards)
+    return {
+        key: torch.tensor([row[key] for row in rows], device=completions.device, dtype=torch.float32)
+        for key in rows[0]
+    }
 
 
 @register_task("gsm8k")
@@ -69,4 +91,5 @@ class GSM8KTask:
     extract_answer = staticmethod(extract_answer)
     parse_gold_answer = staticmethod(parse_gold_answer)
     reward = staticmethod(reward)
+    reward_components = staticmethod(reward_components)
     batch_reward = staticmethod(batch_reward)

@@ -20,6 +20,7 @@ from minilab.generation import (
     generate_self_speculative,
     generate_self_speculative_shared,
 )
+from minilab.checks import require
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import validate_checkpoint_tokenizer
 
@@ -33,6 +34,14 @@ GENERATION_MODES = [
     "self_speculative_shared",
     "jacobi",
 ]
+VERIFIED_GENERATION_MODES = {
+    "mtp_speculative",
+    "mtp_speculative_cached",
+    "mtp_tree",
+    "self_speculative",
+    "self_speculative_shared",
+    "jacobi",
+}
 
 
 def _sync(device):
@@ -173,6 +182,23 @@ def parse_args():
 
 def main():
     args = parse_args()
+    require(args.max_new_tokens >= 0, "--max-new-tokens must be >= 0")
+    require(args.temperature >= 0, "--temperature must be >= 0")
+    require(args.top_k >= 0, "--top-k must be >= 0")
+    require(0 < args.top_p <= 1.0, "--top-p must be in (0, 1]")
+    require(args.runs > 0, "--runs must be > 0")
+    require(args.warmup >= 0, "--warmup must be >= 0")
+    require(args.draft_tokens is None or args.draft_tokens > 0, "--draft-tokens must be > 0")
+    require(args.exit_layer is None or args.exit_layer > 0, "--exit-layer must be > 0")
+    require(args.tree_width > 0, "--tree-width must be > 0")
+    require(args.tree_depth is None or args.tree_depth > 0, "--tree-depth must be > 0")
+    require(args.max_tree_paths > 0, "--max-tree-paths must be > 0")
+    require(args.jacobi_block_size > 0, "--jacobi-block-size must be > 0")
+    require(args.jacobi_iterations > 0, "--jacobi-iterations must be > 0")
+    if any(mode in VERIFIED_GENERATION_MODES for mode in args.modes):
+        require(args.temperature == 0, "--temperature must be 0 for exact verified decoding modes")
+        require(args.top_k == 0, "--top-k does not apply to exact verified decoding modes")
+        require(args.top_p == 1.0, "--top-p does not apply to exact verified decoding modes")
     tok = load_tokenizer(args.tokenizer)
     validate_checkpoint_tokenizer(args.checkpoint, tok)
     device = "cuda" if torch.cuda.is_available() else "cpu"

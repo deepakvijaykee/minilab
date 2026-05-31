@@ -18,6 +18,7 @@ from minilab.models.diffusion_base import (
     loss_normalizer,
     supervised_diffusion_mask,
     validate_clean_tokens,
+    validate_infill_tokens,
     validate_loss_mask,
 )
 from minilab.registry import register_model
@@ -54,6 +55,7 @@ class D3PM(DiffusionBackboneMixin, BaseModel):
 
     def forward(self, z_t, t):
         """Predicts clean-token logits p_tilde_theta(x_0 | z_t)."""
+        validate_infill_tokens(z_t, z_t == self.mask_token_id, self.config, "D3PM forward")
         return self.lm_head(self._diffusion_backbone_forward(z_t, t, "D3PM"))
 
     def compute_loss_per_example(self, logits, x_0, mask, t, fwd, loss_mask=None, normalization="sequence"):

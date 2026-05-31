@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,9 +16,10 @@ from minilab.alignment_common import (
     _validate_reference_tokenizer,
 )
 from minilab.base import unwrap_model
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
 from minilab.diffusion import forward_process_signature
 from minilab.diffusion_sampling import (
+    absorbing_unmask_probability,
     d3pm_reverse_timesteps,
     sample_categorical,
     sedd_absorbing_step_probs,
@@ -26,6 +28,14 @@ from minilab.models.d3pm import absorbing_posterior_log_probs
 from minilab.online_rl import GRPOTrainConfig
 from minilab.preference_alignment import DPOTrainConfig
 from minilab.registry import register_trainer
+from minilab.rl_diagnostics import (
+    append_jsonl,
+    group_stats,
+    rollout_records,
+    rollout_system_stats,
+    scalar_record,
+    stack_reward_results,
+)
 from minilab.trainer import Trainer, _validate_diffusion_trainer_contract, model_aux_loss
 
 
@@ -36,6 +46,8 @@ class DiffusionGRPOTrainConfig(GRPOTrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_integer(self.diffusion_num_steps, "diffusion_num_steps")
+        require_finite_number(self.diffusion_temperature, "diffusion_temperature")
         require(self.diffusion_num_steps > 0, "diffusion_num_steps must be > 0")
         require(self.diffusion_temperature == 1.0, (
             "Diffusion GRPO uses exact model-policy trajectory ratios; keep diffusion_temperature=1.0"
@@ -49,6 +61,7 @@ class DiffusionVRPOTrainConfig(DPOTrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_integer(self.vrpo_num_samples, "vrpo_num_samples")
         require(self.vrpo_num_samples > 0, "vrpo_num_samples must be > 0")
 
 
@@ -57,6 +70,21 @@ class DiffusionGRPORollout:
     traces: list
     old_logps: list
     adv: torch.Tensor
+    completions: list
+    completion_masks: list
+    rewards: torch.Tensor
+    reward_components: dict | None = None
+    age: int = 0
+    generation_latency_ms: float = 0.0
+    reward_latency_ms: float = 0.0
+    generated_tokens: int = 0
+    reward_calls: int = 0
+    queue_depth: int = 0
+    dropped_stale_count: int = 0
+    staleness_delay: int = 0
+    drop_stale_after: int = 0
+    accepted_for_training: bool = True
+    drop_reason: str = ""
 
 
 @dataclass
@@ -373,34 +401,72 @@ class DiffusionGRPOTrainer(_DiffusionAlignmentCheckpointMixin, Trainer):
         traces, old_logps, completions, completion_masks = [], [], [], []
         was_training = self.model.training
         self.model.eval()
-        with torch.no_grad():
-            for _ in range(self.K):
-                rollout = _diffusion_rollout_once(
-                    self.model,
-                    self.fwd,
-                    prompt_ids,
-                    prompt_lens,
-                    self.max_new_tokens,
-                    self.num_steps,
-                    self.temperature,
-                )
-                traces.append(rollout.trace)
-                old_logps.append(rollout.logp)
-                completions.append(rollout.completions)
-                completion_masks.append(rollout.completion_mask)
+        try:
+            generation_started = time.perf_counter()
+            with torch.no_grad():
+                for _ in range(self.K):
+                    rollout = _diffusion_rollout_once(
+                        self.model,
+                        self.fwd,
+                        prompt_ids,
+                        prompt_lens,
+                        self.max_new_tokens,
+                        self.num_steps,
+                        self.temperature,
+                    )
+                    traces.append(rollout.trace)
+                    old_logps.append(rollout.logp)
+                    completions.append(rollout.completions)
+                    completion_masks.append(rollout.completion_mask)
+            generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
 
-        rewards = torch.stack([
-            self.reward_fn(batch, c, m)
-            for c, m in zip(completions, completion_masks, strict=True)
-        ], dim=1).to(self.device)
-        adv = _group_normalized_advantages(rewards)
+            reward_started = time.perf_counter()
+            rewards, reward_components = stack_reward_results(
+                [
+                    self.reward_fn(batch, c, m)
+                    for c, m in zip(completions, completion_masks, strict=True)
+                ],
+                self.device,
+            )
+            reward_latency_ms = (time.perf_counter() - reward_started) * 1000.0
+            adv = _group_normalized_advantages(rewards)
 
-        self.model.train(was_training)
-        return DiffusionGRPORollout(
-            traces=traces,
-            old_logps=old_logps,
-            adv=adv,
-        )
+            return DiffusionGRPORollout(
+                traces=traces,
+                old_logps=old_logps,
+                adv=adv,
+                completions=completions,
+                completion_masks=completion_masks,
+                rewards=rewards,
+                reward_components=reward_components,
+                generation_latency_ms=generation_latency_ms,
+                reward_latency_ms=reward_latency_ms,
+                generated_tokens=int(sum(mask.sum().item() for mask in completion_masks)),
+                reward_calls=len(completion_masks),
+            )
+        finally:
+            self.model.train(was_training)
+
+    def _record_online_rollout(self, batch, rollout):
+        if self.config.rl_metrics_every > 0 and self.step % self.config.rl_metrics_every == 0:
+            metrics = group_stats(rollout.rewards, rollout.adv, rollout.completion_masks, rollout.reward_components)
+            metrics.update(rollout_system_stats(rollout))
+            append_jsonl(
+                Path(self.config.save_dir) / "online_rl_metrics.jsonl",
+                [scalar_record(type(self).__name__, self.step, "diffusion_grpo", metrics)],
+            )
+        if self.config.rl_trace_samples > 0:
+            append_jsonl(
+                Path(self.config.save_dir) / "trajectories.jsonl",
+                rollout_records(
+                    type(self).__name__,
+                    self.step,
+                    "diffusion_grpo",
+                    batch,
+                    rollout,
+                    self.config.rl_trace_samples,
+                ),
+            )
 
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
@@ -499,9 +565,7 @@ def _rollout_clean_logits(model, fwd, tokens, response_mask, num_steps, temperat
         t_now, t_next = timesteps[i], timesteps[i + 1]
         log_probs = _clean_logits_log_probs(model(z, t_now.expand(B)), mask_id, temperature)
         actions = _sample_from_log_probs(log_probs)
-        alpha_now = fwd.alpha_at(t_now.unsqueeze(0)).item()
-        alpha_next = fwd.alpha_at(t_next.unsqueeze(0)).item()
-        unmask_prob = (alpha_next - alpha_now) / (1.0 - alpha_now) if alpha_now < 1.0 else alpha_next
+        unmask_prob = absorbing_unmask_probability(fwd, t_now, t_next)
         action_mask = masked & (torch.rand_like(tokens, dtype=torch.float) < unmask_prob)
         if action_mask.any():
             total_logp = total_logp + _sum_action_logp(log_probs, actions, action_mask)

@@ -13,7 +13,7 @@ from minilab.alignment_common import (
     _trainer_reference_path,
     _validate_reference_tokenizer,
 )
-from minilab.checks import require
+from minilab.checks import require, require_finite_number
 from minilab.data import KTOBalancedBatchSampler, KTODataset
 from minilab.registry import register_trainer
 from minilab.trainer import TrainConfig, Trainer, model_aux_loss, supervised_lm_batch_loss
@@ -25,6 +25,7 @@ class DPOTrainConfig(TrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_finite_number(self.dpo_beta, "dpo_beta")
         require(self.dpo_beta > 0, "dpo_beta must be > 0")
 
 
@@ -34,6 +35,7 @@ class CPOTrainConfig(DPOTrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_finite_number(self.cpo_alpha, "cpo_alpha")
         require(self.cpo_alpha >= 0, "cpo_alpha must be >= 0")
 
 
@@ -43,6 +45,7 @@ class SimPOTrainConfig(DPOTrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_finite_number(self.simpo_gamma, "simpo_gamma")
         require(self.simpo_gamma >= 0, "simpo_gamma must be >= 0")
 
 
@@ -52,6 +55,7 @@ class RePOTrainConfig(TrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_finite_number(self.repo_margin, "repo_margin")
         require(self.repo_margin >= 0, "repo_margin must be >= 0")
 
 
@@ -61,6 +65,7 @@ class ORPOTrainConfig(TrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_finite_number(self.orpo_beta, "orpo_beta")
         require(self.orpo_beta > 0, "orpo_beta must be > 0")
 
 
@@ -73,6 +78,8 @@ class KTOTrainConfig(DPOTrainConfig):
         super().__post_init__()
         require(self.batch_size > 1, "KTO requires batch_size > 1 to estimate the KL term")
         require(self.batch_size % 2 == 0, "KTO requires an even batch_size for balanced minibatches")
+        require_finite_number(self.kto_desirable_weight, "kto_desirable_weight")
+        require_finite_number(self.kto_undesirable_weight, "kto_undesirable_weight")
         require(self.kto_desirable_weight > 0, "kto_desirable_weight must be > 0")
         require(self.kto_undesirable_weight > 0, "kto_undesirable_weight must be > 0")
 

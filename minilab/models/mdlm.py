@@ -17,6 +17,7 @@ from minilab.models.diffusion_base import (
     loss_normalizer,
     supervised_diffusion_mask,
     validate_clean_tokens,
+    validate_infill_tokens,
     validate_loss_mask,
 )
 from minilab.registry import register_model
@@ -42,6 +43,7 @@ class MDLM(DiffusionBackboneMixin, BaseModel):
         self.apply(self._init_weights)
 
     def forward(self, z_t, t):
+        validate_infill_tokens(z_t, z_t == self.mask_token_id, self.config, "MDLM forward")
         x = self._diffusion_backbone_forward(z_t, t, "MDLM")
         return apply_subs_clean_logits(self.lm_head(x), z_t, self.mask_token_id)
 

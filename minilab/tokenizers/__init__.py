@@ -33,7 +33,6 @@ def load_tokenizer(path):
     ))
     cls = get_tokenizer(state["type"])
     tok = cls()
-    if hasattr(tok, "_set_state_base_dir"):
-        tok._set_state_base_dir(path.parent)
+    tok._set_state_base_dir(path.parent)
     tok._set_state(state)
     return tok

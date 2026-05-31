@@ -1,3 +1,5 @@
+import math
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -19,9 +21,20 @@ from minilab.alignment_common import (
     _whiten_masked,
 )
 from minilab.base import BaseModel, unwrap_model
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer_fields
 from minilab.generation import generate
 from minilab.registry import register_trainer
+from minilab.rl_diagnostics import (
+    append_jsonl,
+    group_stats,
+    ppo_stats,
+    rollout_records,
+    rollout_system_stats,
+    scalar_record,
+    stack_reward_results,
+    split_reward_result,
+    vpo_rollout_records,
+)
 from minilab.trainer import (
     TrainConfig,
     Trainer,
@@ -30,6 +43,13 @@ from minilab.trainer import (
     optimizer_decay_groups,
     set_seed,
 )
+
+
+ONLINE_RL_REFERENCE_ALGORITHMS = frozenset({"ppo", "grpo", "drgrpo", "gspo", "rloo"})
+
+
+def online_rl_uses_reference(algorithm):
+    return algorithm in ONLINE_RL_REFERENCE_ALGORITHMS
 
 
 @dataclass
@@ -47,6 +67,12 @@ class PPOTrainConfig(TrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_integer_fields(self, ("ppo_max_new_tokens", "ppo_inner_epochs"))
+        for name in (
+            "ppo_clip_ratio", "ppo_value_clip", "ppo_kl_coef", "ppo_value_coef",
+            "ppo_entropy_coef", "ppo_gamma", "ppo_lam",
+        ):
+            require_finite_number(getattr(self, name), name)
         require(self.ppo_max_new_tokens > 0, "ppo_max_new_tokens must be > 0")
         require(self.ppo_clip_ratio > 0, "ppo_clip_ratio must be > 0")
         require(self.ppo_value_clip > 0, "ppo_value_clip must be > 0")
@@ -68,11 +94,112 @@ class GRPOTrainConfig(TrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_integer_fields(self, (
+            "grpo_num_generations", "grpo_max_new_tokens", "grpo_inner_epochs",
+        ))
+        require_finite_number(self.grpo_clip_ratio, "grpo_clip_ratio")
+        require_finite_number(self.grpo_kl_coef, "grpo_kl_coef")
         require(self.grpo_num_generations > 1, "GRPO requires grpo_num_generations > 1")
         require(self.grpo_max_new_tokens > 0, "grpo_max_new_tokens must be > 0")
         require(self.grpo_clip_ratio > 0, "grpo_clip_ratio must be > 0")
         require(self.grpo_kl_coef >= 0, "grpo_kl_coef must be >= 0")
         require(self.grpo_inner_epochs >= 1, "grpo_inner_epochs must be >= 1")
+
+
+@dataclass
+class DrGRPOTrainConfig(GRPOTrainConfig):
+    """Dr.GRPO uses GRPO's loop knobs while changing advantage normalization."""
+
+
+@dataclass
+class TPOTrainConfig(GRPOTrainConfig):
+    tpo_eta: float = 1.0
+    tpo_anchor_old_policy: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        require_finite_number(self.tpo_eta, "tpo_eta")
+        require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
+            "TPO fits a sampled target distribution and does not use GRPO clipping; "
+            "leave grpo_clip_ratio at the inherited default"
+        ))
+        require(self.grpo_kl_coef == GRPOTrainConfig.grpo_kl_coef, (
+            "TPO fits a sampled target distribution and does not use the GRPO KL penalty; "
+            "leave grpo_kl_coef at the inherited default"
+        ))
+        require(self.tpo_eta > 0, "tpo_eta must be > 0")
+
+
+@dataclass
+class GroupPGTrainConfig(GRPOTrainConfig):
+    def __post_init__(self):
+        super().__post_init__()
+        require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
+            "GroupPG is an unclipped sequence policy-gradient ablation; "
+            "leave grpo_clip_ratio at the inherited default"
+        ))
+        require(self.grpo_kl_coef == GRPOTrainConfig.grpo_kl_coef, (
+            "GroupPG does not use the GRPO KL penalty; leave grpo_kl_coef at the inherited default"
+        ))
+
+
+@dataclass
+class SequenceDGTrainConfig(GRPOTrainConfig):
+    dg_eta: float = 1.0
+    dg_keep_ratio: float = 0.5
+    dg_uncertainty_threshold: float = 0.5
+    dg_replay_capacity: int = 0
+    dg_replay_min_age: int = 1
+    dg_replay_age_decay: float = 0.0
+    dg_staleness_delay: int = 0
+    dg_drop_stale_after: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        require_integer_fields(self, (
+            "dg_replay_capacity", "dg_replay_min_age", "dg_staleness_delay",
+            "dg_drop_stale_after",
+        ))
+        for name in (
+            "dg_eta", "dg_keep_ratio", "dg_uncertainty_threshold",
+            "dg_replay_age_decay",
+        ):
+            require_finite_number(getattr(self, name), name)
+        require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
+            "DG-family sequence objectives do not use GRPO token-level clipping; "
+            "leave grpo_clip_ratio at the inherited default"
+        ))
+        require(self.dg_eta > 0, "dg_eta must be > 0")
+        require(0 < self.dg_keep_ratio <= 1, "dg_keep_ratio must be in (0, 1]")
+        require(self.dg_uncertainty_threshold >= 0, "dg_uncertainty_threshold must be >= 0")
+        require(self.dg_replay_capacity >= 0, "dg_replay_capacity must be >= 0")
+        require(self.dg_replay_min_age >= 0, "dg_replay_min_age must be >= 0")
+        require(self.dg_replay_age_decay >= 0, "dg_replay_age_decay must be >= 0")
+        require(self.dg_staleness_delay >= 0, "dg_staleness_delay must be >= 0")
+        require(self.dg_drop_stale_after >= 0, "dg_drop_stale_after must be >= 0")
+        require(
+            self.dg_drop_stale_after == 0 or self.dg_drop_stale_after >= self.dg_staleness_delay,
+            "dg_drop_stale_after must be 0 or >= dg_staleness_delay",
+        )
+
+
+@dataclass
+class VPOTrainConfig(GRPOTrainConfig):
+    vpo_num_candidates: int = 3
+    vpo_num_scalarizations: int = 8
+    vpo_dirichlet_alpha: float = 1.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        require_integer_fields(self, ("vpo_num_candidates", "vpo_num_scalarizations"))
+        require_finite_number(self.vpo_dirichlet_alpha, "vpo_dirichlet_alpha")
+        require(self.grpo_kl_coef == GRPOTrainConfig.grpo_kl_coef, (
+            "VPO uses set-level clipped policy updates and does not use the GRPO KL penalty; "
+            "leave grpo_kl_coef at the inherited default"
+        ))
+        require(self.vpo_num_candidates > 1, "VPO requires vpo_num_candidates > 1")
+        require(self.vpo_num_scalarizations > 0, "vpo_num_scalarizations must be > 0")
+        require(self.vpo_dirichlet_alpha > 0, "vpo_dirichlet_alpha must be > 0")
 
 
 @dataclass
@@ -86,6 +213,10 @@ class DAPOTrainConfig(GRPOTrainConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        require_integer_fields(self, ("dapo_safe_length", "dapo_max_resample"))
+        require_finite_number(self.dapo_clip_ratio_low, "dapo_clip_ratio_low")
+        require_finite_number(self.dapo_clip_ratio_high, "dapo_clip_ratio_high")
+        require_finite_number(self.dapo_length_penalty, "dapo_length_penalty")
         require(self.grpo_kl_coef == 0, "DAPO removes the KL penalty; set grpo_kl_coef=0")
         require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
             "DAPO uses dapo_clip_ratio_low/high; leave grpo_clip_ratio at the inherited default"
@@ -132,11 +263,26 @@ class PPOValueHead(nn.Module):
 class PPORollout:
     seqs: torch.Tensor
     labels: torch.Tensor
+    completions: torch.Tensor
+    completion_mask: torch.Tensor
+    rewards: torch.Tensor
+    reward_components: dict | None
     old_logp: torch.Tensor
     old_values: torch.Tensor
     advantages: torch.Tensor
     returns: torch.Tensor
     mask: torch.Tensor
+    generation_latency_ms: float = 0.0
+    reward_latency_ms: float = 0.0
+    generated_tokens: int = 0
+    reward_calls: int = 0
+    queue_depth: int = 0
+    dropped_stale_count: int = 0
+    staleness_delay: int = 0
+    drop_stale_after: int = 0
+    age: int = 0
+    accepted_for_training: bool = True
+    drop_reason: str = ""
 
 
 @dataclass
@@ -148,6 +294,42 @@ class GroupRollout:
     completion_masks: list
     rewards: torch.Tensor
     adv: torch.Tensor
+    reward_components: dict | None = None
+    age: int = 0
+    generation_latency_ms: float = 0.0
+    reward_latency_ms: float = 0.0
+    generated_tokens: int = 0
+    reward_calls: int = 0
+    queue_depth: int = 0
+    dropped_stale_count: int = 0
+    staleness_delay: int = 0
+    drop_stale_after: int = 0
+    accepted_for_training: bool = True
+    drop_reason: str = ""
+
+
+@dataclass
+class VPORollout:
+    seqs: list
+    label_seqs: list
+    old_token_logps: list
+    completions: list
+    completion_masks: list
+    rewards: torch.Tensor
+    adv: torch.Tensor
+    candidate_rewards: torch.Tensor
+    reward_components: dict
+    generation_latency_ms: float = 0.0
+    reward_latency_ms: float = 0.0
+    generated_tokens: int = 0
+    reward_calls: int = 0
+    queue_depth: int = 0
+    dropped_stale_count: int = 0
+    staleness_delay: int = 0
+    drop_stale_after: int = 0
+    age: int = 0
+    accepted_for_training: bool = True
+    drop_reason: str = ""
 
 
 def _sample_completion(model, prompt, max_new_tokens, context):
@@ -167,7 +349,12 @@ def _sample_completion(model, prompt, max_new_tokens, context):
 
 
 def _pack_prompt_completions(prompt_ids, prompt_lens, completions, device):
+    require(prompt_ids.dim() == 2, "prompt_ids must have shape (batch, seq)")
     B = prompt_ids.size(0)
+    require(B > 0, "prompt_ids must contain at least one prompt")
+    require(prompt_lens.shape == (B,), "prompt_lens must have shape (batch,)")
+    require(prompt_lens.dtype == torch.long, "prompt_lens must use dtype torch.long")
+    require(len(completions) == B, "completions must match prompt batch size")
     comp_lens = [gen.size(0) for gen in completions]
     max_clen = max(comp_lens)
     completion_pad = torch.zeros(B, max_clen, device=device, dtype=torch.long)
@@ -175,8 +362,12 @@ def _pack_prompt_completions(prompt_ids, prompt_lens, completions, device):
     seqs, labels = [], []
 
     for b, gen in enumerate(completions):
+        require(gen.dim() == 1, "completions must be 1D token tensors")
+        require(gen.dtype == torch.long, "completions must use dtype torch.long")
         plen = int(prompt_lens[b].item())
+        require(0 < plen <= prompt_ids.size(1), "prompt_lens must be in [1, prompt sequence length]")
         clen = gen.size(0)
+        require(clen > 0, "completions must contain at least one token")
         completion_pad[b, :clen] = gen
         completion_mask[b, :clen] = True
         full = torch.cat([prompt_ids[b, :plen], gen])
@@ -192,6 +383,64 @@ def _pack_prompt_completions(prompt_ids, prompt_lens, completions, device):
         seq_pad[b, : seqs[b].size(0)] = seqs[b]
         label_pad[b, : labels[b].size(0)] = labels[b]
     return completion_pad, completion_mask, seq_pad, label_pad, comp_lens
+
+
+def _group_centered_advantages(rewards):
+    return rewards - rewards.mean(dim=1, keepdim=True)
+
+
+def _tpo_skill(rewards):
+    centered = rewards - rewards.mean(dim=1, keepdim=True)
+    std = centered.std(dim=1, unbiased=False, keepdim=True)
+    return torch.where(std > 1e-6, centered / std.clamp(min=1e-6), centered)
+
+
+def _safe_sequence_scores(token_logp, labels):
+    mask = (labels != -100).float()
+    require(mask.sum(dim=-1).gt(0).all(), "sequence policy scores require at least one supervised token")
+    return (token_logp * mask).sum(dim=-1), mask
+
+
+def _group_sequence_scores(model, rollout, device, return_aux=True):
+    scores = []
+    masks = []
+    aux_total = torch.tensor(0.0, device=device)
+    for seq, labels in zip(rollout.seqs, rollout.label_seqs, strict=True):
+        if return_aux:
+            logp, mask, aux = _generation_context_token_logp(model, seq, labels, return_aux=True)
+            aux_total = aux_total + aux
+        else:
+            logp, mask = _generation_context_token_logp(model, seq, labels)
+        score, _ = _safe_sequence_scores(logp, labels)
+        scores.append(score)
+        masks.append(mask)
+    aux_mean = aux_total / max(1, len(scores))
+    return torch.stack(scores, dim=1), masks, aux_mean
+
+
+def _old_sequence_scores(rollout):
+    return torch.stack([
+        _safe_sequence_scores(old_logp, labels)[0]
+        for old_logp, labels in zip(rollout.old_token_logps, rollout.label_seqs, strict=True)
+    ], dim=1).detach()
+
+
+def _vpo_set_rewards(candidate_rewards, components, num_scalarizations, dirichlet_alpha):
+    require(candidate_rewards.dim() == 3, "VPO candidate rewards must have shape [batch, generations, candidates]")
+    require(components, "VPO requires vector reward components; scalar-only rewards are not a VPO objective")
+    require(num_scalarizations > 0, "VPO requires at least one scalarization")
+    require(dirichlet_alpha > 0, "VPO Dirichlet alpha must be > 0")
+    for key, value in components.items():
+        require(value.shape == candidate_rewards.shape, (
+            f"VPO reward component '{key}' must match candidate reward shape"
+        ))
+    vectors = torch.stack([value.float() for value in components.values()], dim=-1)
+    dims = vectors.size(-1)
+    concentration = torch.full((dims,), dirichlet_alpha, device=vectors.device, dtype=vectors.dtype)
+    weights = torch.distributions.Dirichlet(concentration).sample(
+        (vectors.size(0), num_scalarizations))
+    scalarized = torch.einsum("bkcd,bsd->bkcs", vectors, weights)
+    return scalarized.max(dim=2).values.mean(dim=-1)
 
 
 @register_trainer("ppo")
@@ -307,6 +556,7 @@ class PPOTrainer(Trainer):
                     if self.aim_run:
                         self.aim_run.track(avg_loss, name="loss", step=self.step)
                         self.aim_run.track(lr, name="lr", step=self.step)
+                self._record_online_rollout(batch, rollout)
                 self._save_checkpoint_if_due()
                 self.model.eval()
                 self.value_head.eval()
@@ -327,52 +577,79 @@ class PPOTrainer(Trainer):
         value_was_training = self.value_head.training
         self.model.eval()
         self.value_head.eval()
-        with torch.no_grad():
+        try:
+            generation_started = time.perf_counter()
+            with torch.no_grad():
+                for b in range(B):
+                    plen = int(prompt_lens[b].item())
+                    new_tokens = min(self.max_new_tokens, max_ctx - plen)
+                    gens.append(_sample_completion(
+                        self.model,
+                        prompt_ids[b : b + 1, :plen],
+                        new_tokens,
+                        "PPO",
+                    ))
+            generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+
+            completions, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
+                prompt_ids,
+                prompt_lens,
+                gens,
+                self.device,
+            )
+
+            reward_started = time.perf_counter()
+            rewards, reward_components = split_reward_result(self.reward_fn(batch, completions, completion_mask))
+            reward_latency_ms = (time.perf_counter() - reward_started) * 1000.0
+            rewards = rewards.to(self.device)
+            reward_components = {key: value.to(self.device) for key, value in reward_components.items()}
+            with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                old_logp, old_values, mask, _ = self._token_logp_values_entropy(self.model, seq_pad, label_pad)
+                ref_logp, _ = _generation_context_token_logp(self.ref_model, seq_pad, label_pad)
+
+            shaped = -self.kl_coef * (old_logp - ref_logp) * mask
+            last_idx = mask.long().sum(dim=1) - 1
+            active_positions = mask.bool().float().cumsum(dim=1) - 1
             for b in range(B):
-                plen = int(prompt_lens[b].item())
-                new_tokens = min(self.max_new_tokens, max_ctx - plen)
-                gens.append(_sample_completion(
-                    self.model,
-                    prompt_ids[b : b + 1, :plen],
-                    new_tokens,
-                    "PPO",
-                ))
+                terminal = (active_positions[b].eq(last_idx[b]) & mask[b].bool()).nonzero(as_tuple=False).flatten()
+                require(terminal.numel() == 1, "PPO terminal reward needs exactly one final response token")
+                shaped[b, terminal.item()] = shaped[b, terminal.item()] + rewards[b]
 
-        completions, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
-            prompt_ids,
-            prompt_lens,
-            gens,
-            self.device,
-        )
+            advantages, returns = self._gae(shaped, old_values, mask)
+            if self.whiten_rewards:
+                advantages = _whiten_masked(advantages, mask)
 
-        rewards = self.reward_fn(batch, completions, completion_mask).to(self.device)
-        with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-            old_logp, old_values, mask, _ = self._token_logp_values_entropy(self.model, seq_pad, label_pad)
-            ref_logp, _ = _generation_context_token_logp(self.ref_model, seq_pad, label_pad)
+            return PPORollout(
+                seqs=seq_pad,
+                labels=label_pad,
+                completions=completions,
+                completion_mask=completion_mask,
+                rewards=rewards.detach(),
+                reward_components={key: value.detach() for key, value in reward_components.items()},
+                old_logp=old_logp.detach(),
+                old_values=old_values.detach(),
+                advantages=advantages.detach(),
+                returns=returns.detach(),
+                mask=mask.detach(),
+                generation_latency_ms=generation_latency_ms,
+                reward_latency_ms=reward_latency_ms,
+                generated_tokens=int(completion_mask.sum().item()),
+                reward_calls=1,
+            )
+        finally:
+            self.model.train(was_training)
+            self.value_head.train(value_was_training)
 
-        shaped = -self.kl_coef * (old_logp - ref_logp) * mask
-        last_idx = mask.long().sum(dim=1) - 1
-        active_positions = mask.bool().float().cumsum(dim=1) - 1
-        for b in range(B):
-            terminal = (active_positions[b].eq(last_idx[b]) & mask[b].bool()).nonzero(as_tuple=False).flatten()
-            require(terminal.numel() == 1, "PPO terminal reward needs exactly one final response token")
-            shaped[b, terminal.item()] = shaped[b, terminal.item()] + rewards[b]
-
-        advantages, returns = self._gae(shaped, old_values, mask)
-        if self.whiten_rewards:
-            advantages = _whiten_masked(advantages, mask)
-
-        self.model.train(was_training)
-        self.value_head.train(value_was_training)
-        return PPORollout(
-            seqs=seq_pad,
-            labels=label_pad,
-            old_logp=old_logp.detach(),
-            old_values=old_values.detach(),
-            advantages=advantages.detach(),
-            returns=returns.detach(),
-            mask=mask.detach(),
-        )
+    def _record_online_rollout(self, batch, rollout):
+        if self.config.rl_metrics_every > 0 and self.step % self.config.rl_metrics_every == 0:
+            metrics = ppo_stats(rollout.rewards, rollout.advantages, rollout.mask)
+            metrics.update(rollout_system_stats(rollout))
+            for key, value in (rollout.reward_components or {}).items():
+                metrics[f"reward_component_{key}_mean"] = float(value.float().mean().item())
+            append_jsonl(
+                Path(self.config.save_dir) / "online_rl_metrics.jsonl",
+                [scalar_record(type(self).__name__, self.step, "ppo", metrics)],
+            )
 
     def _policy_loss(self, rollout):
         logp, values, mask, entropy = self._token_logp_values_entropy(self.model, rollout.seqs, rollout.labels)
@@ -434,8 +711,9 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         "grpo_num_generations", "grpo_max_new_tokens",
         "grpo_clip_ratio", "grpo_kl_coef", "grpo_inner_epochs",
     )
+    _uses_reference_model = True
 
-    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path, *, signature, tokenizer_sig="", eval_dataset=None):
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
         # PromptDataset yields prompts, not (input, label) pairs — so the generic
         # LM-style eval loss is undefined here. The paper metric is held-out task
         # accuracy, which scripts/grpo.py runs post-training. Reject eval hooks
@@ -447,19 +725,37 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         # Each inner epoch steps the optimizer; accumulating would reshape the
         # update schedule in a way that silently changes the algorithm.
         require(config.grad_accum_steps == 1, "GRPO does not support grad_accum_steps > 1")
-        self.ref_model_path = _trainer_reference_path(ref_model_path, config, "GRPO")
-        _validate_reference_tokenizer(self.ref_model_path, tokenizer_sig, "GRPO")
+        if self._uses_reference_model:
+            self.ref_model_path = _trainer_reference_path(ref_model_path, config, self._algorithm_name().upper())
+            _validate_reference_tokenizer(self.ref_model_path, tokenizer_sig, self._algorithm_name().upper())
+        else:
+            require(ref_model_path in {None, ""}, (
+                f"{type(self).__name__} is reference-free; do not pass ref_model_path"
+            ))
         super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
-        self.ref_model = _load_reference_model(self.model, self.ref_model_path, self.device, "GRPO")
+        if self._uses_reference_model:
+            self.ref_model = _load_reference_model(
+                self.model,
+                self.ref_model_path,
+                self.device,
+                self._algorithm_name().upper(),
+            )
         self.reward_fn = reward_fn
         self.K = config.grpo_num_generations
         self.inner_epochs = config.grpo_inner_epochs
         self.max_new_tokens = config.grpo_max_new_tokens
         self.clip_ratio = config.grpo_clip_ratio
         self.kl_coef = config.grpo_kl_coef
+        self._last_policy_metrics = {}
 
     def _configured_scheduler_total_steps(self):
         return self.config.max_steps * self.config.grpo_inner_epochs
+
+    def save_checkpoint(self):
+        if self._uses_reference_model:
+            super().save_checkpoint()
+        else:
+            Trainer.save_checkpoint(self)
 
     def train(self):
         _rollout_policy_train_loop(self, self.inner_epochs)
@@ -483,55 +779,96 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         completions, completion_masks, seqs, label_seqs = [], [], [], []
         was_training = self.model.training
         self.model.eval()
-        with torch.no_grad():
-            for _ in range(self.K):
-                gens = []
-                for b in range(B):
-                    plen = int(prompt_lens[b].item())
-                    # GRPO ratios below are full-softmax token ratios, so the
-                    # behavior policy must not apply top-k/top-p/repetition filters.
-                    gens.append(_sample_completion(
-                        self.model,
-                        prompt_ids[b : b + 1, :plen],
-                        self.max_new_tokens,
-                        "GRPO",
-                    ))
-                padded, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
-                    prompt_ids,
-                    prompt_lens,
-                    gens,
-                    self.device,
-                )
-                require(completion_mask.any(dim=1).all(), "GRPO requires at least one generated token per prompt")
-                completions.append(padded)
-                completion_masks.append(completion_mask)
-                seqs.append(seq_pad)
-                label_seqs.append(label_pad)
+        try:
+            generation_started = time.perf_counter()
+            with torch.no_grad():
+                for _ in range(self.K):
+                    gens = []
+                    for b in range(B):
+                        plen = int(prompt_lens[b].item())
+                        # GRPO ratios below are full-softmax token ratios, so the
+                        # behavior policy must not apply top-k/top-p/repetition filters.
+                        gens.append(_sample_completion(
+                            self.model,
+                            prompt_ids[b : b + 1, :plen],
+                            self.max_new_tokens,
+                            "GRPO",
+                        ))
+                    padded, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
+                        prompt_ids,
+                        prompt_lens,
+                        gens,
+                        self.device,
+                    )
+                    require(completion_mask.any(dim=1).all(), "GRPO requires at least one generated token per prompt")
+                    completions.append(padded)
+                    completion_masks.append(completion_mask)
+                    seqs.append(seq_pad)
+                    label_seqs.append(label_pad)
+            generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
 
-        rewards = torch.stack([
-            self.reward_fn(batch, c, m)
-            for c, m in zip(completions, completion_masks, strict=True)
-        ], dim=1).to(self.device)
-        adv = _group_normalized_advantages(rewards)
+            reward_started = time.perf_counter()
+            rewards, reward_components = stack_reward_results(
+                [
+                    self.reward_fn(batch, c, m)
+                    for c, m in zip(completions, completion_masks, strict=True)
+                ],
+                self.device,
+            )
+            reward_latency_ms = (time.perf_counter() - reward_started) * 1000.0
+            adv = _group_normalized_advantages(rewards)
 
-        old_token_logps = []
-        for k in range(self.K):
-            with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-                old_token_logps.append(_generation_context_token_logp(self.model, seqs[k], label_seqs[k])[0])
+            old_token_logps = []
+            for k in range(self.K):
+                with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                    old_token_logps.append(_generation_context_token_logp(self.model, seqs[k], label_seqs[k])[0])
 
-        self.model.train(was_training)
-        return GroupRollout(
-            seqs=seqs,
-            label_seqs=label_seqs,
-            old_token_logps=old_token_logps,
-            completions=completions,
-            completion_masks=completion_masks,
-            rewards=rewards,
-            adv=adv,
-        )
+            return GroupRollout(
+                seqs=seqs,
+                label_seqs=label_seqs,
+                old_token_logps=old_token_logps,
+                completions=completions,
+                completion_masks=completion_masks,
+                rewards=rewards,
+                adv=adv,
+                reward_components=reward_components,
+                generation_latency_ms=generation_latency_ms,
+                reward_latency_ms=reward_latency_ms,
+                generated_tokens=int(sum(mask.sum().item() for mask in completion_masks)),
+                reward_calls=len(completion_masks),
+            )
+        finally:
+            self.model.train(was_training)
+
+    def _record_online_rollout(self, batch, rollout):
+        if self.config.rl_metrics_every > 0 and self.step % self.config.rl_metrics_every == 0:
+            metrics = group_stats(rollout.rewards, rollout.adv, rollout.completion_masks, rollout.reward_components)
+            metrics.update(rollout_system_stats(rollout))
+            metrics.update(self._last_policy_metrics)
+            append_jsonl(
+                Path(self.config.save_dir) / "online_rl_metrics.jsonl",
+                [scalar_record(type(self).__name__, self.step, self._algorithm_name(), metrics)],
+            )
+        if self.config.rl_trace_samples > 0:
+            append_jsonl(
+                Path(self.config.save_dir) / "trajectories.jsonl",
+                rollout_records(
+                    type(self).__name__,
+                    self.step,
+                    self._algorithm_name(),
+                    batch,
+                    rollout,
+                    self.config.rl_trace_samples,
+                ),
+            )
+
+    def _algorithm_name(self):
+        return "grpo"
 
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
+        ratio_values = []
+        kl_values = []
         for k in range(self.K):
             logp, mask, aux = _generation_context_token_logp(
                 self.model,
@@ -548,8 +885,492 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
                 ref_logp, _ = _generation_context_token_logp(self.ref_model, rollout.seqs[k], rollout.label_seqs[k])
             delta = ref_logp - logp
             kl = _masked_response_mean(delta.exp() - delta - 1, mask, "GRPO KL")
+            ratio_values.append(ratio.detach()[mask.bool()])
+            kl_values.append((delta.exp() - delta - 1).detach()[mask.bool()])
             total = total + policy_loss + self.kl_coef * kl + aux
+        if ratio_values:
+            ratio_flat = torch.cat(ratio_values)
+            kl_flat = torch.cat(kl_values)
+            self._last_policy_metrics = {
+                "ratio_mean": float(ratio_flat.mean().item()),
+                "clip_fraction": float(((ratio_flat < 1 - self.clip_ratio) | (ratio_flat > 1 + self.clip_ratio)).float().mean().item()),
+                "kl_mean": float(kl_flat.mean().item()),
+            }
         return total / self.K
+
+
+@register_trainer("drgrpo")
+class DrGRPOTrainer(GRPOTrainer):
+    """Dr.GRPO-style group-centered trainer without reward-std normalization.
+
+    This scoped path isolates the normalization ablation in Minilab's LM rollout
+    contract. Length-bias corrections are not part of this class; DAPO owns the
+    length-shaping path.
+    """
+
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, DrGRPOTrainConfig), "DrGRPOTrainer requires DrGRPOTrainConfig")
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+
+    def _rollout(self, batch):
+        rollout = super()._rollout(batch)
+        return replace(rollout, adv=_group_centered_advantages(rollout.rewards))
+
+    def _algorithm_name(self):
+        return "drgrpo"
+
+
+@register_trainer("tpo")
+class TPOTrainer(GRPOTrainer):
+    """Target Policy Optimization over LM rollout groups.
+
+    For each prompt, the sampled completions form a candidate simplex. The
+    target distribution is proportional to the old policy's sequence
+    probabilities times an exponentiated standardized reward skill, then the
+    current policy is fit to that target over the sampled candidates.
+    """
+
+    _extra_critical_fields = GRPOTrainer._extra_critical_fields + ("tpo_eta", "tpo_anchor_old_policy")
+    _uses_reference_model = False
+
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, TPOTrainConfig), "TPOTrainer requires TPOTrainConfig")
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+        self.eta = config.tpo_eta
+        self.anchor_old_policy = config.tpo_anchor_old_policy
+
+    def _policy_loss(self, rollout):
+        current_scores, _masks, aux = _group_sequence_scores(self.model, rollout, self.device, return_aux=True)
+        old_scores = _old_sequence_scores(rollout)
+        skill = _tpo_skill(rollout.rewards)
+        if self.anchor_old_policy:
+            target_logits = F.log_softmax(old_scores, dim=1) + skill / self.eta
+        else:
+            target_logits = skill / self.eta
+        q = F.softmax(target_logits, dim=1).detach()
+        log_p = F.log_softmax(current_scores, dim=1)
+        loss = -(q * log_p).sum(dim=1).mean() + aux
+        self._last_policy_metrics = {
+            "tpo_target_entropy": float((-(q * q.clamp_min(1e-12).log()).sum(dim=1)).mean().item()),
+            "tpo_target_top_prob": float(q.max(dim=1).values.mean().item()),
+        }
+        return loss
+
+    def _algorithm_name(self):
+        return "tpo" if self.anchor_old_policy else "tpo_no_anchor"
+
+
+@register_trainer("tpo_no_anchor")
+class TPONoAnchorTrainer(TPOTrainer):
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, TPOTrainConfig), "TPONoAnchorTrainer requires TPOTrainConfig")
+        require(not config.tpo_anchor_old_policy, "TPONoAnchorTrainer requires tpo_anchor_old_policy=False")
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+
+
+@register_trainer("group_pg")
+class GroupPGTrainer(GRPOTrainer):
+    """Reward-skill weighted sequence policy-gradient ablation for TPO."""
+
+    _uses_reference_model = False
+
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, GroupPGTrainConfig), "GroupPGTrainer requires GroupPGTrainConfig")
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+
+    def _policy_loss(self, rollout):
+        current_scores, _masks, aux = _group_sequence_scores(self.model, rollout, self.device, return_aux=True)
+        skill = _tpo_skill(rollout.rewards).detach()
+        self._last_policy_metrics = {"group_pg_skill_abs_mean": float(skill.abs().mean().item())}
+        return -(skill * current_scores).sum(dim=1).mean() / self.K + aux
+
+    def _algorithm_name(self):
+        return "group_pg"
+
+
+@register_trainer("vpo")
+class VPOTrainer(GRPOTrainer):
+    """Vector Policy Optimization over LM candidate sets.
+
+    A rollout group contains K sets, each set contains C sampled completions,
+    and component rewards define the vector reward. Each prompt group shares a
+    batch of Dirichlet scalarizations, and the set reward is the mean best
+    candidate under those scalarizations.
+    """
+
+    _extra_critical_fields = GRPOTrainer._extra_critical_fields + (
+        "vpo_num_candidates", "vpo_num_scalarizations", "vpo_dirichlet_alpha",
+    )
+    _uses_reference_model = False
+
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, VPOTrainConfig), "VPOTrainer requires VPOTrainConfig")
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+        self.C = config.vpo_num_candidates
+        self.S = config.vpo_num_scalarizations
+        self.dirichlet_alpha = config.vpo_dirichlet_alpha
+
+    def _rollout(self, batch):
+        prompt_ids = batch["prompt_ids"]
+        prompt_lens = batch["prompt_len"]
+        require((prompt_lens > 0).all(), "VPO requires prompt_len > 0 for every prompt")
+        B = prompt_ids.size(0)
+
+        flat_completions, flat_masks, flat_seqs, flat_labels = [], [], [], []
+        candidate_rewards = []
+        component_rows = {}
+        generation_latency_ms = 0.0
+        reward_latency_ms = 0.0
+        generated_tokens = 0
+        reward_calls = 0
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                for _ in range(self.K):
+                    set_rewards = []
+                    set_components = {}
+                    for _candidate in range(self.C):
+                        generation_started = time.perf_counter()
+                        gens = []
+                        for b in range(B):
+                            plen = int(prompt_lens[b].item())
+                            gens.append(_sample_completion(
+                                self.model,
+                                prompt_ids[b : b + 1, :plen],
+                                self.max_new_tokens,
+                                "VPO",
+                            ))
+                        padded, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
+                            prompt_ids,
+                            prompt_lens,
+                            gens,
+                            self.device,
+                        )
+                        generation_latency_ms += (time.perf_counter() - generation_started) * 1000.0
+                        generated_tokens += int(completion_mask.sum().item())
+                        reward_started = time.perf_counter()
+                        reward, components = stack_reward_results([self.reward_fn(batch, padded, completion_mask)], self.device)
+                        reward_latency_ms += (time.perf_counter() - reward_started) * 1000.0
+                        reward_calls += 1
+                        flat_completions.append(padded)
+                        flat_masks.append(completion_mask)
+                        flat_seqs.append(seq_pad)
+                        flat_labels.append(label_pad)
+                        set_rewards.append(reward[:, 0])
+                        for key, value in components.items():
+                            set_components.setdefault(key, []).append(value[:, 0])
+                    candidate_rewards.append(torch.stack(set_rewards, dim=1))
+                    for key, values in set_components.items():
+                        component_rows.setdefault(key, []).append(torch.stack(values, dim=1))
+
+            candidate_rewards = torch.stack(candidate_rewards, dim=1)
+            components = {
+                key: torch.stack(values, dim=1)
+                for key, values in component_rows.items()
+            }
+            rewards = _vpo_set_rewards(candidate_rewards, components, self.S, self.dirichlet_alpha)
+            adv = _group_normalized_advantages(rewards)
+
+            old_token_logps = []
+            for seq, label in zip(flat_seqs, flat_labels, strict=True):
+                with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                    old_token_logps.append(_generation_context_token_logp(self.model, seq, label)[0])
+
+            return VPORollout(
+                seqs=flat_seqs,
+                label_seqs=flat_labels,
+                old_token_logps=old_token_logps,
+                completions=flat_completions,
+                completion_masks=flat_masks,
+                rewards=rewards,
+                adv=adv,
+                candidate_rewards=candidate_rewards,
+                reward_components=components,
+                generation_latency_ms=generation_latency_ms,
+                reward_latency_ms=reward_latency_ms,
+                generated_tokens=generated_tokens,
+                reward_calls=reward_calls,
+            )
+        finally:
+            self.model.train(was_training)
+
+    def _policy_loss(self, rollout):
+        total = torch.tensor(0.0, device=self.device)
+        ratios = []
+        flat_index = 0
+        for k in range(self.K):
+            for _candidate in range(self.C):
+                logp, mask, aux = _generation_context_token_logp(
+                    self.model,
+                    rollout.seqs[flat_index],
+                    rollout.label_seqs[flat_index],
+                    return_aux=True,
+                )
+                ratio = (logp - rollout.old_token_logps[flat_index]).clamp(min=-20.0, max=20.0).exp()
+                adv = rollout.adv[:, k : k + 1]
+                surr1 = ratio * adv
+                surr2 = ratio.clamp(1 - self.clip_ratio, 1 + self.clip_ratio) * adv
+                policy_loss = -_masked_response_mean(torch.min(surr1, surr2), mask, "VPO policy loss")
+                total = total + policy_loss + aux
+                ratios.append(ratio.detach()[mask.bool()])
+                flat_index += 1
+        if ratios:
+            ratio_flat = torch.cat(ratios)
+            self._last_policy_metrics = {
+                "ratio_mean": float(ratio_flat.mean().item()),
+                "clip_fraction": float(((ratio_flat < 1 - self.clip_ratio) | (ratio_flat > 1 + self.clip_ratio)).float().mean().item()),
+                "best_at_set_mean": float(rollout.candidate_rewards.max(dim=2).values.mean().item()),
+                "pool_diversity_l1": float((rollout.candidate_rewards.max(dim=2).values - rollout.candidate_rewards.min(dim=2).values).abs().mean().item()),
+            }
+        return total / (self.K * self.C)
+
+    def _record_online_rollout(self, batch, rollout):
+        if self.config.rl_metrics_every > 0 and self.step % self.config.rl_metrics_every == 0:
+            metrics = group_stats(rollout.rewards, rollout.adv)
+            metrics.update(rollout_system_stats(rollout))
+            metrics.update(self._last_policy_metrics)
+            for key, value in rollout.reward_components.items():
+                metrics[f"reward_component_{key}_mean"] = float(value.float().mean().item())
+                metrics[f"vpo_best_{key}_mean"] = float(value.float().max(dim=2).values.mean().item())
+                metrics[f"vpo_diversity_{key}_mean"] = float((value.float().max(dim=2).values - value.float().min(dim=2).values).mean().item())
+            append_jsonl(
+                Path(self.config.save_dir) / "online_rl_metrics.jsonl",
+                [scalar_record(type(self).__name__, self.step, self._algorithm_name(), metrics)],
+            )
+        if self.config.rl_trace_samples > 0:
+            append_jsonl(
+                Path(self.config.save_dir) / "trajectories.jsonl",
+                vpo_rollout_records(
+                    type(self).__name__,
+                    self.step,
+                    self._algorithm_name(),
+                    rollout,
+                    self.config.rl_trace_samples,
+                ),
+            )
+
+    def _algorithm_name(self):
+        return "vpo"
+
+
+@register_trainer("dg")
+class DGTrainer(GRPOTrainer):
+    """Sequence-level Delightful Policy Gradient over LM rollouts.
+
+    Minilab's scoped LM version uses the rollout group's leave-mean reward as
+    the baseline because exact actor expected reward is unavailable for
+    free-form generation.
+    """
+
+    _extra_critical_fields = GRPOTrainer._extra_critical_fields + (
+        "dg_eta", "dg_keep_ratio", "dg_uncertainty_threshold",
+        "dg_replay_capacity", "dg_replay_min_age", "dg_replay_age_decay",
+        "dg_staleness_delay", "dg_drop_stale_after",
+    )
+    _uses_reference_model = False
+    _uses_grpo_kl_as_ratio_variance = False
+
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, SequenceDGTrainConfig), f"{type(self).__name__} requires SequenceDGTrainConfig")
+        if not self._uses_grpo_kl_as_ratio_variance:
+            require(config.grpo_kl_coef == GRPOTrainConfig.grpo_kl_coef, (
+                f"{type(self).__name__} does not use the R2VPO ratio-variance coefficient; "
+                "leave grpo_kl_coef at the inherited default"
+            ))
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+        self.dg_eta = config.dg_eta
+        self.keep_ratio = config.dg_keep_ratio
+        self.uncertainty_threshold = config.dg_uncertainty_threshold
+        self.replay_capacity = config.dg_replay_capacity
+        self.replay_min_age = config.dg_replay_min_age
+        self.replay_age_decay = config.dg_replay_age_decay
+        self.staleness_delay = config.dg_staleness_delay
+        self.drop_stale_after = config.dg_drop_stale_after
+        self._replay = []
+
+    def _sequence_advantage(self, rollout):
+        return rollout.rewards - rollout.rewards.mean(dim=1, keepdim=True)
+
+    def _sequence_uncertainty(self, rollout):
+        return rollout.rewards.std(dim=1, keepdim=True, unbiased=False).expand_as(rollout.rewards)
+
+    def _gate_and_advantage(self, seq_logp, old_seq_logp, rollout):
+        advantage = self._sequence_advantage(rollout)
+        surprisal = -old_seq_logp.detach()
+        gate = torch.sigmoid(advantage * surprisal / self.dg_eta)
+        return gate, advantage, {}
+
+    def _policy_loss(self, rollout):
+        seq_logp, _masks, aux = _group_sequence_scores(self.model, rollout, self.device, return_aux=True)
+        old_seq_logp = _old_sequence_scores(rollout)
+        gate, advantage, metrics = self._gate_and_advantage(seq_logp, old_seq_logp, rollout)
+        weight = (gate * advantage).detach()
+        self._last_policy_metrics = {
+            "gate_mean": float(gate.mean().item()),
+            **metrics,
+        }
+        return -(seq_logp * weight).mean() + aux
+
+    def _algorithm_name(self):
+        return "dg"
+
+
+@register_trainer("kondo")
+class KondoTrainer(DGTrainer):
+    """Compute-screening DG ablation using a smooth keep-ratio gate."""
+
+    def _gate_and_advantage(self, seq_logp, old_seq_logp, rollout):
+        advantage = self._sequence_advantage(rollout)
+        delight = advantage * (-old_seq_logp.detach())
+        flat = delight.reshape(-1)
+        if self.keep_ratio >= 1:
+            screen = torch.ones_like(delight)
+            threshold = flat.min()
+        else:
+            threshold = torch.quantile(flat, 1 - self.keep_ratio)
+            screen = torch.sigmoid((delight - threshold) / self.dg_eta)
+        gate = torch.sigmoid(delight / self.dg_eta) * screen
+        return gate, advantage, {
+            "kept_frac": float((screen > 0.5).float().mean().item()),
+            "gate_prob_mean": float(screen.mean().item()),
+        }
+
+    def _algorithm_name(self):
+        return "kondo"
+
+
+@register_trainer("uncertainty_dg")
+class UncertaintyDGTrainer(DGTrainer):
+    def _gate_and_advantage(self, seq_logp, old_seq_logp, rollout):
+        advantage = self._sequence_advantage(rollout)
+        uncertainty = self._sequence_uncertainty(rollout)
+        surprisal = -old_seq_logp.detach()
+        gate = torch.sigmoid((advantage * surprisal - uncertainty) / self.dg_eta)
+        return gate, advantage, {"uncertainty_mean": float(uncertainty.mean().item())}
+
+    def _algorithm_name(self):
+        return "uncertainty_dg"
+
+
+@register_trainer("filtered_dg")
+class FilteredDGTrainer(DGTrainer):
+    def _gate_and_advantage(self, seq_logp, old_seq_logp, rollout):
+        advantage = self._sequence_advantage(rollout)
+        uncertainty = self._sequence_uncertainty(rollout)
+        keep = (uncertainty <= self.uncertainty_threshold).float()
+        gate = torch.sigmoid(advantage * (-old_seq_logp.detach()) / self.dg_eta) * keep
+        return gate, advantage, {
+            "uncertainty_mean": float(uncertainty.mean().item()),
+            "kept_frac": float(keep.mean().item()),
+        }
+
+    def _algorithm_name(self):
+        return "filtered_dg"
+
+
+@register_trainer("reward_variance_dg")
+class RewardVarianceDGTrainer(DGTrainer):
+    def _gate_and_advantage(self, seq_logp, old_seq_logp, rollout):
+        advantage = self._sequence_advantage(rollout)
+        uncertainty = self._sequence_uncertainty(rollout)
+        effective = advantage / (1 + uncertainty)
+        gate = torch.sigmoid(effective * (-old_seq_logp.detach()) / self.dg_eta)
+        return gate, effective, {"uncertainty_mean": float(uncertainty.mean().item())}
+
+    def _algorithm_name(self):
+        return "reward_variance_dg"
+
+
+@register_trainer("aspo")
+class ASPOTrainer(DGTrainer):
+    """Asymmetric sequence-ratio policy gradient."""
+
+    def _policy_loss(self, rollout):
+        seq_logp, _masks, aux = _group_sequence_scores(self.model, rollout, self.device, return_aux=True)
+        old_seq_logp = _old_sequence_scores(rollout)
+        advantage = self._sequence_advantage(rollout)
+        log_ratio = (seq_logp - old_seq_logp).clamp(min=-20, max=20)
+        flipped = torch.where(advantage > 0, -log_ratio, log_ratio)
+        ratio = flipped.exp()
+        effective = ratio * advantage
+        self._last_policy_metrics = {"ratio_mean": float(ratio.mean().item())}
+        return -(seq_logp * effective.detach()).mean() + aux
+
+    def _algorithm_name(self):
+        return "aspo"
+
+
+@register_trainer("r2vpo")
+class R2VPOTrainer(DGTrainer):
+    """Ratio-variance regularized sequence policy gradient."""
+
+    _uses_grpo_kl_as_ratio_variance = True
+
+    def _policy_loss(self, rollout):
+        seq_logp, _masks, aux = _group_sequence_scores(self.model, rollout, self.device, return_aux=True)
+        old_seq_logp = _old_sequence_scores(rollout)
+        advantage = self._sequence_advantage(rollout)
+        ratio = (seq_logp - old_seq_logp).clamp(min=-20, max=20).exp()
+        penalty = 2 * self.config.grpo_kl_coef * (ratio - 1)
+        effective = ratio * (advantage - penalty)
+        self._last_policy_metrics = {
+            "ratio_mean": float(ratio.mean().item()),
+            "var_penalty_mean": float(penalty.mean().item()),
+        }
+        return -(seq_logp * effective.detach()).mean() + aux
+
+    def _algorithm_name(self):
+        return "r2vpo"
+
+
+@register_trainer("replay_dg")
+class ReplayDGTrainer(DGTrainer):
+    """In-process stale-rollout DG, mirroring replay as a local systems probe."""
+
+    def _rollout(self, batch):
+        fresh = replace(super()._rollout(batch), age=0)
+        capacity = max(self.replay_capacity, self.staleness_delay + 1 if self.staleness_delay > 0 else 0)
+        if capacity <= 0:
+            return replace(fresh, queue_depth=0)
+        self._replay = [replace(item, age=item.age + 1) for item in self._replay]
+        self._replay.append(fresh)
+        if len(self._replay) > capacity:
+            self._replay.pop(0)
+        dropped = 0
+        if self.drop_stale_after > 0:
+            kept = []
+            for item in self._replay:
+                if item.age > self.drop_stale_after:
+                    dropped += 1
+                else:
+                    kept.append(item)
+            self._replay = kept
+        delay = max(self.replay_min_age, self.staleness_delay)
+        ready = [item for item in self._replay if item.age >= delay]
+        selected = min(ready, key=lambda item: item.age) if ready else fresh
+        return replace(
+            selected,
+            queue_depth=len(self._replay),
+            dropped_stale_count=dropped,
+            staleness_delay=delay,
+            drop_stale_after=self.drop_stale_after,
+            drop_reason="" if ready or delay == 0 else "warming_up_for_staleness",
+        )
+
+    def _algorithm_name(self):
+        return "replay_dg"
+
+
+@register_trainer("fresh_dg")
+class FreshDGTrainer(ReplayDGTrainer):
+    def _gate_and_advantage(self, seq_logp, old_seq_logp, rollout):
+        gate, advantage, metrics = super()._gate_and_advantage(seq_logp, old_seq_logp, rollout)
+        freshness = torch.tensor(math.exp(-self.replay_age_decay * rollout.age), device=gate.device)
+        return gate * freshness, advantage, {**metrics, "freshness_weight": float(freshness.item()), "batch_age": float(rollout.age)}
+
+    def _algorithm_name(self):
+        return "fresh_dg"
 
 
 @register_trainer("rloo")
@@ -583,6 +1404,7 @@ class RLOOTrainer(GRPOTrainer):
 
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
+        seq_logps = []
         for k in range(self.K):
             logp, mask, aux = _generation_context_token_logp(
                 self.model,
@@ -591,8 +1413,14 @@ class RLOOTrainer(GRPOTrainer):
                 return_aux=True,
             )
             seq_logp = (logp * mask).sum(dim=-1)
+            seq_logps.append(seq_logp.detach())
             total = total - (seq_logp * rollout.adv[:, k].detach()).mean() + aux
+        if seq_logps:
+            self._last_policy_metrics = {"seq_logp_mean": float(torch.stack(seq_logps, dim=1).mean().item())}
         return total / self.K
+
+    def _algorithm_name(self):
+        return "rloo"
 
 
 @register_trainer("gspo")
@@ -610,6 +1438,8 @@ class GSPOTrainer(GRPOTrainer):
 
     def _policy_loss(self, rollout):
         total = torch.tensor(0.0, device=self.device)
+        ratios = []
+        kls = []
         for k in range(self.K):
             logp, mask, aux = _generation_context_token_logp(
                 self.model,
@@ -628,14 +1458,28 @@ class GSPOTrainer(GRPOTrainer):
                 ref_logp, _ = _generation_context_token_logp(self.ref_model, rollout.seqs[k], rollout.label_seqs[k])
             delta = ref_logp - logp
             kl = _masked_response_mean(delta.exp() - delta - 1, mask, "GSPO KL")
+            ratios.append(ratio.detach())
+            kls.append((delta.exp() - delta - 1).detach()[mask.bool()])
             total = total + policy_loss + self.kl_coef * kl + aux
+        if ratios:
+            ratio_flat = torch.cat([r.reshape(-1) for r in ratios])
+            kl_flat = torch.cat(kls)
+            self._last_policy_metrics = {
+                "ratio_mean": float(ratio_flat.mean().item()),
+                "clip_fraction": float(((ratio_flat < 1 - self.clip_ratio) | (ratio_flat > 1 + self.clip_ratio)).float().mean().item()),
+                "kl_mean": float(kl_flat.mean().item()),
+            }
         return total / self.K
+
+    def _algorithm_name(self):
+        return "gspo"
 
 
 @register_trainer("dapo")
 class DAPOTrainer(GRPOTrainer):
     """DAPO: decoupled clipping, dynamic sampling, token-level aggregation, length shaping."""
 
+    _uses_reference_model = False
     _extra_critical_fields = (
         "grpo_num_generations", "grpo_max_new_tokens",
         "grpo_inner_epochs",
@@ -706,8 +1550,11 @@ class DAPOTrainer(GRPOTrainer):
         rewards = rollout.rewards + torch.stack([
             self._length_reward(m) for m in rollout.completion_masks
         ], dim=1)
+        components = dict(rollout.reward_components or {})
+        if self.safe_length > 0 and self.length_penalty > 0:
+            components["length_penalty"] = rewards - rollout.rewards
         adv = _group_normalized_advantages(rewards)
-        return replace(rollout, rewards=rewards, adv=adv)
+        return replace(rollout, rewards=rewards, adv=adv, reward_components=components)
 
     def _length_reward(self, completion_mask):
         if self.safe_length == 0 or self.length_penalty == 0:
@@ -721,6 +1568,7 @@ class DAPOTrainer(GRPOTrainer):
         total = torch.tensor(0.0, device=self.device)
         token_total = torch.tensor(0.0, device=self.device)
         aux_total = torch.tensor(0.0, device=self.device)
+        ratios = []
         for k in range(self.K):
             logp, mask, aux = _generation_context_token_logp(
                 self.model,
@@ -732,10 +1580,20 @@ class DAPOTrainer(GRPOTrainer):
             adv = rollout.adv[:, k : k + 1]
             clipped = ratio.clamp(1 - self.clip_ratio_low, 1 + self.clip_ratio_high)
             policy_loss = -torch.min(ratio * adv, clipped * adv) * mask
+            ratios.append(ratio.detach()[mask.bool()])
             total = total + policy_loss.sum()
             token_total = token_total + mask.sum()
             aux_total = aux_total + aux
+        if ratios:
+            ratio_flat = torch.cat(ratios)
+            self._last_policy_metrics = {
+                "ratio_mean": float(ratio_flat.mean().item()),
+                "clip_fraction": float(((ratio_flat < 1 - self.clip_ratio_low) | (ratio_flat > 1 + self.clip_ratio_high)).float().mean().item()),
+            }
         return total / token_total.clamp(min=1.0) + aux_total / self.K
+
+    def _algorithm_name(self):
+        return "dapo"
 
 
 def _select_group_rollout_rows(rollout, rows):
@@ -748,6 +1606,10 @@ def _select_group_rollout_rows(rollout, rows):
         completion_masks=[mask.index_select(0, rows.to(mask.device)) for mask in rollout.completion_masks],
         rewards=rollout.rewards.index_select(0, rows.to(rollout.rewards.device)),
         adv=rollout.adv.index_select(0, rows.to(rollout.adv.device)),
+        reward_components={
+            key: value.index_select(0, rows.to(value.device))
+            for key, value in (rollout.reward_components or {}).items()
+        },
     )
 
 
@@ -755,12 +1617,16 @@ def _merge_group_rollouts(chunks):
     require(chunks, "DAPO dynamic sampling requires at least one selected rollout chunk")
     K = len(chunks[0].seqs)
     require(K > 0, "DAPO dynamic sampling selected an empty rollout")
+    component_keys = set(chunks[0].reward_components or {})
     for chunk in chunks:
         require(len(chunk.seqs) == K, "DAPO rollout chunks must have the same number of generations")
         require(len(chunk.label_seqs) == K, "DAPO rollout chunks must have matching label generations")
         require(len(chunk.old_token_logps) == K, "DAPO rollout chunks must have matching old log-prob generations")
         require(len(chunk.completions) == K, "DAPO rollout chunks must have matching completion generations")
         require(len(chunk.completion_masks) == K, "DAPO rollout chunks must have matching completion masks")
+        require(set(chunk.reward_components or {}) == component_keys, (
+            "DAPO rollout chunks must have matching reward component keys"
+        ))
     return GroupRollout(
         seqs=[
             _cat_padded([chunk.seqs[k] for chunk in chunks], pad_value=0)
@@ -784,6 +1650,14 @@ def _merge_group_rollouts(chunks):
         ],
         rewards=torch.cat([chunk.rewards for chunk in chunks], dim=0),
         adv=torch.cat([chunk.adv for chunk in chunks], dim=0),
+        reward_components={
+            key: torch.cat([chunk.reward_components[key] for chunk in chunks], dim=0)
+            for key in component_keys
+        },
+        generation_latency_ms=sum(chunk.generation_latency_ms for chunk in chunks),
+        reward_latency_ms=sum(chunk.reward_latency_ms for chunk in chunks),
+        generated_tokens=sum(chunk.generated_tokens for chunk in chunks),
+        reward_calls=sum(chunk.reward_calls for chunk in chunks),
     )
 
 

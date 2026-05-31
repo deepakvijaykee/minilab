@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 import torch.nn as nn
 
-from minilab.base import BaseModel
-from minilab.checks import require
+from minilab.base import BaseModel, validate_token_ids
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
     DEFAULT_LOCAL_ATTENTION_WINDOW,
@@ -81,6 +81,13 @@ class HybridConfig(BaseConfig):
         if self.dt_rank is None:
             self.dt_rank = (self.dim + 15) // 16
         validate_parallel_or_interleaved_lm_config(self, "HybridLM")
+        require_finite_fields(self, (
+            "mamba_every", "mamba_offset", "d_state", "d_conv", "expand", "dt_rank",
+            "dt_min", "dt_max", "dt_init_floor",
+        ))
+        require_integer_fields(self, (
+            "mamba_every", "mamba_offset", "d_state", "d_conv", "expand", "dt_rank",
+        ))
         require(self.mamba_every > 0, "mamba_every must be > 0")
         require(0 <= self.mamba_offset < self.mamba_every, "mamba_offset must be in [0, mamba_every)")
         require(self.d_state > 0, "d_state must be > 0")
@@ -165,9 +172,7 @@ class HybridLM(BaseModel):
         return self._causal_lm_forward(idx, targets, include_auxiliary_loss=True)
 
     def forward_hidden(self, idx):
-        require(idx.size(1) <= self.config.max_seq_len, (
-            f"HybridLM supports at most {self.config.max_seq_len} tokens, got {idx.size(1)}"
-        ))
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "HybridLM")
         x = self._cast_hidden(self.tok_emb(idx))
         T = idx.size(1)
         x, freqs_cis, attn_bias, is_causal = apply_simple_position(self.pos_enc, x, T, "HybridLM")

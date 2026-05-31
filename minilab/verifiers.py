@@ -1,5 +1,6 @@
 """Rule and learned verifiers for outcome-supervised training."""
 
+import ast
 import json
 import math
 import re
@@ -14,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from minilab.base import BaseModel
+from minilab.base import BaseModel, validate_token_ids
 from minilab.checks import require
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
@@ -60,28 +61,22 @@ class NumericVerifier:
 
 
 class PythonUnitTestVerifier:
-    """Run generated Python code against caller-provided tests in a subprocess."""
+    """Run tiny generated Python functions against caller-provided tests.
+
+    This is intentionally a restricted local verifier, not a general code
+    execution sandbox. Candidate code is limited to simple function definitions
+    and expressions, then executed in a subprocess with a small builtins table so
+    timeouts are enforceable and imports/filesystem access are not part of the
+    task contract.
+    """
 
     def __init__(self, timeout_seconds=5.0):
         require(timeout_seconds > 0, "timeout_seconds must be > 0")
         self.timeout_seconds = timeout_seconds
 
     def __call__(self, solution_code, tests_code):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "candidate_test.py"
-            path.write_text(solution_code + "\n\n" + tests_code)
-            try:
-                proc = subprocess.run(
-                    [sys.executable, str(path)],
-                    cwd=tmp,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_seconds,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                return 0.0
-        return 1.0 if proc.returncode == 0 else 0.0
+        result = restricted_python_unit_test_result(solution_code, tests_code, self.timeout_seconds)
+        return 1.0 if result["syntax"] and result["timeout_free"] and result["unit_tests"] else 0.0
 
 
 class CompositeVerifier:
@@ -110,7 +105,7 @@ class ToolCallVerifier:
 
     def __call__(self, prediction, reference):
         try:
-            call = json.loads(_extract_json_object(prediction))
+            call = json.loads(extract_json_object(prediction))
         except (json.JSONDecodeError, ValueError):
             return 0.0
         if not isinstance(call, dict):
@@ -121,8 +116,101 @@ class ToolCallVerifier:
         arguments = call["arguments"]
         if tool_name not in self.tools or not isinstance(arguments, dict):
             return 0.0
-        result = self.tools[tool_name](**arguments)
+        try:
+            result = self.tools[tool_name](**arguments)
+        except (TypeError, ValueError, OverflowError, ArithmeticError):
+            return 0.0
         return self.result_verifier(str(result), str(reference))
+
+
+_SAFE_PYTHON_BUILTINS = ("abs", "bool", "int", "len", "max", "min", "str", "sum")
+_SAFE_PYTHON_CALLS = set(_SAFE_PYTHON_BUILTINS)
+_SAFE_PYTHON_NODES = (
+    ast.Module,
+    ast.FunctionDef,
+    ast.arguments,
+    ast.arg,
+    ast.Return,
+    ast.If,
+    ast.IfExp,
+    ast.Compare,
+    ast.BoolOp,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.Store,
+    ast.Subscript,
+    ast.Slice,
+    ast.List,
+    ast.Tuple,
+    ast.Assign,
+    ast.Expr,
+    ast.Call,
+    ast.operator,
+    ast.unaryop,
+    ast.cmpop,
+    ast.boolop,
+)
+
+
+def _restricted_python_safety_error(tree):
+    require(isinstance(tree, ast.Module), "restricted Python validator requires a module AST")
+    if not any(isinstance(node, ast.FunctionDef) for node in tree.body):
+        return "candidate must define at least one function"
+    for node in ast.walk(tree):
+        if not isinstance(node, _SAFE_PYTHON_NODES):
+            return f"unsupported Python syntax: {type(node).__name__}"
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            return "dunder names are not allowed"
+        if isinstance(node, ast.FunctionDef):
+            if node.name.startswith("__"):
+                return "dunder function names are not allowed"
+            if node.decorator_list:
+                return "decorators are not allowed"
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_PYTHON_CALLS:
+                return "candidate calls are limited to safe builtins"
+    return None
+
+
+def restricted_python_unit_test_result(solution_code, tests_code, timeout_seconds=1.0):
+    """Return component scores for the tiny local Python unit-test verifier."""
+    require(timeout_seconds > 0, "timeout_seconds must be > 0")
+    try:
+        tree = ast.parse(solution_code)
+    except SyntaxError:
+        return {"syntax": 0.0, "timeout_free": 1.0, "unit_tests": 0.0}
+
+    if _restricted_python_safety_error(tree) is not None:
+        return {"syntax": 1.0, "timeout_free": 1.0, "unit_tests": 0.0}
+
+    driver = (
+        "import builtins\n"
+        f"SAFE_BUILTINS = {{name: getattr(builtins, name) for name in {tuple(_SAFE_PYTHON_BUILTINS)!r}}}\n"
+        "namespace = {'__builtins__': SAFE_BUILTINS}\n"
+        f"candidate_code = {solution_code!r}\n"
+        f"tests_code = {tests_code!r}\n"
+        "exec(compile(candidate_code, '<candidate>', 'exec'), namespace)\n"
+        "exec(compile(tests_code, '<tests>', 'exec'), namespace)\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "restricted_candidate_test.py"
+        path.write_text(driver)
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(path)],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"syntax": 1.0, "timeout_free": 0.0, "unit_tests": 0.0}
+    passed = 1.0 if proc.returncode == 0 else 0.0
+    return {"syntax": 1.0, "timeout_free": 1.0, "unit_tests": passed}
 
 
 class VerifierDataset(Dataset):
@@ -130,8 +218,15 @@ class VerifierDataset(Dataset):
         require(seq_len > 1, "VerifierDataset requires seq_len > 1")
         self.rows = []
         for ex in examples:
-            ids = tokenizer.encode(ex["text"])[:seq_len]
+            ids = tokenizer.encode(ex["text"])
+            require(type(ids) is list and all(type(token_id) is int and token_id >= 0 for token_id in ids), (
+                "VerifierDataset tokenizer must return a list of non-negative integer token ids"
+            ))
             require(ids, "VerifierDataset example has empty text")
+            require(len(ids) <= seq_len, (
+                f"VerifierDataset text len {len(ids)} exceeds seq_len {seq_len}; "
+                "caller must choose a larger context or own verifier-specific truncation"
+            ))
             label = float(ex["label"])
             require(label in {0.0, 1.0}, "VerifierDataset labels must be 0 or 1")
             self.rows.append({
@@ -216,9 +311,7 @@ class OutcomeVerifier(BaseModel):
         )
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        require(input_ids.size(1) <= self.config.max_seq_len, (
-            f"OutcomeVerifier supports at most {self.config.max_seq_len} tokens, got {input_ids.size(1)}"
-        ))
+        validate_token_ids(input_ids, self.config.vocab_size, self.config.max_seq_len, "OutcomeVerifier")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
@@ -264,7 +357,7 @@ def _last_number(text):
     return float(matches[-1].replace(",", ""))
 
 
-def _extract_json_object(text):
+def extract_json_object(text):
     text = text.strip()
     if text.startswith("{") and text.endswith("}"):
         return text

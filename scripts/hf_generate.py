@@ -10,6 +10,7 @@ import argparse
 import torch
 
 from hf_common import model_dtype_kwargs, require_transformers, resolve_device, resolve_dtype, resolve_hf_spec
+from minilab.checks import require
 from minilab.hf_presets import print_hf_model_presets
 
 
@@ -30,6 +31,11 @@ args = p.parse_args()
 if args.list_presets:
     print_hf_model_presets()
     raise SystemExit(0)
+
+require(args.max_new_tokens >= 0, "--max-new-tokens must be >= 0")
+require(args.temperature >= 0, "--temperature must be >= 0")
+require(args.top_k >= 0, "--top-k must be >= 0")
+require(0 < args.top_p <= 1.0, "--top-p must be in (0, 1]")
 
 _, AutoModelForCausalLM, AutoTokenizer = require_transformers()
 spec, dtype_name = resolve_hf_spec(args.model, args.dtype)

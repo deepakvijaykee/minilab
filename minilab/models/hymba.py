@@ -13,8 +13,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from minilab.base import BaseModel
-from minilab.checks import require
+from minilab.base import BaseModel, validate_token_ids
+from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
     DEFAULT_LOCAL_ATTENTION_WINDOW,
@@ -83,6 +83,13 @@ class HymbaConfig(BaseConfig):
 
     def __post_init__(self):
         validate_parallel_or_interleaved_lm_config(self, "HymbaLM")
+        require_finite_fields(self, (
+            "d_state", "d_conv", "expand", "headdim", "ngroups", "num_meta_tokens",
+            "dt_min", "dt_max", "dt_init_floor",
+        ))
+        require_integer_fields(self, (
+            "d_state", "d_conv", "expand", "headdim", "ngroups", "num_meta_tokens",
+        ))
         require(self.d_state > 0, "d_state must be > 0")
         require(self.d_conv > 0, "d_conv must be > 0")
         require(self.expand > 0, "expand must be > 0")
@@ -187,6 +194,7 @@ class HymbaLM(BaseModel):
         return self._causal_lm_forward(idx, targets, include_auxiliary_loss=True)
 
     def forward_hidden(self, idx):
+        validate_token_ids(idx, self.config.vocab_size, self.config.max_seq_len, "HymbaLM")
         meta = self.config.num_meta_tokens
         total_len = idx.size(1) + meta
         require(total_len <= self.config.max_seq_len, (

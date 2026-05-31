@@ -1,10 +1,11 @@
 import torch
 import torch.nn.functional as F
 
-from minilab.checks import require
+from minilab.checks import require, require_finite_number, require_integer
 
 
 def sedd_absorbing_step_probs(log_scores, z, dsigma, mask_id, temperature, drop_mask=False):
+    require_finite_number(temperature, "temperature")
     require(temperature >= 0, "temperature must be >= 0")
     require(log_scores.ndim == 3, "SEDD log_scores must have shape (batch, seq, vocab)")
     require(z.shape == log_scores.shape[:2], "SEDD current tokens must match log_scores batch and sequence shape")
@@ -81,6 +82,8 @@ def _absorbing_transposed_transition_log_probs(z, dsigma, mask_id, vocab_size):
 
 
 def sample_categorical(probs):
+    require(probs.ndim > 0, "categorical sampler expects a probability tensor with a vocabulary dimension")
+    require(probs.size(-1) > 0, "categorical sampler received an empty vocabulary dimension")
     require(torch.isfinite(probs).all(), "categorical sampler received non-finite probabilities")
     require((probs >= 0).all(), "categorical sampler received negative probabilities")
     flat = probs.reshape(-1, probs.size(-1))
@@ -91,6 +94,7 @@ def sample_categorical(probs):
 
 
 def sample_logits(logits, temperature):
+    require_finite_number(temperature, "temperature")
     require(temperature >= 0, "temperature must be >= 0")
     valid_or_masked = torch.isfinite(logits) | torch.isneginf(logits)
     require(valid_or_masked.all(), "logits sampler received non-finite logits outside masked support")
@@ -107,7 +111,45 @@ def sample_clean_logits(logits, mask_id, temperature):
     return sample_logits(logits, temperature)
 
 
+def absorbing_unmask_probability(fwd, t_now, t_next):
+    """Probability that a still-masked absorbing token is revealed over one reverse step."""
+    device = None
+    dtype = torch.float32
+    if torch.is_tensor(t_now):
+        device = t_now.device
+        if torch.is_floating_point(t_now):
+            dtype = t_now.dtype
+    elif torch.is_tensor(t_next):
+        device = t_next.device
+        if torch.is_floating_point(t_next):
+            dtype = t_next.dtype
+
+    t_now = torch.as_tensor(t_now, device=device, dtype=dtype)
+    t_next = torch.as_tensor(t_next, device=t_now.device, dtype=t_now.dtype)
+    require(t_now.numel() == 1 and t_next.numel() == 1, (
+        "absorbing unmask probability expects scalar timesteps"
+    ))
+    require(torch.isfinite(t_now).all() and torch.isfinite(t_next).all(), (
+        "absorbing unmask probability expects finite scalar timesteps"
+    ))
+    require(((0 <= t_next) & (t_next < t_now) & (t_now <= 1)).all(), (
+        "absorbing unmask probability expects reverse timesteps satisfying 0 <= t_next < t_now <= 1"
+    ))
+    alpha_now = fwd.alpha_at(t_now.reshape(1)).reshape(())
+    alpha_next = fwd.alpha_at(t_next.reshape(1)).reshape(())
+    require(alpha_next >= alpha_now, (
+        "absorbing unmask probability requires a non-increasing forward alpha schedule"
+    ))
+    denom = (1.0 - alpha_now).clamp_min(torch.finfo(alpha_now.dtype).tiny)
+    prob = torch.where(alpha_now < 1.0, (alpha_next - alpha_now) / denom, alpha_next)
+    return prob.clamp(0.0, 1.0)
+
+
 def d3pm_reverse_timesteps(fwd, num_steps, device):
+    require_integer(num_steps, "D3PM num_steps")
+    require(0 < num_steps <= fwd.num_timesteps, (
+        "D3PM num_steps must be in [1, fwd.num_timesteps]"
+    ))
     step = torch.arange(num_steps + 1, device=device, dtype=torch.long)
     offset = torch.div(
         step * fwd.num_timesteps + num_steps // 2,
@@ -123,6 +165,7 @@ def d3pm_reverse_timesteps(fwd, num_steps, device):
 
 def llada_add_gumbel_noise(logits, temperature):
     """LLaDA reference sampler's low-precision Gumbel-max transform."""
+    require_finite_number(temperature, "temperature")
     require(temperature >= 0, "temperature must be >= 0")
     if temperature == 0:
         return logits
@@ -140,14 +183,14 @@ def llada_transfer_counts(mask_index, steps):
     assigned to the earliest steps.
     """
     require(mask_index.dtype == torch.bool, "mask_index must be bool")
+    require_integer(steps, "steps")
     require(steps > 0, "steps must be > 0")
     mask_num = mask_index.sum(dim=1, keepdim=True)
     base = mask_num // steps
     remainder = mask_num % steps
     counts = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.long) + base
-    for i in range(mask_num.size(0)):
-        counts[i, : int(remainder[i].item())] += 1
-    return counts
+    step_ids = torch.arange(steps, device=mask_index.device).view(1, steps)
+    return counts + (step_ids < remainder).long()
 
 
 def _select_transfer_positions(
@@ -239,6 +282,7 @@ def llada_remask_step(
         require(prompt_index.shape == x.shape, "prompt_index must match x")
         mask_index = mask_index & (~prompt_index)
     if block_end is not None:
+        require_integer(block_end, "block_end")
         require(0 < block_end <= x.size(1), "block_end must be in (0, seq_len]")
         inside_block = torch.arange(x.size(1), device=x.device) < block_end
         mask_index = mask_index & inside_block.unsqueeze(0)
@@ -250,6 +294,7 @@ def llada_remask_step(
 
 
 def dream_top_p_logits(logits, top_p):
+    require_finite_number(top_p, "top_p")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     if top_p == 1:
         return logits
@@ -264,6 +309,7 @@ def dream_top_p_logits(logits, top_p):
 
 
 def dream_top_k_logits(logits, top_k):
+    require_integer(top_k, "top_k")
     require(top_k >= 0, "top_k must be >= 0")
     if top_k == 0 or top_k >= logits.size(-1):
         return logits
@@ -285,10 +331,15 @@ def dream_sample_tokens(
     order, `maskgit_plus` uses sampled-token probability, `topk_margin` uses
     top1-top2 margin, and `entropy` uses negative entropy.
     """
+    require_finite_number(temperature, "temperature")
+    require_finite_number(top_p, "top_p")
+    require_integer(top_k, "top_k")
     require(temperature >= 0, "temperature must be >= 0")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(top_k >= 0, "top_k must be >= 0")
     require(alg in {"origin", "maskgit_plus", "topk_margin", "entropy"}, f"unknown Dream alg: {alg}")
+    require(logits.ndim >= 1, "Dream logits must include a vocabulary dimension")
+    require(logits.size(-1) > 0, "Dream logits must have a non-empty vocabulary dimension")
     logits = dream_top_k_logits(dream_top_p_logits(logits, top_p), top_k)
     if temperature > 0:
         probs = F.softmax(logits / temperature, dim=-1)
@@ -301,6 +352,7 @@ def dream_sample_tokens(
     if alg == "origin":
         confidence = torch.rand(logits.shape[:-1], device=logits.device, dtype=probs.dtype)
     elif alg == "topk_margin":
+        require(probs.size(-1) >= 2, "Dream topk_margin requires vocabulary size >= 2")
         top2 = torch.topk(probs, k=2, dim=-1).values
         confidence = top2[..., 0] - top2[..., 1]
     elif alg == "entropy":
@@ -311,6 +363,10 @@ def dream_sample_tokens(
 
 def _dream_transfer_counts(num_transfer_tokens, batch_size, device):
     if torch.is_tensor(num_transfer_tokens):
+        require(
+            not torch.is_floating_point(num_transfer_tokens) and num_transfer_tokens.dtype != torch.bool,
+            "Dream num_transfer_tokens must be an integer tensor",
+        )
         num_transfer_tokens = num_transfer_tokens.to(device=device, dtype=torch.long)
         if num_transfer_tokens.numel() == 1:
             counts = num_transfer_tokens.reshape(1).expand(batch_size)
@@ -320,6 +376,7 @@ def _dream_transfer_counts(num_transfer_tokens, batch_size, device):
             ))
             counts = num_transfer_tokens
     else:
+        require_integer(num_transfer_tokens, "Dream num_transfer_tokens")
         counts = torch.full((batch_size,), int(num_transfer_tokens), device=device, dtype=torch.long)
     require((counts >= 0).all(), "Dream num_transfer_tokens must be >= 0")
     return counts
@@ -341,6 +398,7 @@ def dream_remask_step(
 ):
     """One Dream reverse step over currently masked tokens."""
     require(logits.shape[:2] == x.shape, "logits and x must share batch/sequence shape")
+    require_finite_number(alg_temp, "alg_temp")
     require(alg_temp >= 0, "alg_temp must be >= 0")
     transfer_counts = _dream_transfer_counts(num_transfer_tokens, x.size(0), x.device)
     logits = logits.clone()
@@ -357,6 +415,7 @@ def dream_remask_step(
         require(prompt_index.shape == x.shape, "prompt_index must match x")
         mask_index = mask_index & (~prompt_index)
     if block_end is not None:
+        require_integer(block_end, "block_end")
         require(0 < block_end <= x.size(1), "block_end must be in (0, seq_len]")
         inside_block = torch.arange(x.size(1), device=x.device) < block_end
         mask_index = mask_index & inside_block.unsqueeze(0)

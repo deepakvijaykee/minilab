@@ -253,6 +253,7 @@ def _rollout_policy_train_loop(trainer, inner_epochs):
                 if trainer.aim_run:
                     trainer.aim_run.track(avg_loss, name="loss", step=trainer.step)
                     trainer.aim_run.track(lr, name="lr", step=trainer.step)
+            trainer._record_online_rollout(batch, rollout)
             trainer._save_checkpoint_if_due()
 
         trainer._save_final_checkpoint()

@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from minilab.base import BaseModel
-from minilab.checks import require
+from minilab.base import BaseModel, validate_token_ids
+from minilab.checks import require, require_finite_number, require_integer
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
 from minilab.models.transformer_utils import (
@@ -54,6 +54,8 @@ class ByteLatentConfig(BaseConfig):
             f"ByteLatentLM requires byte vocab size {BYTE_VOCAB_SIZE}"
         ))
         validate_fixed_rope_transformer_config(self, "ByteLatentLM")
+        require_finite_number(self.patch_size, "patch_size")
+        require_integer(self.patch_size, "patch_size")
         require(self.patch_size > 0, "patch_size must be > 0")
 
 
@@ -63,10 +65,14 @@ def entropy_from_logits(logits):
 
 
 def patch_start_mask_from_entropy(entropy, threshold, min_patch_size=1):
+    require_finite_number(threshold, "threshold")
+    require_finite_number(min_patch_size, "min_patch_size")
+    require_integer(min_patch_size, "min_patch_size")
     require(threshold >= 0, "threshold must be >= 0")
     require(min_patch_size > 0, "min_patch_size must be > 0")
     require(entropy.dim() == 2, "entropy must have shape (batch, seq)")
     B, T = entropy.shape
+    require(T > 0, "entropy must contain at least one position")
     starts = torch.zeros(B, T, device=entropy.device, dtype=torch.bool)
     starts[:, 0] = True
     last = torch.zeros(B, device=entropy.device, dtype=torch.long)
@@ -78,6 +84,12 @@ def patch_start_mask_from_entropy(entropy, threshold, min_patch_size=1):
 
 
 def static_patch_start_mask(batch_size, seq_len, patch_size, device=None):
+    require_finite_number(batch_size, "batch_size")
+    require_finite_number(seq_len, "seq_len")
+    require_finite_number(patch_size, "patch_size")
+    require_integer(batch_size, "batch_size")
+    require_integer(seq_len, "seq_len")
+    require_integer(patch_size, "patch_size")
     require(batch_size > 0, "batch_size must be > 0")
     require(seq_len > 0, "seq_len must be > 0")
     require(patch_size > 0, "patch_size must be > 0")
@@ -171,9 +183,7 @@ class ByteLatentLM(BaseModel):
         return logits, loss
 
     def forward_hidden(self, input_ids, patch_start_mask=None):
-        require(input_ids.size(1) <= self.config.max_seq_len, (
-            f"ByteLatentLM supports at most {self.config.max_seq_len} bytes, got {input_ids.size(1)}"
-        ))
+        validate_token_ids(input_ids, self.config.vocab_size, self.config.max_seq_len, "ByteLatentLM")
         B, T = input_ids.shape
         if patch_start_mask is None:
             patch_start_mask = static_patch_start_mask(B, T, self.config.patch_size, input_ids.device)

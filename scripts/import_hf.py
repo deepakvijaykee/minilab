@@ -23,8 +23,18 @@ from minilab.trainer import tokenizer_signature
 
 def _rope_base(hf_config):
     data = hf_config.to_dict()
-    rope = data.get("rope_parameters") or data.get("rope_scaling") or {}
-    return float(rope.get("rope_theta") or data.get("rope_theta") or 10000.0)
+    rope = data.get("rope_parameters")
+    if rope is None:
+        rope = data.get("rope_scaling")
+    require(rope is None or isinstance(rope, dict), "HF rope parameters must be a mapping when present")
+    if isinstance(rope, dict) and rope.get("rope_theta") is not None:
+        base = float(rope["rope_theta"])
+    elif data.get("rope_theta") is not None:
+        base = float(data["rope_theta"])
+    else:
+        base = 10000.0
+    require(base > 0, "HF rope_theta must be > 0")
+    return base
 
 
 def _native_config(hf_config, max_seq_len):
@@ -34,15 +44,20 @@ def _native_config(hf_config, max_seq_len):
         f"Only Llama-compatible HF models are currently importable, got model_type={model_type!r}. "
         "SmolLM2 is supported; Qwen3/Gemma need separate mapping validation."
     ))
-    require(data.get("hidden_act", "silu") == "silu", "HF import currently requires hidden_act='silu'")
-    require(not data.get("attention_bias", False), "HF import currently requires attention_bias=false")
-    require(not data.get("mlp_bias", False), "HF import currently requires mlp_bias=false")
-    require(data.get("tie_word_embeddings", True), "HF import currently requires tied input/output embeddings")
+    require(data.get("hidden_act") == "silu", "HF import currently requires hidden_act='silu'")
+    require(data.get("attention_bias") is False, "HF import currently requires attention_bias=false")
+    require(data.get("mlp_bias") is False, "HF import currently requires mlp_bias=false")
+    require(data.get("tie_word_embeddings") is True, "HF import currently requires tied input/output embeddings")
 
     dim = int(data["hidden_size"])
     heads = int(data["num_attention_heads"])
-    kv_heads = int(data.get("num_key_value_heads") or heads)
+    raw_kv_heads = data.get("num_key_value_heads")
+    kv_heads = heads if raw_kv_heads is None else int(raw_kv_heads)
     intermediate = int(data["intermediate_size"])
+    require(int(data["vocab_size"]) > 0, "HF vocab_size must be positive")
+    require(int(data["num_hidden_layers"]) > 0, "HF num_hidden_layers must be positive")
+    require(heads > 0, "HF num_attention_heads must be positive")
+    require(kv_heads > 0, "HF num_key_value_heads must be positive")
     require(dim % heads == 0, "HF hidden_size must be divisible by num_attention_heads")
     require(intermediate > 0, "HF intermediate_size must be positive")
 
@@ -132,14 +147,15 @@ if args.list_presets:
     print_hf_model_presets()
     raise SystemExit(0)
 
+spec, _ = resolve_hf_spec(args.model, "float32")
+save_dir = Path(args.save_dir or f"checkpoints/imported/{spec['alias'] or spec['repo'].replace('/', '__')}")
+max_seq_len = int(spec["max_seq_len"]) if args.max_seq_len is None else args.max_seq_len
+require(max_seq_len > 0, "--max-seq-len must be > 0")
+
 if args.device == "cuda" and not torch.cuda.is_available():
     raise ValueError("CUDA requested but torch.cuda.is_available() is false")
 
 AutoConfig, AutoModelForCausalLM, AutoTokenizer = require_transformers()
-spec, _ = resolve_hf_spec(args.model, "float32")
-save_dir = Path(args.save_dir or f"checkpoints/imported/{spec['alias'] or spec['repo'].replace('/', '__')}")
-max_seq_len = args.max_seq_len or int(spec["max_seq_len"])
-require(max_seq_len > 0, "--max-seq-len must be > 0")
 
 hf_config = AutoConfig.from_pretrained(spec["repo"], trust_remote_code=args.trust_remote_code)
 native_config = _native_config(hf_config, max_seq_len)

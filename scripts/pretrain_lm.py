@@ -26,6 +26,7 @@ from common import (
     resolve_save_every,
 )
 from minilab.checks import require
+from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER
 from minilab.presets import get_lm_model_preset, lm_model_preset_choices
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
@@ -58,8 +59,9 @@ from minilab.nn.architecture import (
 )
 
 
+_MODEL_SELECTOR_FLAGS = ("preset",)
 _MODEL_BUILD_FLAGS = (
-    "preset", "dim", "num_layers", "num_heads", "num_kv_heads", "attention", "position",
+    "dim", "num_layers", "num_heads", "num_kv_heads", "attention", "position",
     "norm",
     "rope_base", "rope_local_base", "rope_global_base", "rope_scaling_factor",
     "rope_original_max_seq_len", "rope_partial_rotary_factor", "yarn_beta_fast",
@@ -167,8 +169,9 @@ p.add_argument("--warmup-steps", type=int, default=100)
 p.add_argument("--save-every", type=int, default=0, help="periodic save interval (0 = save once at end)")
 p.add_argument("--batch-size", type=int, default=32)
 p.add_argument("--lr", type=float, default=3e-4)
-p.add_argument("--muon-lr", type=float, default=0.02)
-p.add_argument("--optimizer", choices=["adamw", "lion", "muon"], default="adamw")
+p.add_argument("--muon-lr", type=float, default=None, help="defaults to 0.02 for Muon-family optimizers")
+p.add_argument("--soft-muon-power", type=float, default=None, help="fixed p=0.4 profile for --optimizer soft_muon")
+p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon"], default="adamw")
 p.add_argument("--lr-schedule", choices=["cosine", "linear", "constant", "wsd"], default="cosine")
 p.add_argument("--qk-clip-threshold", type=float, default=None)
 p.add_argument("--qk-clip-balance", type=float, default=None)
@@ -188,7 +191,7 @@ if args.preset and args.model is not None:
 model_name = preset.get("model") or args.model or "gpt"
 
 if args.resume_from:
-    reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
+    reject_supplied(args, _MODEL_SELECTOR_FLAGS + _MODEL_BUILD_FLAGS, "only applies when starting a new model")
 elif model_name in {"mamba", "mamba2"}:
     reject_supplied(args, _MAMBA_ONLY_REJECTED_FLAGS, "does not apply to --model mamba or mamba2")
 elif model_name in {"hybrid", "hymba"}:
@@ -207,6 +210,15 @@ if args.qk_clip_balance is not None:
     require(
         args.qk_clip_threshold is not None,
         "--qk-clip-balance only applies when --qk-clip-threshold is supplied",
+    )
+if args.optimizer not in {"muon", "soft_muon"}:
+    require(args.muon_lr is None, "--muon-lr only applies to --optimizer muon or soft_muon")
+if args.optimizer != "soft_muon":
+    require(args.soft_muon_power is None, "--soft-muon-power only applies to --optimizer soft_muon")
+if args.soft_muon_power is not None:
+    require(
+        args.soft_muon_power == DEFAULT_SOFT_MUON_POWER,
+        "--soft-muon-power currently supports the fixed p=0.4 coefficient profile",
     )
 
 set_seed(args.seed)
@@ -260,6 +272,8 @@ qk_clip_threshold = resolve_default(args.qk_clip_threshold, 0.0)
 qk_clip_balance = resolve_default(args.qk_clip_balance, 0.5)
 token_superposition_size = resolve_default(args.token_superposition_size, 1)
 token_superposition_steps = resolve_default(args.token_superposition_steps, 0)
+muon_lr = resolve_default(args.muon_lr, 0.02)
+soft_muon_power = resolve_default(args.soft_muon_power, DEFAULT_SOFT_MUON_POWER)
 
 if args.num_kv_heads is not None:
     require(attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
@@ -429,7 +443,7 @@ print(f"{type(model).__name__}: {model.num_parameters():,} params")
 
 tc = TrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
-    muon_lr=args.muon_lr, optimizer=args.optimizer, lr_schedule=args.lr_schedule,
+    muon_lr=muon_lr, soft_muon_power=soft_muon_power, optimizer=args.optimizer, lr_schedule=args.lr_schedule,
     qk_clip_threshold=qk_clip_threshold, qk_clip_balance=qk_clip_balance,
     log_every=100, eval_every=500, save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=args.save_dir,

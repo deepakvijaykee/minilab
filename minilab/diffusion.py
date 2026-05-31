@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from minilab.checks import require
+from minilab.checks import require, require_integer
 from minilab.registry import register_scheduler, get_scheduler
 
 
@@ -109,6 +109,7 @@ class _ScheduledForwardProcessMixin:
         path.write_text(json.dumps(self.to_state()))
 
     def sample_time(self, batch_size, device, mode="continuous"):
+        require_integer(batch_size, "batch_size")
         require(batch_size > 0, f"batch_size must be > 0, got {batch_size}")
         if mode == "continuous":
             return torch.rand(batch_size, device=device) * 0.999 + 0.001
@@ -159,6 +160,8 @@ class ForwardProcess(_ScheduledForwardProcessMixin):
     process_type = "absorbing"
 
     def __init__(self, mask_token_id, num_timesteps=1000, schedule="cosine"):
+        require_integer(mask_token_id, "mask_token_id")
+        require_integer(num_timesteps, "num_timesteps")
         require(mask_token_id >= 0, "mask_token_id must be >= 0")
         require(num_timesteps > 1, "num_timesteps must be > 1")
         self.mask_token_id = mask_token_id
@@ -239,6 +242,8 @@ class UniformForwardProcess(_ScheduledForwardProcessMixin):
     process_type = "uniform"
 
     def __init__(self, vocab_size, num_timesteps=1000, schedule="cosine"):
+        require_integer(vocab_size, "vocab_size")
+        require_integer(num_timesteps, "num_timesteps")
         require(vocab_size > 1, "vocab_size must be > 1")
         require(num_timesteps > 1, "num_timesteps must be > 1")
         self.vocab_size = vocab_size
