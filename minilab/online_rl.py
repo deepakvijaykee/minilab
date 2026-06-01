@@ -112,6 +112,24 @@ class DrGRPOTrainConfig(GRPOTrainConfig):
 
 
 @dataclass
+class GRPOLiteTrainConfig(GRPOTrainConfig):
+    """Reference-free group REINFORCE ablation: no KL, ratio, or clipping."""
+
+    grpo_kl_coef: float = 0.0
+    grpo_inner_epochs: int = 1
+
+    def __post_init__(self):
+        super().__post_init__()
+        require(self.grpo_inner_epochs == 1, (
+            "GRPO-lite is a one-update REINFORCE ablation; set grpo_inner_epochs=1"
+        ))
+        require(self.grpo_kl_coef == 0.0, "GRPO-lite is reference-free; set grpo_kl_coef=0")
+        require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
+            "GRPO-lite does not use PPO clipping; leave grpo_clip_ratio at the inherited default"
+        ))
+
+
+@dataclass
 class TPOTrainConfig(GRPOTrainConfig):
     tpo_eta: float = 1.0
     tpo_anchor_old_policy: bool = True
@@ -712,6 +730,7 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         "grpo_clip_ratio", "grpo_kl_coef", "grpo_inner_epochs",
     )
     _uses_reference_model = True
+    _scores_old_policy = True
 
     def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
         # PromptDataset yields prompts, not (input, label) pairs — so the generic
@@ -792,7 +811,7 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
                             self.model,
                             prompt_ids[b : b + 1, :plen],
                             self.max_new_tokens,
-                            "GRPO",
+                            self._algorithm_name().upper(),
                         ))
                     padded, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
                         prompt_ids,
@@ -800,7 +819,9 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
                         gens,
                         self.device,
                     )
-                    require(completion_mask.any(dim=1).all(), "GRPO requires at least one generated token per prompt")
+                    require(completion_mask.any(dim=1).all(), (
+                        f"{self._algorithm_name().upper()} requires at least one generated token per prompt"
+                    ))
                     completions.append(padded)
                     completion_masks.append(completion_mask)
                     seqs.append(seq_pad)
@@ -819,9 +840,10 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
             adv = _group_normalized_advantages(rewards)
 
             old_token_logps = []
-            for k in range(self.K):
-                with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-                    old_token_logps.append(_generation_context_token_logp(self.model, seqs[k], label_seqs[k])[0])
+            if self._scores_old_policy:
+                for k in range(self.K):
+                    with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                        old_token_logps.append(_generation_context_token_logp(self.model, seqs[k], label_seqs[k])[0])
 
             return GroupRollout(
                 seqs=seqs,
@@ -918,6 +940,48 @@ class DrGRPOTrainer(GRPOTrainer):
 
     def _algorithm_name(self):
         return "drgrpo"
+
+
+@register_trainer("grpo_lite")
+class GRPOLiteTrainer(GRPOTrainer):
+    """Reference-free group-normalized REINFORCE over sampled completions.
+
+    This is the nanoRL-style GRPO ablation, not a replacement for paper GRPO:
+    sample a group, standardize rewards within each prompt group, and apply
+    `-log pi(y|x) * advantage` with a fixed sequence-length denominator.
+    """
+
+    _uses_reference_model = False
+    _scores_old_policy = False
+
+    def __init__(self, model, reward_fn, train_dataset, config, ref_model_path=None, *, signature, tokenizer_sig="", eval_dataset=None):
+        require(isinstance(config, GRPOLiteTrainConfig), "GRPOLiteTrainer requires GRPOLiteTrainConfig")
+        super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
+        self.loss_denominator_tokens = _model_max_seq_len(self.model, "GRPO-lite fixed loss normalization")
+
+    def _policy_loss(self, rollout):
+        total = torch.tensor(0.0, device=self.device)
+        aux_total = torch.tensor(0.0, device=self.device)
+        for k in range(self.K):
+            logp, mask, aux = _generation_context_token_logp(
+                self.model,
+                rollout.seqs[k],
+                rollout.label_seqs[k],
+                return_aux=True,
+            )
+            adv = rollout.adv[:, k : k + 1].detach()
+            total = total + (logp * adv * mask).sum()
+            aux_total = aux_total + aux
+
+        batch = rollout.rewards.size(0)
+        denom = self.loss_denominator_tokens * batch * self.K
+        self._last_policy_metrics = {
+            "grpo_lite_loss_denominator_tokens": float(self.loss_denominator_tokens),
+        }
+        return -total / denom + aux_total / self.K
+
+    def _algorithm_name(self):
+        return "grpo_lite"
 
 
 @register_trainer("tpo")

@@ -26,6 +26,8 @@ from minilab.alignment import (
     FreshDGTrainer,
     GRPOTrainConfig,
     GRPOTrainer,
+    GRPOLiteTrainConfig,
+    GRPOLiteTrainer,
     GroupPGTrainConfig,
     GroupPGTrainer,
     GSPOTrainConfig,
@@ -70,7 +72,7 @@ p = argparse.ArgumentParser()
 p.add_argument(
     "--algorithm",
     choices=[
-        "ppo", "grpo", "drgrpo", "dapo", "gspo", "rloo",
+        "ppo", "grpo", "drgrpo", "grpo_lite", "dapo", "gspo", "rloo",
         "tpo", "tpo_no_anchor", "group_pg",
         "vpo",
         "dg", "kondo", "uncertainty_dg", "filtered_dg", "reward_variance_dg",
@@ -93,12 +95,12 @@ p.add_argument("--muon-lr", type=float, default=None, help="defaults to 0.02 for
 p.add_argument("--soft-muon-power", type=float, default=None, help="fixed p=0.4 profile for --optimizer soft_muon")
 p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon"], default="adamw")
 p.add_argument("--num-generations", type=int, default=None, help="defaults to 4 for group policy algorithms")
-p.add_argument("--inner-epochs", type=int, default=None, help="inner update epochs per rollout; defaults to 1 for RLOO and 4 otherwise")
+p.add_argument("--inner-epochs", type=int, default=None, help="inner update epochs per rollout; defaults to 1 for RLOO/GRPO-lite and 4 otherwise")
 p.add_argument(
     "--kl-coef",
     type=float,
     default=None,
-    help="defaults to 0.1 for PPO/GRPO/DrGRPO/GSPO/RLOO/R2VPO; DAPO accepts only 0",
+    help="defaults to 0.1 for PPO/GRPO/DrGRPO/GSPO/RLOO/R2VPO; DAPO/GRPO-lite accept only 0",
 )
 p.add_argument(
     "--clip-ratio",
@@ -148,8 +150,8 @@ if args.algorithm == "ppo":
     require(args.optimizer == "adamw", "--optimizer only supports adamw for --algorithm ppo")
 if args.algorithm not in {"ppo", "grpo", "drgrpo", "gspo", "vpo"}:
     require(args.clip_ratio is None, "--clip-ratio only applies to PPO/GRPO/DrGRPO/GSPO/VPO")
-if args.algorithm not in {"ppo", "grpo", "drgrpo", "gspo", "rloo", "r2vpo", "dapo"}:
-    require(args.kl_coef is None, "--kl-coef only applies to PPO/GRPO/DrGRPO/GSPO/RLOO/R2VPO")
+if args.algorithm not in {"ppo", "grpo", "drgrpo", "gspo", "rloo", "r2vpo", "dapo", "grpo_lite"}:
+    require(args.kl_coef is None, "--kl-coef only applies to PPO/GRPO/DrGRPO/GSPO/RLOO/R2VPO; DAPO/GRPO-lite accept only 0")
 if args.algorithm != "dapo":
     require(args.clip_ratio_low is None, "--clip-ratio-low only applies to --algorithm dapo")
     require(args.clip_ratio_high is None, "--clip-ratio-high only applies to --algorithm dapo")
@@ -219,13 +221,16 @@ muon_lr = resolve_default(args.muon_lr, 0.02)
 soft_muon_power = resolve_default(args.soft_muon_power, DEFAULT_SOFT_MUON_POWER)
 inner_epochs = args.inner_epochs
 if inner_epochs is None:
-    inner_epochs = 1 if args.algorithm == "rloo" else 4
+    inner_epochs = 1 if args.algorithm in {"rloo", "grpo_lite"} else 4
 kl_coef = args.kl_coef
 if kl_coef is None:
-    kl_coef = 0.0 if args.algorithm == "dapo" else 0.1
+    kl_coef = 0.0 if args.algorithm in {"dapo", "grpo_lite"} else 0.1
 if args.algorithm == "dapo":
     require(kl_coef == 0, "DAPO removes the KL penalty; set --kl-coef 0 or leave it unset")
     require(args.clip_ratio is None, "DAPO uses --clip-ratio-low/--clip-ratio-high; do not set --clip-ratio")
+if args.algorithm == "grpo_lite":
+    require(kl_coef == 0, "GRPO-lite is reference-free; set --kl-coef 0 or leave it unset")
+    require(inner_epochs == 1, "GRPO-lite is a one-update REINFORCE ablation; set --inner-epochs 1 or leave it unset")
 if args.algorithm == "rloo":
     require(args.clip_ratio is None, "RLOO is an unclipped REINFORCE estimator; do not set --clip-ratio")
 clip_ratio_default = 4e-4 if args.algorithm == "gspo" else 0.2
@@ -374,6 +379,7 @@ else:
     config_cls = {
         "grpo": GRPOTrainConfig,
         "drgrpo": DrGRPOTrainConfig,
+        "grpo_lite": GRPOLiteTrainConfig,
         "gspo": GSPOTrainConfig,
         "rloo": RLOOTrainConfig,
         "tpo": TPOTrainConfig,
@@ -429,6 +435,7 @@ trainer_cls = {
     "ppo": PPOTrainer,
     "grpo": GRPOTrainer,
     "drgrpo": DrGRPOTrainer,
+    "grpo_lite": GRPOLiteTrainer,
     "dapo": DAPOTrainer,
     "gspo": GSPOTrainer,
     "rloo": RLOOTrainer,

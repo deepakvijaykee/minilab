@@ -105,11 +105,20 @@ def _seq_avg_logp(model, input_ids, labels):
 
 def _token_logp(model, input_ids, labels):
     logits, _ = model(input_ids)
-    log_probs = F.log_softmax(logits, dim=-1)
     mask = (labels != -100).float()
-    safe_targets = labels.where(mask.bool(), torch.zeros_like(labels))
-    token_logp = log_probs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+    token_logp = _target_token_logp(logits, labels)
     return token_logp, mask
+
+
+def _target_token_logp(logits, labels):
+    require(logits.shape[:-1] == labels.shape, "target-token log-prob logits/labels shape mismatch")
+    safe_targets = labels.where(labels != -100, torch.zeros_like(labels))
+    token_logp = -F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        safe_targets.reshape(-1),
+        reduction="none",
+    ).view(labels.shape)
+    return torch.where(labels != -100, token_logp, torch.zeros_like(token_logp))
 
 
 def _require_supervised_tokens(mask, context):
@@ -193,10 +202,7 @@ def _generation_context_token_logp(model, input_ids, labels, return_aux=False):
             aux = unwrap_model(model).auxiliary_loss()
             total_aux = aux if total_aux is None else total_aux + aux
             aux_count += 1
-        selected = F.log_softmax(logits[:, -1], dim=-1).gather(
-            -1,
-            safe_targets[active, pos].unsqueeze(-1),
-        ).squeeze(-1)
+        selected = _target_token_logp(logits[:, -1], safe_targets[active, pos])
         if token_logp is None:
             token_logp = torch.zeros(labels.shape, device=input_ids.device, dtype=selected.dtype)
         token_logp[active, pos] = selected

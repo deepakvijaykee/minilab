@@ -36,7 +36,7 @@ REFERENCE_METHODS = {
     "diffusion_grpo",
 } | ONLINE_RL_REFERENCE_ALGORITHMS
 GROUP_ROLLOUT_METHODS = {
-    "grpo", "drgrpo", "gspo", "rloo", "dapo",
+    "grpo", "drgrpo", "grpo_lite", "gspo", "rloo", "dapo",
     "tpo", "tpo_no_anchor", "group_pg", "vpo",
     "dg", "kondo", "uncertainty_dg", "filtered_dg", "reward_variance_dg",
     "aspo", "r2vpo", "replay_dg", "fresh_dg",
@@ -63,6 +63,7 @@ METHODS = (
     "ppo",
     "grpo",
     "drgrpo",
+    "grpo_lite",
     "gspo",
     "rloo",
     "dapo",
