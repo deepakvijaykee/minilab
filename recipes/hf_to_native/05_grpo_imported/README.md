@@ -2,7 +2,7 @@
 
 This recipe runs native Minilab RLVR with the GSM8K verifier reward
 on an imported and aligned checkpoint. By default it starts from the
-SimPO output of recipe 04; the preference step can be skipped by
+SimPO output of recipe 04. The preference step can be skipped by
 pointing `POLICY_CHECKPOINT` at the SFT checkpoint from recipe 03
 instead, which is occasionally useful when comparing the effect of
 preference tuning on downstream RLVR signal.
@@ -20,9 +20,8 @@ These defaults are deliberately small because RLVR on a 135M model is
 much heavier per outer step than on the local `gpt-10m`. Activation
 memory in the rollout phase scales with the policy size and with the
 number of generations, so the per-step cost grows by roughly the same
-factor as the parameter count compared with recipe 04. The right
-mental adjustment is to expect noticeably longer wall time per step
-than the local-training analogue.
+factor as the parameter count compared with recipe 04. Expect
+noticeably longer wall time per step than the local-training analogue.
 
 Lifting `MAX_STEPS` alone or `NUM_GENERATIONS` alone produces noise
 rather than signal. The two interact: more steps without more

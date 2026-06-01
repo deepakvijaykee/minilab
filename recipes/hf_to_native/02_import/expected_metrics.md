@@ -7,8 +7,8 @@ there.
 `model.pt`, `config.json`, and `model_type.txt` together describe the
 native GPT checkpoint, with `model_type.txt` reading `GPT`. These are
 the same three files that every from-scratch local-training checkpoint
-contains, which is what makes the imported model loadable by the
-unmodified native trainers.
+contains, so the imported model loads through the unmodified native
+trainers.
 
 `tokenizer.json` plus an `hf_tokenizer/` directory hold the
 tokenization state. The native `tokenizer.json` is a thin wrapper

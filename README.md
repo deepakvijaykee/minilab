@@ -61,9 +61,9 @@ several minutes in.
 ## What the defaults can and cannot show
 
 The defaults are sized so that the entire loop runs in a coffee break, and
-that choice has consequences worth stating up front. The interesting object
-to study at this scale is the loss curve and the qualitative shift between
-checkpoints, not absolute task performance. Story-level coherence on
+that sizing decides what these runs can and cannot tell you. The interesting
+object to study at this scale is the loss curve and the qualitative shift
+between checkpoints, not absolute task performance. Story-level coherence on
 TinyStories emerges around `gpt-25m` trained for roughly 3000 steps. Below
 that threshold the model has the unigram and short-range statistics but
 not the longer-range templates, and reading the samples gives a misleading
@@ -81,8 +81,8 @@ GRPO and RLVR are non-bootstrapping in a strict sense. If the SFT base
 produces zero answer-shaped completions, every rollout scores zero, the
 group-relative advantage is zero, and the gradient is zero. RL cannot
 teach a behavior the base assigns near-zero probability to in the first
-place; the practical fix is to train recipe 02 longer rather than to
-push GRPO hyperparameters.
+place, so when GRPO stalls the fix lives upstream. Train recipe 02
+longer rather than reaching for GRPO hyperparameters.
 
 The diffusion branch is the less-validated track. Recipes complete and
 metrics behave, but at matched parameters and matched compute, masked
@@ -104,7 +104,7 @@ Gemma3 round-trip cleanly through inspection and generation, but
 `model_type` is not `llama`. Wiring them up is mostly mapping work
 rather than capability work: Qwen3 needs the attention-bias and untied
 embedding paths, and Gemma3 needs local-global RoPE and per-layer
-embedding dimensions. Both surface in the native GPT config; only the
+embedding dimensions. Both surface in the native GPT config. Only the
 importer is missing the bridge.
 
 ## Install
@@ -219,13 +219,13 @@ than the estimator's a-priori guess.
 
 ## Hugging Face bridge
 
-The HF bridge handles curated sub-1B causal LMs. The intent is narrow and
-worth being explicit about: inspect them, generate from them, or import a
-compatible checkpoint into the native Minilab format so that it goes
-through the same trainers as everything else. It is not a general HF
-loader, and it does not aim to be. Today only Llama-compatible weights
-import cleanly. SmolLM2 works end to end; Qwen3 and Gemma3 round-trip
-through inspection and generation but the import path rejects them
+The HF bridge handles curated sub-1B causal LMs, and it does three narrow
+things: inspect them, generate from them, or import a compatible checkpoint
+into the native Minilab format so that it runs through the same trainers as
+everything else. It is not a general HF loader, and it does not aim to
+be. Today only Llama-compatible weights import cleanly. SmolLM2 works
+end to end. Qwen3 and Gemma3 round-trip
+through inspection and generation, but the import path rejects them
 until their weight mappings have been validated against the native GPT
 config.
 
@@ -245,14 +245,22 @@ release provides them. The full list comes from
 `scripts/hf_inspect.py --list-presets`, and the recipes that drive the
 import-and-train flow live under `recipes/hf_to_native/`.
 
-## Post-training transfer lab
+## Post-training RL methods
 
-Minilab also exposes the mechanism-transfer lane from `rl-experiments` under
-the same local LM loop. `scripts/grpo.py` can run GRPO-family baselines,
-candidate-target methods, influence-allocation methods, replay/freshness
-probes, reward-uncertainty variants, and VPO on GSM8K or tiny verifier tasks,
-with optional JSONL metrics, trajectory traces, local staleness sweeps, and
-tiny code-repair/tool-call verifier tasks:
+Recipe 04 runs plain GRPO, but `scripts/grpo.py` is the entry point for a
+much wider menu of online-RL methods that all share the same
+rollout-score-update loop. Collecting them behind one script turns them into
+a controlled comparison: at this scale you can point PPO, GRPO, Dr.GRPO,
+DAPO, GSPO, and RLOO at the same verifier and the same tiny policy and watch
+where they actually diverge, instead of inferring it from aggregate numbers.
+Next to those published baselines sit more experimental objectives, TPO,
+group policy gradient, VPO, and a family of variants that filter or reweight
+rollouts by reward uncertainty, reward variance, or replay age.
+
+The reward does not have to come from GSM8K. Four small deterministic-verifier
+tasks, `format_answer`, `mini_arithmetic`, `tool_call_json`, and
+`tiny_code_repair`, return a clean pass or fail without a large dataset, which
+is the cleanest way to separate an algorithm's behavior from dataset noise.
 
 ```bash
 python scripts/grpo.py \
@@ -264,10 +272,10 @@ python scripts/grpo.py \
   --rl-trace-samples 8
 ```
 
-The design remains laptop-scale: local rollouts, deterministic verifiers,
-component rewards, failure galleries, and memory metrics rather than a
-production rollout cluster. See `docs/post_training_transfer_lab.md`.
-Planned sweeps and result slots live in `docs/research_questions.md`.
+Everything here stays laptop-scale. The run emits per-step metrics as JSONL,
+samples a handful of rollout traces, and writes out the rollouts that scored
+zero, so a dead run can be read directly rather than guessed at from the loss
+curve alone.
 
 ## Running scripts directly
 

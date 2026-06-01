@@ -17,6 +17,5 @@ GSM8K test subset (20 of full split) accuracy: 1/20 = 5.0%
 ```
 
 The accuracy number varies widely seed to seed at this scale. A
-single-digit value is the expected ballpark for the default budget
-rather than a useful signal about the RLVR run, and reading it as one
-overinterprets noise.
+single-digit value is the expected ballpark for the default budget.
+It reflects the rollout budget, not the quality of the RLVR run.

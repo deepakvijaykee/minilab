@@ -24,9 +24,9 @@ The eval block prints up to five `Q/A/(predicted, expected, OK|WRONG)`
 lines followed by a summary line of the form
 `GSM8K test subset (50 of full split) accuracy: ...`. At the default
 budget the reward is sparse and the within-group z-score is noisy, so
-accuracy hovers near the SFT baseline regardless of step count.
-Reading the result as a benchmark misses the point of running this
-recipe at this scale.
+accuracy hovers near the SFT baseline regardless of step count. What
+this recipe demonstrates at this scale is the trajectory-scoring
+machinery itself, not a movement in the accuracy number.
 
 The most common dead-run pattern is the verifier returning zero on
 every rollout because the diffusion base never produces a numeric

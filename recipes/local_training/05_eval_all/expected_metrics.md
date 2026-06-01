@@ -9,10 +9,10 @@ For each checkpoint, `evaluate.py` prints a small fixed block:
   sampled generations
 - Five truncated samples under `--- Samples ---`
 
-The interesting reading is not any single block in isolation but the
-trajectory across `base -> sft -> preference -> grpo`. Three patterns
-recur and are worth stating explicitly because they look like
-regressions until they are interpreted correctly.
+What to read is not any single block in isolation but the trajectory
+across `base -> sft -> preference -> grpo`. Three patterns recur along
+that trajectory, and each one looks like a regression until you read it
+correctly.
 
 Perplexity on TinyStories almost always rises after SFT, even though
 SFT is nominally training the model. The evaluation distribution stays
@@ -40,5 +40,6 @@ model cannot retrieve those reliably without learning the underlying
 task.
 
 `Skipping <label>: missing <path>` lines are the audit trail of which
-stages completed. They are not failures; they are how this recipe lets
-a partial pipeline be evaluated cleanly.
+stages have run so far. They are not errors. They are how the recipe
+evaluates a partial pipeline cleanly, leaving the stages that have not
+run for later.

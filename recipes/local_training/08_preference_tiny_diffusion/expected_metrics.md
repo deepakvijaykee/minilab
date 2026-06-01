@@ -4,8 +4,8 @@ Diffusion DPO substitutes a one-sample ELBO of the denoising loss for
 the exact log-likelihood that standard DPO uses. The estimator is
 unbiased but high-variance, and each preference pair therefore
 contributes a noisy gradient. Per-pair noise can be on the same order
-as the signal, which is the structural reason convergence looks
-visibly rougher than autoregressive DPO at matched step counts. The
+as the signal, which is why convergence looks visibly rougher than
+autoregressive DPO at matched step counts. The
 right way to read the loss curve is as a noisy random walk around a
 slowly descending trend, not as a smooth descent.
 

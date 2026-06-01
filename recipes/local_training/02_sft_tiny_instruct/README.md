@@ -22,7 +22,7 @@ unchanged while the answer template is the only thing being relearned.
 With a thousand-step base, 500 steps of SFT, and 2000 Alpaca rows, the
 model begins producing answer-shaped continuations rather than the
 TinyStories drift that the base alone would emit. Genuine instruction
-quality is a separate axis and needs a stronger base; what shifts at
+quality is a separate axis and needs a stronger base. What shifts at
 this scale is shape rather than content. That asymmetry, format moving
 first and content moving later, is one of the more useful things this
 stage reveals about the alignment stack.

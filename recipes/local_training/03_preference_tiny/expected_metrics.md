@@ -24,12 +24,12 @@ The recipe samples from three prompts (`What makes a good friend?`,
 different from the SFT recipe's three. The point is that the
 qualitative read is not measuring memorization of SFT prompts.
 Preference tuning shifts which coherent answer the policy prefers among
-the answers the base already assigns nontrivial mass to; how coherent
+the answers the base already assigns nontrivial mass to. How coherent
 any of those answers is in absolute terms is fixed by the base.
 
 These runs validate the loss path and the reference-model bookkeeping.
-They are not a preference benchmark, and reading them as one would
-overinterpret the result. HH-RLHF preferences at this scale mostly
+What they do not do is move preference behavior far, and the reason is
+built into the scale. HH-RLHF preferences at this scale mostly
 track stylistic surface features that a seven million parameter model
 can fit, and the beta-scaled trust region keeps the policy close to
 SFT regardless of how many steps the trainer takes.

@@ -23,5 +23,5 @@ The end-of-run generations use the same three fixed prompts as the
 local-training SFT recipe, which is deliberate: the same prompts
 across the two tracks make the qualitative comparison honest. At a
 hundred steps the result reflects the base model with light Alpaca-
-flavored polish. This is sized as a sanity run on the import path,
-not as a real SFT pass on a 135M model.
+flavored polish. A hundred steps is enough to confirm the import path
+trains cleanly. A real SFT pass on a 135M base would run far longer.

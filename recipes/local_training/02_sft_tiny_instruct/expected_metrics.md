@@ -21,9 +21,10 @@ The `run_metrics.json` file is written under
 `checkpoints/local_training/sft/`, alongside the model artifacts. That
 file is the place to look for actual measured memory and timing.
 
-One failure mode is concrete enough to name. If the answers come out
-as raw TinyStories text, with children, dogs, and "once upon a time"
-appearing in response to Alpaca prompts, then either the prompt loss
+The clearest failure to watch for is the base text bleeding through. If
+the answers come out as raw TinyStories text, with children, dogs, and
+"once upon a time" appearing in response to Alpaca prompts, then either
+the prompt loss
 mask is not active or the loaded checkpoint is being trained from
 scratch rather than fine-tuned. The two things to verify are that
 `--checkpoint` resolved to the pretrained step and that the trainer

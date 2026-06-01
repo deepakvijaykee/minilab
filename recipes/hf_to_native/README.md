@@ -82,11 +82,10 @@ python scripts/hf_inspect.py --list-presets
 The import step maps Hugging Face weights into Minilab's native GPT
 format so that the resulting checkpoint loads through the same code
 path as a from-scratch checkpoint. After import, every native trainer,
-sampler, and evaluator works without modification. The constraint
-worth being explicit about is that only Llama-compatible weights
-import cleanly today: SmolLM2 works end to end, Qwen3 and Gemma3
-round-trip through inspection and generation but fail the import
-model-type guard until their weight mappings have been validated
-against the native GPT config. The guard lives in
+sampler, and evaluator works without modification. Only Llama-compatible
+weights import cleanly today. SmolLM2 works end to end. Qwen3 and Gemma3
+round-trip through inspection and generation
+but fail the import model-type guard until their weight mappings have
+been validated against the native GPT config. The guard lives in
 `scripts/import_hf.py::_native_config` and is the right place to look
 when extending the track to a new model family.

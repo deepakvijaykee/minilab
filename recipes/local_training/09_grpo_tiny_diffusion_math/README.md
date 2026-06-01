@@ -32,6 +32,5 @@ Rollout cost scales as
 The autoregressive analogue in recipe 04 only multiplies by the first
 three of those factors, so even a modest diffusion GRPO run is
 substantially slower per step than its autoregressive counterpart.
-Setting expectations about this up front is useful: the wall-time
-table in the root README reflects rollouts dominating the cost, not
-gradient steps.
+That extra factor is why the wall-time table in the root README is
+dominated by rollouts rather than gradient steps.

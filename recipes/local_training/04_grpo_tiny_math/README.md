@@ -26,7 +26,7 @@ Every rollout in the group carries its own KV cache, so doubling
 `num_generations` doubles activation memory for the rollout phase
 rather than the smaller marginal cost one might expect from a single
 extra forward pass. The `run.sh` wrapper calls `estimate_vram.py`
-first; pushing past `batch_size=1` is only sensible once that estimate
+first. Pushing past `batch_size=1` is only sensible once that estimate
 comfortably fits the available VRAM.
 
 Switch algorithms with `ALGORITHM=`:

@@ -16,11 +16,11 @@ the default switching to SimPO is deliberate rather than incidental.
 Fifty steps over 200 pairs is below what would be needed to shift
 preference behavior in any quantitatively meaningful way on a 135M
 base. The margin will move on most pairs, but the policy stays close
-to the SFT checkpoint in KL. The interesting thing this recipe
-verifies is therefore not a preference result but three structural
-properties: that the loss path is finite and stable, that the
-optimizer state allocates correctly, and that the native preference
-trainers accept imported weights without ad-hoc modification.
+to the SFT checkpoint in KL. What this run verifies is therefore not a
+preference result but three structural properties: that the loss path
+is finite and stable, that the optimizer state allocates correctly, and
+that the native preference trainers accept imported weights without
+ad-hoc modification.
 
 A SimPO loss that climbs steadily rather than descending almost
 always points back to recipe 03: the SFT checkpoint at `step_100` is

@@ -4,10 +4,9 @@ This recipe pretrains a masked diffusion language model under the
 `mdlm-25m` preset. It is the diffusion-track counterpart to recipe 01,
 and recipes 07 through 09 load the checkpoint it produces. The
 diffusion branch is set up so that the model is never coerced into a
-next-token predictor for alignment: every downstream stage keeps the
-diffusion objective, which is what makes the comparison with the
-autoregressive branch meaningful at the pretraining-to-alignment level
-rather than just at the pretraining level.
+next-token predictor for alignment. Every downstream stage keeps the
+diffusion objective, so the comparison with the autoregressive branch
+holds all the way through alignment rather than only at pretraining.
 
 ```bash
 bash recipes/local_training/06_pretrain_tiny_mdlm/run.sh
@@ -32,15 +31,13 @@ autoregressive recipes write: `forward_process.json`, which records
 the noise schedule. Every downstream diffusion recipe needs this file
 to reconstruct the forward process at training time and refuses to
 load a checkpoint without it. Renaming or dropping it is the most
-common reason later recipes fail to start, so it is worth treating
-that file as part of the model rather than as auxiliary metadata.
+common reason later recipes fail to start, so treat it as part of the
+model, not as auxiliary metadata you can regenerate.
 
 At matched parameters and matched compute, diffusion pretraining needs
 substantially more samples than autoregressive pretraining to reach
-the same coherence. The structural reason is that each token in the
-diffusion loss is supervised through a stochastic timestep expectation
-rather than against a deterministic next-token target, which means the
-same gradient budget carries strictly less information per token. The
-practical implication for this recipe is that planning for roughly an
-order of magnitude more steps than recipe 01 is the right starting
-estimate when chasing comparable sample quality.
+the same coherence. Each token in the diffusion loss is supervised through a
+stochastic timestep expectation rather than against a deterministic
+next-token target, so the same gradient budget carries strictly less
+information per token. Plan for roughly an order of magnitude more steps
+than recipe 01 when you are chasing comparable sample quality.

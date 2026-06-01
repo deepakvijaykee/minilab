@@ -20,7 +20,6 @@ MODEL=qwen3-0.6b bash recipes/hf_to_native/00_inspect/run.sh
 
 Setting `LOAD=1` pulls the weights into memory and reports the actual
 parameter-memory footprint instead of just the announced parameter
-count. Without it the script reads `config.json` only, which is enough
-to verify that the preset and its tokenizer resolve and is what makes
-the recipe safe to call as a sanity check without committing to a
-download.
+count. Without it the script reads `config.json` only. That is enough
+to verify that the preset and its tokenizer resolve, and cheap enough
+to run as a routine sanity check before committing to any download.

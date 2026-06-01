@@ -6,7 +6,7 @@ the response is noised and supervised. Step-to-step jitter is visibly
 larger than the autoregressive SFT loss because each step samples a
 single timestep per example and the loss weight depends on that
 sampled timestep. This is the diffusion-side analogue of how AR SFT's
-loss is noise-free; the noise has not vanished, it has moved into the
+loss is noise-free. The noise has not vanished, only moved into the
 estimator.
 
 The checkpoint directory contains `model.pt`, `config.json`,

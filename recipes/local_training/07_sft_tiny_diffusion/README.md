@@ -3,10 +3,9 @@
 This recipe runs instruction SFT on the diffusion language model. The
 trainer holds the prompt tokens clean at every diffusion timestep and
 noises only the response tokens, supervising the model on denoising
-the answer conditional on the question. The structural point worth
-being explicit about is that the model is never reduced to a
-left-to-right next-token predictor during alignment, so the inductive
-bias of the diffusion objective carries through into the SFT stage
+the answer conditional on the question. The model is never reduced to a
+left-to-right next-token predictor for alignment, so the inductive bias
+of the diffusion objective carries straight through into the SFT stage
 rather than being discarded for convenience.
 
 ```bash

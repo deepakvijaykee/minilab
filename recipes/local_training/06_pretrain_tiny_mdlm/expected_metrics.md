@@ -29,11 +29,9 @@ cannot sample unconditionally and print
 instead, which is correct behavior for those families rather than a
 sampling failure.
 
-Sample quality at a thousand steps is poor: token-shaped output with
-broken syntax. The cause is the same point as above, restated because
-it is the dominant explanation for why diffusion looks weaker than
-autoregressive at this budget. Each token is supervised through a
-noisy timestep expectation rather than against a single direct
-cross-entropy target, so the bias-variance balance of the per-token
-estimator sits in a higher-variance regime than the autoregressive
-equivalent.
+Sample quality at a thousand steps is poor, with token-shaped output
+and broken syntax. This traces back to the same estimator property that
+governs the loss curve. Each token is supervised through a noisy
+timestep expectation rather than against a single direct cross-entropy
+target, so the bias-variance balance of the per-token estimator sits in
+a higher-variance regime than the autoregressive equivalent.

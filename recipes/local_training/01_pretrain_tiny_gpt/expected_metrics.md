@@ -8,8 +8,8 @@ pass.
 
 Initial loss on a 4k-vocab model with uniform predictions is
 `log(4096)`, which is roughly 8.3 nats. The default thousand-step run
-usually lands in the 5 to 6 range. The interpretation is that the easy
-entropy has gone and the model is climbing the long tail of bigram and
+usually lands in the 5 to 6 range, which means the easy entropy is
+gone and the model is now climbing the long tail of bigram and
 short-range context structure. If the loss is still above 6 at the end
 of the run, the most likely cause is a vocabulary mismatch with the
 loaded `tokenizer.json`, which leaves the model unable to attribute
