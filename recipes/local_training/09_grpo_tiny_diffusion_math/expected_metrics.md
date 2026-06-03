@@ -25,12 +25,13 @@ lines followed by a summary line of the form
 `GSM8K test subset (50 of full split) accuracy: ...`. At the default
 budget the reward is sparse and the within-group z-score is noisy, so
 accuracy hovers near the SFT baseline regardless of step count. What
-this recipe demonstrates at this scale is the trajectory-scoring
-machinery itself, not a movement in the accuracy number.
+this recipe exercises at this scale is the trajectory-scoring
+machinery, which runs end to end even while the accuracy number stays
+flat.
 
 The most common dead-run pattern is the verifier returning zero on
-every rollout because the diffusion base never produces a numeric
-answer. The loss is then well-defined but the gradient is identically
-zero. The gating constraint here is base capacity, not RL
-hyperparameters. Push recipe 06 further before chasing GRPO numbers
-in this recipe.
+every rollout, which happens when the diffusion base never produces a
+numeric answer to grade. The loss stays well-defined but the gradient
+is identically zero, so nothing the RL hyperparameters control can
+rescue the run. What gates it is base capacity, so the move is to push
+recipe 06 further before chasing GRPO numbers here.

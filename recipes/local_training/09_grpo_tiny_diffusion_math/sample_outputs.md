@@ -21,6 +21,6 @@ GSM8K test subset (50 of full split) accuracy: 0/50 = 0.0%
 The blank `predicted=` field in the example is realistic at the
 default scale. The diffusion base often produces no extractable
 number at all, which the verifier treats as wrong by construction.
-That outcome reflects the base capacity, not the RL loop.
-Strengthening recipe 06 is the only intervention likely to give the
-verifier something to reward here.
+That traces straight back to base capacity, so the only intervention
+likely to give the verifier something to reward is to strengthen
+recipe 06.

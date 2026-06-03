@@ -8,10 +8,10 @@ which the optimizer is mainly polishing rare-token probabilities and
 the loss curve flattens.
 
 The default Alpaca prompts (`Give three tips for staying healthy.`,
-`What is the capital of France?`, `Explain gravity.`) are deliberately
-broad-knowledge prompts. A seven million parameter model has nowhere
-near the capacity to memorize that factual content, so the natural
-outcome is on-topic but factually wrong answers. That is the response
+`What is the capital of France?`, `Explain gravity.`) ask for broad
+factual knowledge, the kind a seven million parameter model has nowhere
+near the capacity to memorize. The natural outcome is on-topic but
+factually wrong answers. That is the response
 template winning over the content head, and at this scale it is the
 correct ordering of effects: format converges first because format
 lives in a low-dimensional subspace of the head, while content would

@@ -16,8 +16,8 @@ steps at `batch_size=1` with two generations per prompt, 64 maximum
 new tokens, 100 training examples, and 20 evaluation examples. Output
 lands in `checkpoints/imported/smollm2-135m-grpo`.
 
-These defaults are deliberately small because RLVR on a 135M model is
-much heavier per outer step than on the local `gpt-10m`. Activation
+These defaults stay small because RLVR on a 135M model is much heavier
+per outer step than on the local `gpt-10m`. Activation
 memory in the rollout phase scales with the policy size and with the
 number of generations, so the per-step cost grows by roughly the same
 factor as the parameter count compared with recipe 04. Expect
