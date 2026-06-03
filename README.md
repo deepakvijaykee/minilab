@@ -253,6 +253,9 @@ rollout-score-update loop. Collecting them behind one script turns them into
 a controlled comparison: at this scale you can point PPO, GRPO, Dr.GRPO,
 DAPO, GSPO, and RLOO at the same verifier and the same tiny policy and watch
 where they actually diverge, instead of inferring it from aggregate numbers.
+Dr.GRPO removes GRPO's group-std scaling and response-length loss
+normalization by using centered rewards and a fixed generation-budget token
+denominator.
 Next to those published baselines sit more experimental objectives, TPO,
 group policy gradient, VPO, and a family of variants that filter or reweight
 rollouts by reward uncertainty, reward variance, or replay age.

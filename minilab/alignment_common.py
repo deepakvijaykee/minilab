@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import record_function
 from tqdm import tqdm
 
 from minilab.base import BaseModel, unwrap_model
@@ -243,11 +244,13 @@ def _rollout_policy_train_loop(trainer, inner_epochs):
         pbar = tqdm(range(trainer.step + 1, trainer.config.max_steps + 1), desc="Training")
         for trainer.step in pbar:
             batch = trainer._next_batch()
-            rollout = trainer._rollout(batch)
+            with record_function(f"{type(trainer).__name__}.rollout"):
+                rollout = trainer._rollout(batch)
             total_loss = 0.0
             for _ in range(inner_epochs):
-                with torch.autocast(trainer.device, dtype=trainer.dtype, enabled=trainer.dtype != torch.float32):
-                    loss = trainer._policy_loss(rollout)
+                with record_function(f"{type(trainer).__name__}.update"):
+                    with torch.autocast(trainer.device, dtype=trainer.dtype, enabled=trainer.dtype != torch.float32):
+                        loss = trainer._policy_loss(rollout)
                 trainer.scaler.scale(loss).backward()
                 trainer._optimizer_update()
                 total_loss += loss.item()

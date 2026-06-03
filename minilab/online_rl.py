@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function
 from tqdm import tqdm
 
 from minilab.alignment_common import (
@@ -312,6 +313,7 @@ class GroupRollout:
     completion_masks: list
     rewards: torch.Tensor
     adv: torch.Tensor
+    ref_token_logps: list | None = None
     reward_components: dict | None = None
     age: int = 0
     generation_latency_ms: float = 0.0
@@ -337,6 +339,7 @@ class VPORollout:
     adv: torch.Tensor
     candidate_rewards: torch.Tensor
     reward_components: dict
+    ref_token_logps: list | None = None
     generation_latency_ms: float = 0.0
     reward_latency_ms: float = 0.0
     generated_tokens: int = 0
@@ -801,54 +804,66 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         try:
             generation_started = time.perf_counter()
             with torch.no_grad():
-                for _ in range(self.K):
-                    gens = []
-                    for b in range(B):
-                        plen = int(prompt_lens[b].item())
-                        # GRPO ratios below are full-softmax token ratios, so the
-                        # behavior policy must not apply top-k/top-p/repetition filters.
-                        gens.append(_sample_completion(
-                            self.model,
-                            prompt_ids[b : b + 1, :plen],
-                            self.max_new_tokens,
-                            self._algorithm_name().upper(),
+                with record_function(f"{self._algorithm_name()}.generate"):
+                    for _ in range(self.K):
+                        gens = []
+                        for b in range(B):
+                            plen = int(prompt_lens[b].item())
+                            # GRPO ratios below are full-softmax token ratios, so the
+                            # behavior policy must not apply top-k/top-p/repetition filters.
+                            gens.append(_sample_completion(
+                                self.model,
+                                prompt_ids[b : b + 1, :plen],
+                                self.max_new_tokens,
+                                self._algorithm_name().upper(),
+                            ))
+                        padded, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
+                            prompt_ids,
+                            prompt_lens,
+                            gens,
+                            self.device,
+                        )
+                        require(completion_mask.any(dim=1).all(), (
+                            f"{self._algorithm_name().upper()} requires at least one generated token per prompt"
                         ))
-                    padded, completion_mask, seq_pad, label_pad, _ = _pack_prompt_completions(
-                        prompt_ids,
-                        prompt_lens,
-                        gens,
-                        self.device,
-                    )
-                    require(completion_mask.any(dim=1).all(), (
-                        f"{self._algorithm_name().upper()} requires at least one generated token per prompt"
-                    ))
-                    completions.append(padded)
-                    completion_masks.append(completion_mask)
-                    seqs.append(seq_pad)
-                    label_seqs.append(label_pad)
+                        completions.append(padded)
+                        completion_masks.append(completion_mask)
+                        seqs.append(seq_pad)
+                        label_seqs.append(label_pad)
             generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
 
             reward_started = time.perf_counter()
-            rewards, reward_components = stack_reward_results(
-                [
-                    self.reward_fn(batch, c, m)
-                    for c, m in zip(completions, completion_masks, strict=True)
-                ],
-                self.device,
-            )
+            with record_function(f"{self._algorithm_name()}.reward"):
+                rewards, reward_components = stack_reward_results(
+                    [
+                        self.reward_fn(batch, c, m)
+                        for c, m in zip(completions, completion_masks, strict=True)
+                    ],
+                    self.device,
+                )
             reward_latency_ms = (time.perf_counter() - reward_started) * 1000.0
             adv = _group_normalized_advantages(rewards)
 
             old_token_logps = []
             if self._scores_old_policy:
-                for k in range(self.K):
-                    with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
-                        old_token_logps.append(_generation_context_token_logp(self.model, seqs[k], label_seqs[k])[0])
+                with record_function(f"{self._algorithm_name()}.logprob_old"):
+                    for k in range(self.K):
+                        with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                            old_token_logps.append(_generation_context_token_logp(self.model, seqs[k], label_seqs[k])[0])
+
+            ref_token_logps = None
+            if self._uses_reference_model:
+                ref_token_logps = []
+                with record_function(f"{self._algorithm_name()}.logprob_ref"):
+                    for k in range(self.K):
+                        with torch.no_grad(), torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                            ref_token_logps.append(_generation_context_token_logp(self.ref_model, seqs[k], label_seqs[k])[0])
 
             return GroupRollout(
                 seqs=seqs,
                 label_seqs=label_seqs,
                 old_token_logps=old_token_logps,
+                ref_token_logps=ref_token_logps,
                 completions=completions,
                 completion_masks=completion_masks,
                 rewards=rewards,
@@ -888,6 +903,9 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         return "grpo"
 
     def _policy_loss(self, rollout):
+        require(rollout.ref_token_logps is not None and len(rollout.ref_token_logps) == self.K, (
+            f"{self._algorithm_name().upper()} policy loss requires cached reference log-probs from rollout"
+        ))
         total = torch.tensor(0.0, device=self.device)
         ratio_values = []
         kl_values = []
@@ -903,8 +921,7 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
             surr1 = ratio * adv_k
             surr2 = ratio.clamp(1 - self.clip_ratio, 1 + self.clip_ratio) * adv_k
             policy_loss = -_masked_response_mean(torch.min(surr1, surr2), mask, "GRPO policy loss")
-            with torch.no_grad():
-                ref_logp, _ = _generation_context_token_logp(self.ref_model, rollout.seqs[k], rollout.label_seqs[k])
+            ref_logp = rollout.ref_token_logps[k]
             delta = ref_logp - logp
             kl = _masked_response_mean(delta.exp() - delta - 1, mask, "GRPO KL")
             ratio_values.append(ratio.detach()[mask.bool()])
@@ -923,11 +940,13 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
 
 @register_trainer("drgrpo")
 class DrGRPOTrainer(GRPOTrainer):
-    """Dr.GRPO-style group-centered trainer without reward-std normalization.
+    """Dr.GRPO-style trainer with centered rewards and fixed-budget token loss.
 
-    This scoped path isolates the normalization ablation in Minilab's LM rollout
-    contract. Length-bias corrections are not part of this class; DAPO owns the
-    length-shaping path.
+    The Dr.GRPO paper removes two GRPO denominators: per-group reward std and
+    per-response length. Minilab keeps the existing optional frozen-reference KL
+    path for this scoped trainer, but aggregates both policy and KL token terms
+    with the same fixed generation-budget denominator so the KL term does not
+    reintroduce response-length weighting.
     """
 
     def __init__(self, model, reward_fn, train_dataset, config, ref_model_path, *, signature, tokenizer_sig="", eval_dataset=None):
@@ -937,6 +956,48 @@ class DrGRPOTrainer(GRPOTrainer):
     def _rollout(self, batch):
         rollout = super()._rollout(batch)
         return replace(rollout, adv=_group_centered_advantages(rollout.rewards))
+
+    def _policy_loss(self, rollout):
+        require(rollout.ref_token_logps is not None and len(rollout.ref_token_logps) == self.K, (
+            "Dr.GRPO policy loss requires cached reference log-probs from rollout"
+        ))
+        total = torch.tensor(0.0, device=self.device)
+        kl_total = torch.tensor(0.0, device=self.device)
+        aux_total = torch.tensor(0.0, device=self.device)
+        ratio_values = []
+        kl_values = []
+        for k in range(self.K):
+            logp, mask, aux = _generation_context_token_logp(
+                self.model,
+                rollout.seqs[k],
+                rollout.label_seqs[k],
+                return_aux=True,
+            )
+            ratio = (logp - rollout.old_token_logps[k]).clamp(min=-20.0, max=20.0).exp()
+            adv = rollout.adv[:, k : k + 1].detach()
+            clipped = ratio.clamp(1 - self.clip_ratio, 1 + self.clip_ratio)
+            total = total + (torch.min(ratio * adv, clipped * adv) * mask).sum()
+
+            delta = rollout.ref_token_logps[k] - logp
+            kl_term = delta.exp() - delta - 1
+            kl_total = kl_total + (kl_term * mask).sum()
+            aux_total = aux_total + aux
+            ratio_values.append(ratio.detach()[mask.bool()])
+            kl_values.append(kl_term.detach()[mask.bool()])
+
+        batch = rollout.rewards.size(0)
+        denom = self.max_new_tokens * batch * self.K
+        require(denom > 0, "Dr.GRPO fixed loss denominator must be positive")
+        if ratio_values:
+            ratio_flat = torch.cat(ratio_values)
+            kl_flat = torch.cat(kl_values)
+            self._last_policy_metrics = {
+                "ratio_mean": float(ratio_flat.mean().item()),
+                "clip_fraction": float(((ratio_flat < 1 - self.clip_ratio) | (ratio_flat > 1 + self.clip_ratio)).float().mean().item()),
+                "kl_mean": float(kl_flat.mean().item()),
+                "drgrpo_loss_denominator_tokens": float(self.max_new_tokens),
+            }
+        return -total / denom + self.kl_coef * kl_total / denom + aux_total / self.K
 
     def _algorithm_name(self):
         return "drgrpo"
@@ -1145,6 +1206,7 @@ class VPOTrainer(GRPOTrainer):
                 seqs=flat_seqs,
                 label_seqs=flat_labels,
                 old_token_logps=old_token_logps,
+                ref_token_logps=None,
                 completions=flat_completions,
                 completion_masks=flat_masks,
                 rewards=rewards,
@@ -1452,13 +1514,15 @@ class RLOOTrainer(GRPOTrainer):
 
     def _rollout(self, batch):
         rollout = super()._rollout(batch)
+        require(rollout.ref_token_logps is not None and len(rollout.ref_token_logps) == self.K, (
+            "RLOO rollout requires cached reference log-probs from rollout"
+        ))
         seq_rewards = []
         old_seq_logps = []
         for k in range(self.K):
             old_logp = (rollout.old_token_logps[k] * (rollout.label_seqs[k] != -100).float()).sum(dim=-1)
-            with torch.no_grad():
-                ref_logp, mask = _generation_context_token_logp(self.ref_model, rollout.seqs[k], rollout.label_seqs[k])
-                kl = ((rollout.old_token_logps[k] - ref_logp) * mask).sum(dim=-1)
+            mask = (rollout.label_seqs[k] != -100).float()
+            kl = ((rollout.old_token_logps[k] - rollout.ref_token_logps[k]) * mask).sum(dim=-1)
             seq_rewards.append(rollout.rewards[:, k] - self.kl_coef * kl)
             old_seq_logps.append(old_logp)
 
@@ -1501,6 +1565,9 @@ class GSPOTrainer(GRPOTrainer):
         super().__init__(model, reward_fn, train_dataset, config, ref_model_path, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
 
     def _policy_loss(self, rollout):
+        require(rollout.ref_token_logps is not None and len(rollout.ref_token_logps) == self.K, (
+            "GSPO policy loss requires cached reference log-probs from rollout"
+        ))
         total = torch.tensor(0.0, device=self.device)
         ratios = []
         kls = []
@@ -1518,9 +1585,7 @@ class GSPOTrainer(GRPOTrainer):
             surr1 = ratio * adv
             surr2 = ratio.clamp(1 - self.clip_ratio, 1 + self.clip_ratio) * adv
             policy_loss = -torch.min(surr1, surr2).mean()
-            with torch.no_grad():
-                ref_logp, _ = _generation_context_token_logp(self.ref_model, rollout.seqs[k], rollout.label_seqs[k])
-            delta = ref_logp - logp
+            delta = rollout.ref_token_logps[k] - logp
             kl = _masked_response_mean(delta.exp() - delta - 1, mask, "GSPO KL")
             ratios.append(ratio.detach())
             kls.append((delta.exp() - delta - 1).detach()[mask.bool()])
@@ -1666,6 +1731,9 @@ def _select_group_rollout_rows(rollout, rows):
         seqs=[seq.index_select(0, rows.to(seq.device)) for seq in rollout.seqs],
         label_seqs=[labels.index_select(0, rows.to(labels.device)) for labels in rollout.label_seqs],
         old_token_logps=[logp.index_select(0, rows.to(logp.device)) for logp in rollout.old_token_logps],
+        ref_token_logps=None if rollout.ref_token_logps is None else [
+            logp.index_select(0, rows.to(logp.device)) for logp in rollout.ref_token_logps
+        ],
         completions=[completion.index_select(0, rows.to(completion.device)) for completion in rollout.completions],
         completion_masks=[mask.index_select(0, rows.to(mask.device)) for mask in rollout.completion_masks],
         rewards=rollout.rewards.index_select(0, rows.to(rollout.rewards.device)),
@@ -1686,6 +1754,7 @@ def _merge_group_rollouts(chunks):
         require(len(chunk.seqs) == K, "DAPO rollout chunks must have the same number of generations")
         require(len(chunk.label_seqs) == K, "DAPO rollout chunks must have matching label generations")
         require(len(chunk.old_token_logps) == K, "DAPO rollout chunks must have matching old log-prob generations")
+        require(chunk.ref_token_logps is None, "DAPO rollout chunks must not carry reference log-prob generations")
         require(len(chunk.completions) == K, "DAPO rollout chunks must have matching completion generations")
         require(len(chunk.completion_masks) == K, "DAPO rollout chunks must have matching completion masks")
         require(set(chunk.reward_components or {}) == component_keys, (
@@ -1704,6 +1773,7 @@ def _merge_group_rollouts(chunks):
             _cat_padded([chunk.old_token_logps[k] for chunk in chunks], pad_value=0.0)
             for k in range(K)
         ],
+        ref_token_logps=None,
         completions=[
             _cat_padded([chunk.completions[k] for chunk in chunks], pad_value=0)
             for k in range(K)
