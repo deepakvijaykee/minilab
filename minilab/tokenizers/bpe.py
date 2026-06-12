@@ -70,12 +70,13 @@ class BPETokenizer(BaseTokenizer):
             ids = _apply_merge(ids, best_pair, best_id)
         return ids
 
-    def decode(self, ids: list[int]) -> str:
+    def decode(self, ids: list[int], errors: str = "replace") -> str:
         missing = [i for i in ids if i not in self.vocab]
         require(not missing, f"BPE decode received unknown token ids: {missing[:5]}")
+        require(errors in {"strict", "replace", "ignore"}, "BPE decode errors must be 'strict', 'replace', or 'ignore'")
         raw = b"".join(self.vocab[i] for i in ids)
         try:
-            return raw.decode("utf-8")
+            return raw.decode("utf-8", errors=errors)
         except UnicodeDecodeError as exc:
             raise ValueError("BPE decode received a token sequence that is not valid UTF-8") from exc
 

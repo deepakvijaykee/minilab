@@ -35,7 +35,10 @@ class ByteTokenizer(BaseTokenizer):
             ids = ids + [EOS_ID]
         return ids
 
-    def decode(self, ids: list[int]) -> str:
+    def decode(self, ids: list[int], errors: str = "replace") -> str:
+        require(errors in {"strict", "replace", "ignore"}, (
+            "ByteTokenizer decode errors must be 'strict', 'replace', or 'ignore'"
+        ))
         byte_values = []
         for token_id in ids:
             if token_id in {PAD_ID, BOS_ID, EOS_ID, BOE_ID, BPE_ID}:
@@ -44,7 +47,7 @@ class ByteTokenizer(BaseTokenizer):
                 f"ByteTokenizer decode received non-byte id {token_id}"
             ))
             byte_values.append(token_id - BYTE_OFFSET)
-        return bytes(byte_values).decode("utf-8", errors="strict")
+        return bytes(byte_values).decode("utf-8", errors=errors)
 
     @property
     def vocab_size(self) -> int:
