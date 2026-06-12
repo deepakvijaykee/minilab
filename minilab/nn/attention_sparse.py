@@ -14,6 +14,9 @@ from minilab.nn.attention_common import (
 from minilab.registry import register_attention
 
 
+MSA_SPARSE_INDEX_PAD = -1
+
+
 def _block_sparse_attention_bias(T, block_size, local_blocks, global_tokens, random_blocks, seed, device, dtype, is_causal):
     num_blocks = math.ceil(T / block_size)
     allowed_blocks = torch.zeros(num_blocks, num_blocks, device=device, dtype=torch.bool)
@@ -43,7 +46,84 @@ def _block_sparse_attention_bias(T, block_size, local_blocks, global_tokens, ran
     return _bool_to_additive_bias(allowed, dtype)
 
 
-def _learned_block_attention_bias(q_idx, k_idx, block_size, top_k_blocks, local_blocks, kv_group_size, dtype, is_causal):
+def msa_sparse_topk_select(max_score, top_k, num_valid_pages=None, force_begin_blocks=0, force_end_blocks=0):
+    """PyTorch reference for MSA's sparse_topk_select contract.
+
+    `max_score` is shaped `(heads, kv_blocks, query_tokens)`. The returned
+    block indexes are shaped `(query_tokens, heads, top_k)`, sorted ascending by
+    block id and padded with `-1` when fewer valid blocks exist.
+    """
+    require(max_score.dim() == 3, "max_score must have shape (heads, kv_blocks, query_tokens)")
+    require(top_k > 0, "top_k must be > 0")
+    require(force_begin_blocks >= 0, "force_begin_blocks must be >= 0")
+    require(force_end_blocks >= 0, "force_end_blocks must be >= 0")
+    num_heads, max_k_tiles, total_q = max_score.shape
+    if num_valid_pages is None:
+        num_valid_pages = max_k_tiles
+    require(0 <= num_valid_pages <= max_k_tiles, "num_valid_pages must be in [0, kv_blocks]")
+    if num_valid_pages == 0:
+        return torch.full((total_q, num_heads, top_k), MSA_SPARSE_INDEX_PAD, device=max_score.device, dtype=torch.int32)
+    if num_valid_pages <= top_k:
+        selected = torch.full(
+            (total_q, num_heads, top_k),
+            MSA_SPARSE_INDEX_PAD,
+            device=max_score.device,
+            dtype=torch.int32,
+        )
+        selected[..., :num_valid_pages] = torch.arange(
+            num_valid_pages,
+            device=max_score.device,
+            dtype=torch.int32,
+        ).view(1, 1, num_valid_pages)
+        return selected
+
+    force_begin_blocks = min(force_begin_blocks, num_valid_pages)
+    force_end_blocks = min(force_end_blocks, num_valid_pages)
+    force_mask = torch.zeros(num_valid_pages, device=max_score.device, dtype=torch.bool)
+    if force_begin_blocks:
+        force_mask[:force_begin_blocks] = True
+    if force_end_blocks:
+        force_mask[num_valid_pages - force_end_blocks:] = True
+    forced = torch.arange(num_valid_pages, device=max_score.device, dtype=torch.long)[force_mask]
+    require(forced.numel() <= top_k, "forced sparse blocks must fit within top_k")
+
+    scores = max_score[:, :num_valid_pages, :].permute(2, 0, 1)
+    remaining = top_k - forced.numel()
+    pieces = []
+    if forced.numel() > 0:
+        pieces.append(forced.view(1, 1, -1).expand(total_q, num_heads, -1))
+    if remaining > 0:
+        candidate_scores = scores.masked_fill(force_mask.view(1, 1, -1), float("-inf"))
+        k_eff = min(remaining, num_valid_pages - forced.numel())
+        if k_eff > 0:
+            values, indices = candidate_scores.topk(k_eff, dim=-1)
+            indices = torch.where(
+                torch.isfinite(values),
+                indices,
+                torch.full_like(indices, MSA_SPARSE_INDEX_PAD),
+            )
+            pieces.append(indices)
+
+    if pieces:
+        selected = torch.cat(pieces, dim=-1)
+    else:
+        selected = torch.empty(total_q, num_heads, 0, device=max_score.device, dtype=torch.long)
+    if selected.size(-1) < top_k:
+        pad = torch.full(
+            (total_q, num_heads, top_k - selected.size(-1)),
+            MSA_SPARSE_INDEX_PAD,
+            device=max_score.device,
+            dtype=selected.dtype,
+        )
+        selected = torch.cat([selected, pad], dim=-1)
+
+    sentinel = torch.full_like(selected, num_valid_pages)
+    order = torch.argsort(torch.where(selected != MSA_SPARSE_INDEX_PAD, selected, sentinel), dim=-1)
+    selected = torch.gather(selected, -1, order)
+    return selected.to(torch.int32)
+
+
+def _msa_block_max_scores(q_idx, k_idx, block_size, is_causal):
     B, G, T, index_dim = q_idx.shape
     require(k_idx.shape[:2] == (B, T), "index keys must match batch and sequence length")
     require(k_idx.size(-1) == index_dim, "index query/key dims must match")
@@ -59,24 +139,38 @@ def _learned_block_attention_bias(q_idx, k_idx, block_size, top_k_blocks, local_
         pad = num_blocks * block_size - T
         if pad > 0:
             scores = F.pad(scores, (0, pad), value=float("-inf"))
-        block_scores = scores.view(B, G, T, num_blocks, block_size).amax(dim=-1)
+        return scores.view(B, G, T, num_blocks, block_size).amax(dim=-1)
 
-        keep_blocks = torch.zeros(B, G, T, num_blocks, device=q_idx.device, dtype=torch.bool)
-        if top_k_blocks > 0:
-            k_eff = min(top_k_blocks, num_blocks)
-            values, indices = block_scores.topk(k_eff, dim=-1)
-            keep_blocks.scatter_(-1, indices, torch.isfinite(values))
 
-        q_blocks = torch.div(torch.arange(T, device=q_idx.device), block_size, rounding_mode="floor")
-        blocks = torch.arange(num_blocks, device=q_idx.device)
-        delta = q_blocks[:, None] - blocks[None, :]
-        if is_causal:
-            local = (delta >= 0) & (delta <= local_blocks)
-        else:
-            local = delta.abs() <= local_blocks
-        keep_blocks |= local.view(1, 1, T, num_blocks)
+def _msa_block_indexes_from_scores(block_scores, top_k_blocks):
+    B, G, T, num_blocks = block_scores.shape
+    rows = []
+    for b in range(B):
+        rows.append(msa_sparse_topk_select(block_scores[b].permute(0, 2, 1), top_k_blocks, num_blocks))
+    return torch.stack(rows, dim=0).permute(0, 2, 1, 3).contiguous()
 
-        allowed = keep_blocks.repeat_interleave(block_size, dim=-1)[..., :T]
+
+def _learned_block_attention_bias(q_idx, k_idx, block_size, top_k_blocks, local_blocks, kv_group_size, dtype, is_causal):
+    B, G, T, _ = q_idx.shape
+    num_blocks = math.ceil(T / block_size)
+    with torch.no_grad():
+        block_scores = _msa_block_max_scores(q_idx, k_idx, block_size, is_causal)
+        block_indexes = _msa_block_indexes_from_scores(block_scores, top_k_blocks)
+        key_blocks = torch.div(torch.arange(T, device=q_idx.device), block_size, rounding_mode="floor")
+        allowed = (block_indexes.unsqueeze(-1).long() == key_blocks.view(1, 1, 1, 1, T)).any(dim=-2)
+
+        if local_blocks > 0:
+            blocks = torch.arange(num_blocks, device=q_idx.device)
+            keep_blocks = (block_indexes.unsqueeze(-1).long() == blocks.view(1, 1, 1, 1, num_blocks)).any(dim=-2)
+            q_blocks = torch.div(torch.arange(T, device=q_idx.device), block_size, rounding_mode="floor")
+            delta = q_blocks[:, None] - blocks[None, :]
+            if is_causal:
+                local = (delta >= 0) & (delta <= local_blocks)
+            else:
+                local = delta.abs() <= local_blocks
+            keep_blocks |= local.view(1, 1, T, num_blocks)
+            allowed = keep_blocks.repeat_interleave(block_size, dim=-1)[..., :T]
+
         if is_causal:
             pos = torch.arange(T, device=q_idx.device)
             allowed &= (pos[None, :] <= pos[:, None]).view(1, 1, T, T)
@@ -324,7 +418,7 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         dropout=0.0,
         block_size=128,
         top_k_blocks=32,
-        local_blocks=1,
+        local_blocks=0,
         index_dim=None,
     ):
         super().__init__()
@@ -335,7 +429,7 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         require(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
         require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
         require(block_size > 0, "block_size must be > 0")
-        require(top_k_blocks >= 0, "top_k_blocks must be >= 0")
+        require(top_k_blocks > 0, "top_k_blocks must be > 0")
         require(local_blocks >= 0, "local_blocks must be >= 0")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads

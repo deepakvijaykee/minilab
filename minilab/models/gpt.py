@@ -201,7 +201,7 @@ class GPTConfig(BaseConfig):
         require(self.local_attention_window > 0, "local_attention_window must be > 0")
         require(self.qwen3_next_full_attention_interval > 0, "qwen3_next_full_attention_interval must be > 0")
         require(self.sparse_block_size > 0, "sparse_block_size must be > 0")
-        require(self.sparse_top_k_blocks >= 0, "sparse_top_k_blocks must be >= 0")
+        require(self.sparse_top_k_blocks > 0, "sparse_top_k_blocks must be > 0")
         require(self.sparse_local_blocks >= 0, "sparse_local_blocks must be >= 0")
         require(self.sparse_index_dim >= 0, "sparse_index_dim must be >= 0")
         require(self.lighthouse_num_levels > 0, "lighthouse_num_levels must be > 0")
