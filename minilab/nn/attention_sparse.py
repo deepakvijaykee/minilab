@@ -275,7 +275,7 @@ def _safe_log_softmax(scores, support):
 
 def _learned_block_kl_loss(index_scores, q, k_attn, token_support, kv_group_size, attn_bias, loss_weight):
     if loss_weight == 0.0 or not torch.is_grad_enabled():
-        return index_scores.sum() * 0.0
+        return index_scores.new_zeros(())
     B, G, T, _ = index_scores.shape
     H = q.size(1)
     head_support = token_support.repeat_interleave(kv_group_size, dim=1)
@@ -299,7 +299,7 @@ def _learned_block_kl_loss(index_scores, q, k_attn, token_support, kv_group_size
     kl = (teacher * (teacher_log - index_log_probs)).masked_fill(~support, 0.0).sum(dim=-1)
     valid = support.any(dim=-1)
     if not bool(valid.any().item()):
-        return index_scores.sum() * 0.0
+        return index_scores.new_zeros(())
     return loss_weight * kl[valid].mean().to(index_scores.dtype)
 
 
