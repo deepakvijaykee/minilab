@@ -5,7 +5,6 @@ from minilab.data import load_openwebtext, load_text8, load_tinystories, load_wi
 from minilab.evaluation import perplexity
 from minilab import generation as _generation
 from minilab import models as _models
-from minilab.models.transformer_utils import attention_uses_gqa
 from minilab.registry import get_model, get_sampler
 from minilab.trainer import LMTrainer, set_seed, tokenizer_signature
 from torch.utils.data import DataLoader
@@ -64,6 +63,7 @@ def lm_model_kwargs(
     num_heads=None,
     num_kv_heads=None,
     attention=None,
+    attention_backend=None,
     position=None,
     norm=None,
     rope_base=None,
@@ -80,6 +80,8 @@ def lm_model_kwargs(
     sparse_top_k_blocks=None,
     sparse_local_blocks=None,
     sparse_index_dim=None,
+    sparse_kl_loss_weight=None,
+    sparse_index_warmup_steps=None,
     lighthouse_num_levels=None,
     lighthouse_pooling_factor=None,
     lighthouse_top_k=None,
@@ -108,6 +110,7 @@ def lm_model_kwargs(
         _update_supplied(kwargs, {
             "num_kv_heads": num_kv_heads,
             "attention": attention,
+            "attention_backend": attention_backend,
             "position": position,
             "norm": norm,
             "connection": connection,
@@ -129,6 +132,8 @@ def lm_model_kwargs(
             "sparse_top_k_blocks": sparse_top_k_blocks,
             "sparse_local_blocks": sparse_local_blocks,
             "sparse_index_dim": sparse_index_dim,
+            "sparse_kl_loss_weight": sparse_kl_loss_weight,
+            "sparse_index_warmup_steps": sparse_index_warmup_steps,
             "lighthouse_num_levels": lighthouse_num_levels,
             "lighthouse_pooling_factor": lighthouse_pooling_factor,
             "lighthouse_top_k": lighthouse_top_k,
@@ -151,6 +156,7 @@ def lm_model_kwargs(
         _update_supplied(kwargs, {
             "num_kv_heads": num_kv_heads,
             "attention": attention,
+            "attention_backend": attention_backend,
             "position": position,
             "norm": norm,
             "ffn": ffn,
@@ -174,6 +180,7 @@ def lm_model_kwargs(
         _update_supplied(kwargs, {
             "num_kv_heads": num_kv_heads,
             "attention": attention,
+            "attention_backend": attention_backend,
             "norm": norm,
             "ffn": ffn,
             "num_experts": num_experts,

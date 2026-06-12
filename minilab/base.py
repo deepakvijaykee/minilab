@@ -101,6 +101,9 @@ class BaseModel(nn.Module):
     def set_qk_clip_recording(self, enabled):
         return None
 
+    def set_training_step(self, step):
+        return None
+
     def supports_qk_clip(self):
         return False
 

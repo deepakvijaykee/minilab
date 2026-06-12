@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from minilab.checks import require
-from minilab.nn.attention_common import _QKClipMixin, apply_rotary_emb
+from minilab.nn.attention_common import _QKClipMixin, DEFAULT_ATTENTION_BACKEND, attention_sdpa, apply_rotary_emb
 from minilab.registry import register_attention
 
 
@@ -23,7 +22,16 @@ class MultiHeadLatentAttention(_QKClipMixin, nn.Module):
     inference-time absorb cache.
     """
 
-    def __init__(self, dim, num_heads, dropout=0.0, q_lora_rank=None, kv_lora_rank=None, rope_head_dim=None):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        dropout=0.0,
+        q_lora_rank=None,
+        kv_lora_rank=None,
+        rope_head_dim=None,
+        attention_backend=DEFAULT_ATTENTION_BACKEND,
+    ):
         super().__init__()
         require(dim > 0, "dim must be > 0")
         require(num_heads > 0, "num_heads must be > 0")
@@ -41,6 +49,7 @@ class MultiHeadLatentAttention(_QKClipMixin, nn.Module):
         require(self.q_lora_rank > 0, "q_lora_rank must be > 0")
         require(self.kv_lora_rank > 0, "kv_lora_rank must be > 0")
         self.dropout = dropout
+        self.attention_backend = attention_backend
         self.wq_a = nn.Linear(dim, self.q_lora_rank, bias=False)
         self.q_norm = nn.LayerNorm(self.q_lora_rank)
         self.wq_b = nn.Linear(self.q_lora_rank, num_heads * self.head_dim, bias=False)
@@ -72,12 +81,9 @@ class MultiHeadLatentAttention(_QKClipMixin, nn.Module):
             q_pe, k_pe = _apply_partial_rotary(q_pe, k_pe, freqs_cis, self.rope_head_dim)
         q = torch.cat([q_nope, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)
-        self._record_qk_clip_logits(q, k, attn_bias=attn_bias, is_causal=is_causal and attn_bias is None)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal and attn_bias is None,
-        )
+        causal = is_causal and attn_bias is None
+        self._record_qk_clip_logits(q, k, attn_bias=attn_bias, is_causal=causal)
+        out = attention_sdpa(q, k, v, attn_bias, self.dropout if self.training else 0.0, causal, backend=self.attention_backend)
         return self.out(out.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim))
 
     @torch.no_grad()
@@ -95,4 +101,3 @@ class MultiHeadLatentAttention(_QKClipMixin, nn.Module):
         kv_weight = self.wkv_b.weight.view(self.num_heads, kv_rows, self.kv_lora_rank)
         kv_weight[:, :self.nope_head_dim].mul_(sqrt_gamma.to(kv_weight.device, kv_weight.dtype).view(-1, 1, 1))
         self._reset_qk_clip_stats()
-

@@ -1,6 +1,7 @@
 import torch
 
 from minilab.checks import require, require_finite_fields, require_integer_fields
+from minilab.nn.attention_common import DEFAULT_ATTENTION_BACKEND, attention_backend_choices
 from minilab.nn.architecture import (
     GQA_ATTENTIONS,
     MOE_FFNS,
@@ -14,6 +15,21 @@ from minilab.registry import get_position
 _SIMPLE_HYBRID_POSITIONS = {"rope", "yarn_rope", "none", "sinusoidal"}
 _LOCAL_WINDOW_ATTENTIONS = {"sliding_window", "sliding_window_gqa_qknorm"}
 _PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
+_FLASH_BACKEND_ATTENTIONS = {
+    "mha",
+    "mha_qknorm",
+    "gqa",
+    "mqa",
+    "gqa_qknorm",
+    "gated_gqa_qknorm",
+    "gated_gqa_qknorm_partial_rope",
+    "gqa_qknorm_kv_tied",
+    "gqa_qknorm_partial_rope",
+    "iha",
+    "mla",
+    "qwen3_next",
+}
+_FLASH_BACKEND_BIAS_POSITIONS = {"alibi", "t5_relative", "kerple_log", "kerple_power"}
 DEFAULT_ROPE_BASE = 10000.0
 DEFAULT_ROPE_LOCAL_BASE = 10000.0
 DEFAULT_ROPE_GLOBAL_BASE = 1000000.0
@@ -28,11 +44,36 @@ DEFAULT_SPARSE_BLOCK_SIZE = 128
 DEFAULT_SPARSE_TOP_K_BLOCKS = 32
 DEFAULT_SPARSE_LOCAL_BLOCKS = 0
 DEFAULT_SPARSE_INDEX_DIM = 0
+DEFAULT_SPARSE_KL_LOSS_WEIGHT = 0.0
+DEFAULT_SPARSE_INDEX_WARMUP_STEPS = 0
 DEFAULT_LIGHTHOUSE_NUM_LEVELS = 3
 DEFAULT_LIGHTHOUSE_POOLING_FACTOR = 2
 DEFAULT_LIGHTHOUSE_TOP_K = 32
 DEFAULT_NUM_EXPERTS = 8
 DEFAULT_TOP_K_EXPERTS = 2
+
+
+def validate_attention_backend(backend):
+    require(backend in attention_backend_choices(), (
+        f"attention_backend must be one of {attention_backend_choices()}, got {backend!r}"
+    ))
+
+
+def validate_flash_attention_backend_contract(config, owner):
+    if getattr(config, "attention_backend", DEFAULT_ATTENTION_BACKEND) != "flash":
+        return
+    require(getattr(config, "dropout", 0.0) == 0.0, (
+        f"{owner} attention_backend='flash' currently requires dropout=0.0"
+    ))
+    attention = getattr(config, "attention", "mha")
+    resolved_attention = resolve_deepseek_v4_attention(attention, 0)
+    require(attention in _FLASH_BACKEND_ATTENTIONS or resolved_attention in _FLASH_BACKEND_ATTENTIONS, (
+        f"{owner} attention_backend='flash' currently supports dense SDPA attention variants only"
+    ))
+    position = getattr(config, "position", "rope")
+    require(position not in _FLASH_BACKEND_BIAS_POSITIONS, (
+        f"{owner} attention_backend='flash' does not support additive attention-bias positions"
+    ))
 
 
 def require_default_unless(value, default, condition, message):
@@ -44,6 +85,7 @@ def validate_parallel_or_interleaved_lm_config(config, owner):
     if config.num_kv_heads is None:
         config.num_kv_heads = config.num_heads
     _validate_simple_lm_fields(config)
+    validate_flash_attention_backend_contract(config, owner)
     _validate_simple_transformer_branch(config, owner)
 
 
@@ -67,7 +109,9 @@ def validate_fixed_rope_transformer_config(config, owner):
     require(config.dim % config.num_heads == 0, "dim must be divisible by num_heads")
     require((config.dim // config.num_heads) % 2 == 0, "RoPE requires even head dimension")
     require(config.max_seq_len > 0, "max_seq_len must be > 0")
+    validate_attention_backend(getattr(config, "attention_backend", DEFAULT_ATTENTION_BACKEND))
     require(0.0 <= config.dropout < 1.0, "dropout must be in [0, 1)")
+    validate_flash_attention_backend_contract(config, owner)
     require(config.ffn_mult > 0, "ffn_mult must be > 0")
     require(config.attention != "lighthouse_mha", (
         f"Lighthouse attention is wired through GPT, not {owner}"
@@ -109,6 +153,7 @@ def _validate_simple_lm_fields(config):
     require(config.num_heads > 0, "num_heads must be > 0")
     require(config.num_kv_heads > 0, "num_kv_heads must be > 0")
     require(config.max_seq_len > 0, "max_seq_len must be > 0")
+    validate_attention_backend(getattr(config, "attention_backend", DEFAULT_ATTENTION_BACKEND))
     require(config.dim % config.num_heads == 0, "dim must be divisible by num_heads")
     require(0.0 <= config.dropout < 1.0, "dropout must be in [0, 1)")
     require(config.ffn_mult > 0, "ffn_mult must be > 0")
@@ -225,6 +270,10 @@ def attention_uses_gqa(attention):
 
 def transformer_auxiliary_loss(blocks, ffn_name, reference):
     loss = reference.sum() * 0.0
+    for block in blocks:
+        attn_aux_loss = getattr(block.attn, "aux_loss", None)
+        if attn_aux_loss is not None:
+            loss = loss + attn_aux_loss
     if ffn_name not in MOE_FFNS:
         return loss
     for block in blocks:

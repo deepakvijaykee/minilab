@@ -17,6 +17,7 @@ from minilab.base import BaseModel, validate_token_ids
 from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.config import BaseConfig
 from minilab.models.transformer_utils import (
+    DEFAULT_ATTENTION_BACKEND,
     DEFAULT_LOCAL_ATTENTION_WINDOW,
     DEFAULT_NUM_EXPERTS,
     DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
@@ -56,6 +57,7 @@ class HymbaConfig(BaseConfig):
     dropout: float = 0.0
     ffn_mult: float = 4.0
     attention: str = "mha"
+    attention_backend: str = DEFAULT_ATTENTION_BACKEND
     position: str = "rope"
     norm: str = "rmsnorm"
     ffn: str = "swiglu"

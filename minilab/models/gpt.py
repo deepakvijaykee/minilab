@@ -10,6 +10,7 @@ from minilab.checks import require, require_finite_fields, require_integer_field
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
 from minilab.models.transformer_utils import (
+    DEFAULT_ATTENTION_BACKEND,
     DEFAULT_LOCAL_ATTENTION_WINDOW,
     DEFAULT_NUM_EXPERTS,
     DEFAULT_QWEN3_NEXT_FULL_ATTENTION_INTERVAL,
@@ -21,6 +22,8 @@ from minilab.models.transformer_utils import (
     DEFAULT_ROPE_SCALING_FACTOR,
     DEFAULT_SPARSE_BLOCK_SIZE,
     DEFAULT_SPARSE_INDEX_DIM,
+    DEFAULT_SPARSE_INDEX_WARMUP_STEPS,
+    DEFAULT_SPARSE_KL_LOSS_WEIGHT,
     DEFAULT_SPARSE_LOCAL_BLOCKS,
     DEFAULT_SPARSE_TOP_K_BLOCKS,
     DEFAULT_LIGHTHOUSE_NUM_LEVELS,
@@ -36,6 +39,8 @@ from minilab.models.transformer_utils import (
     set_transformer_qk_clip_recording,
     transformer_auxiliary_loss,
     transformer_supports_qk_clip,
+    validate_attention_backend,
+    validate_flash_attention_backend_contract,
     validate_moe_fields,
 )
 from minilab.nn.architecture import (
@@ -61,11 +66,31 @@ _CACHE_ATTENTIONS = {
     "gqa_qknorm_partial_rope",
     "gqa_qknorm_kv_tied",
 }
+_ATTENTION_BACKEND_ATTENTIONS = {
+    "mha",
+    "mha_qknorm",
+    "gqa",
+    "mqa",
+    "gqa_qknorm",
+    "gated_gqa_qknorm",
+    "gated_gqa_qknorm_partial_rope",
+    "gqa_qknorm_kv_tied",
+    "gqa_qknorm_partial_rope",
+    "sliding_window_gqa_qknorm",
+    "learned_block_gqa",
+    "lighthouse_mha",
+    "iha",
+    "sliding_window",
+    "block_sparse",
+    "mla",
+}
 _GPT_COMPAT_DEFAULT_FIELDS = {
     "sparse_block_size",
     "sparse_top_k_blocks",
     "sparse_local_blocks",
     "sparse_index_dim",
+    "sparse_kl_loss_weight",
+    "sparse_index_warmup_steps",
     "lighthouse_num_levels",
     "lighthouse_pooling_factor",
     "lighthouse_top_k",
@@ -77,6 +102,7 @@ _GPT_COMPAT_DEFAULT_FIELDS = {
     "future_summary_loss_weight",
     "jacobi_loss_weight",
     "jacobi_iterations",
+    "attention_backend",
 }
 
 
@@ -95,6 +121,7 @@ class GPTConfig(BaseConfig):
     position: str = "rope"
     norm: str = "rmsnorm"
     ffn: str = "swiglu"
+    attention_backend: str = DEFAULT_ATTENTION_BACKEND
     connection: str = "residual"
     connection_expansion: int = 4
     num_experts: int = DEFAULT_NUM_EXPERTS
@@ -114,6 +141,8 @@ class GPTConfig(BaseConfig):
     sparse_top_k_blocks: int = DEFAULT_SPARSE_TOP_K_BLOCKS
     sparse_local_blocks: int = DEFAULT_SPARSE_LOCAL_BLOCKS
     sparse_index_dim: int = DEFAULT_SPARSE_INDEX_DIM
+    sparse_kl_loss_weight: float = DEFAULT_SPARSE_KL_LOSS_WEIGHT
+    sparse_index_warmup_steps: int = DEFAULT_SPARSE_INDEX_WARMUP_STEPS
     lighthouse_num_levels: int = DEFAULT_LIGHTHOUSE_NUM_LEVELS
     lighthouse_pooling_factor: int = DEFAULT_LIGHTHOUSE_POOLING_FACTOR
     lighthouse_top_k: int = DEFAULT_LIGHTHOUSE_TOP_K
@@ -151,6 +180,7 @@ class GPTConfig(BaseConfig):
             self.num_kv_heads = self.num_heads
         self._validate_core_fields()
         self._validate_attention_position_contract()
+        validate_flash_attention_backend_contract(self, "GPT")
         self._reject_unused_variant_knobs()
         self._validate_connection_knobs()
         self._validate_ffn_knobs()
@@ -163,11 +193,11 @@ class GPTConfig(BaseConfig):
             "rope_scaling_factor", "rope_original_max_seq_len", "rope_partial_rotary_factor",
             "yarn_beta_fast", "yarn_beta_slow", "local_attention_window",
             "qwen3_next_full_attention_interval", "sparse_block_size", "sparse_top_k_blocks",
-            "sparse_local_blocks", "sparse_index_dim", "lighthouse_num_levels",
-            "lighthouse_pooling_factor", "lighthouse_top_k", "per_layer_embedding_dim",
-            "final_logit_softcap", "mtp_depth", "mtp_loss_weight", "layerskip_loss_weight",
-            "layerskip_dropout", "layerskip_min_layer", "future_summary_window",
-            "future_summary_loss_weight", "jacobi_loss_weight", "jacobi_iterations",
+            "sparse_local_blocks", "sparse_index_dim", "sparse_kl_loss_weight",
+            "sparse_index_warmup_steps", "lighthouse_num_levels", "lighthouse_pooling_factor",
+            "lighthouse_top_k", "per_layer_embedding_dim", "final_logit_softcap", "mtp_depth",
+            "mtp_loss_weight", "layerskip_loss_weight", "layerskip_dropout", "layerskip_min_layer",
+            "future_summary_window", "future_summary_loss_weight", "jacobi_loss_weight", "jacobi_iterations",
         ))
         require_integer_fields(self, (
             "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
@@ -175,8 +205,8 @@ class GPTConfig(BaseConfig):
             "rope_original_max_seq_len", "local_attention_window",
             "qwen3_next_full_attention_interval", "sparse_block_size",
             "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
-            "lighthouse_num_levels", "lighthouse_pooling_factor", "lighthouse_top_k",
-            "per_layer_embedding_dim", "mtp_depth", "layerskip_min_layer",
+            "sparse_index_warmup_steps", "lighthouse_num_levels", "lighthouse_pooling_factor",
+            "lighthouse_top_k", "per_layer_embedding_dim", "mtp_depth", "layerskip_min_layer",
             "future_summary_window", "jacobi_iterations",
         ))
         require(self.vocab_size > 0, "vocab_size must be > 0")
@@ -204,6 +234,11 @@ class GPTConfig(BaseConfig):
         require(self.sparse_top_k_blocks > 0, "sparse_top_k_blocks must be > 0")
         require(self.sparse_local_blocks >= 0, "sparse_local_blocks must be >= 0")
         require(self.sparse_index_dim >= 0, "sparse_index_dim must be >= 0")
+        require(self.sparse_kl_loss_weight >= 0, "sparse_kl_loss_weight must be >= 0")
+        require(self.sparse_index_warmup_steps >= 0, "sparse_index_warmup_steps must be >= 0")
+        require(self.sparse_index_warmup_steps == 0 or self.sparse_kl_loss_weight > 0, (
+            "sparse_index_warmup_steps requires sparse_kl_loss_weight > 0"
+        ))
         require(self.lighthouse_num_levels > 0, "lighthouse_num_levels must be > 0")
         require(self.lighthouse_pooling_factor > 1, "lighthouse_pooling_factor must be > 1")
         require(self.lighthouse_top_k > 0, "lighthouse_top_k must be > 0")
@@ -231,6 +266,7 @@ class GPTConfig(BaseConfig):
         require((self.jacobi_iterations == 0) == (self.jacobi_loss_weight == 0), (
             "jacobi_iterations and jacobi_loss_weight must be enabled together"
         ))
+        validate_attention_backend(self.attention_backend)
 
     def _validate_attention_position_contract(self):
         if attention_uses_gqa(self.attention):
@@ -405,6 +441,18 @@ class GPTConfig(BaseConfig):
             "sparse_index_dim only applies to attention='learned_block_gqa'",
         )
         require_default_unless(
+            self.sparse_kl_loss_weight,
+            DEFAULT_SPARSE_KL_LOSS_WEIGHT,
+            uses_learned_block,
+            "sparse_kl_loss_weight only applies to attention='learned_block_gqa'",
+        )
+        require_default_unless(
+            self.sparse_index_warmup_steps,
+            DEFAULT_SPARSE_INDEX_WARMUP_STEPS,
+            uses_learned_block,
+            "sparse_index_warmup_steps only applies to attention='learned_block_gqa'",
+        )
+        require_default_unless(
             self.lighthouse_num_levels,
             DEFAULT_LIGHTHOUSE_NUM_LEVELS,
             uses_lighthouse,
@@ -475,6 +523,7 @@ def _build_transformer_attention(config, block_id):
                 config.num_kv_heads,
                 config.dropout,
                 rope_fraction=config.rope_partial_rotary_factor,
+                attention_backend=config.attention_backend,
             )
         elif attention == "learned_block_gqa":
             attn = attn_cls(
@@ -486,9 +535,17 @@ def _build_transformer_attention(config, block_id):
                 top_k_blocks=config.sparse_top_k_blocks,
                 local_blocks=config.sparse_local_blocks,
                 index_dim=None if config.sparse_index_dim == 0 else config.sparse_index_dim,
+                kl_loss_weight=config.sparse_kl_loss_weight,
+                attention_backend=config.attention_backend,
             )
         else:
-            attn = attn_cls(config.dim, config.num_heads, config.num_kv_heads, config.dropout)
+            attn = attn_cls(
+                config.dim,
+                config.num_heads,
+                config.num_kv_heads,
+                config.dropout,
+                attention_backend=config.attention_backend,
+            )
         if attention == "sliding_window_gqa_qknorm":
             attn.window_size = config.local_attention_window
         return attention, attn
@@ -498,6 +555,7 @@ def _build_transformer_attention(config, block_id):
             config.num_heads,
             config.dropout,
             window_size=config.local_attention_window,
+            attention_backend=config.attention_backend,
         )
     if attention == "lighthouse_mha":
         return attention, attn_cls(
@@ -507,6 +565,14 @@ def _build_transformer_attention(config, block_id):
             num_levels=config.lighthouse_num_levels,
             pooling_factor=config.lighthouse_pooling_factor,
             top_k=config.lighthouse_top_k,
+            attention_backend=config.attention_backend,
+        )
+    if attention in _ATTENTION_BACKEND_ATTENTIONS:
+        return attention, attn_cls(
+            config.dim,
+            config.num_heads,
+            config.dropout,
+            attention_backend=config.attention_backend,
         )
     return attention, attn_cls(config.dim, config.num_heads, config.dropout)
 
@@ -770,6 +836,13 @@ class GPT(BaseModel):
     def set_qk_clip_recording(self, enabled):
         set_transformer_qk_clip_recording(self._optimizer_transformer_blocks(), enabled)
 
+    def set_training_step(self, step):
+        warmup_active = self.training and 0 < step <= self.config.sparse_index_warmup_steps
+        for block in self._optimizer_transformer_blocks():
+            setter = getattr(block.attn, "set_sparse_index_warmup", None)
+            if setter is not None:
+                setter(warmup_active)
+
     def supports_qk_clip(self):
         return transformer_supports_qk_clip(self.blocks)
 
@@ -994,8 +1067,7 @@ class GPT(BaseModel):
                 mtp_target.reshape(-1),
                 ignore_index=-100,
             ))
-            if self.config.ffn in MOE_FFNS:
-                mtp_aux = mtp_aux + module.block.ffn.aux_loss
+            mtp_aux = mtp_aux + transformer_auxiliary_loss((module.block,), self.config.ffn, main_hidden)
         if not mtp_losses:
             return main_hidden.sum() * 0.0
         return self.config.mtp_loss_weight * torch.stack(mtp_losses).mean() + mtp_aux

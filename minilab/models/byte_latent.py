@@ -16,6 +16,7 @@ from minilab.checks import require, require_finite_number, require_integer
 from minilab.config import BaseConfig
 from minilab.losses import causal_lm_cross_entropy
 from minilab.models.transformer_utils import (
+    DEFAULT_ATTENTION_BACKEND,
     DEFAULT_NUM_EXPERTS,
     DEFAULT_TOP_K_EXPERTS,
     commit_transformer_block_updates,
@@ -44,6 +45,7 @@ class ByteLatentConfig(BaseConfig):
     dropout: float = 0.0
     ffn_mult: float = 4.0
     attention: str = "mha"
+    attention_backend: str = DEFAULT_ATTENTION_BACKEND
     ffn: str = "swiglu"
     num_experts: int = DEFAULT_NUM_EXPERTS
     top_k_experts: int = DEFAULT_TOP_K_EXPERTS
@@ -142,6 +144,7 @@ class ByteLatentLM(BaseModel):
             dropout=config.dropout,
             ffn_mult=config.ffn_mult,
             attention=config.attention,
+            attention_backend=config.attention_backend,
             ffn=config.ffn,
             num_experts=config.num_experts,
             top_k_experts=config.top_k_experts,

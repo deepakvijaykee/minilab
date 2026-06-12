@@ -655,6 +655,7 @@ class Trainer:
             pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
 
             for self.step in pbar:
+                unwrap_model(self.model).set_training_step(self.step)
                 total_loss = 0.0
                 for _ in range(self.config.grad_accum_steps):
                     batch = self._next_batch()

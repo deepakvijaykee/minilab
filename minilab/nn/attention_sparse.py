@@ -6,9 +6,12 @@ import torch.nn.functional as F
 
 from minilab.checks import require
 from minilab.nn.attention_common import (
+    _attention_support_from_bias,
     _bool_to_additive_bias,
     _local_attention_bias,
     _merge_attention_bias,
+    DEFAULT_ATTENTION_BACKEND,
+    attention_sdpa,
     apply_rotary_emb,
 )
 from minilab.registry import register_attention
@@ -123,23 +126,31 @@ def msa_sparse_topk_select(max_score, top_k, num_valid_pages=None, force_begin_b
     return selected.to(torch.int32)
 
 
-def _msa_block_max_scores(q_idx, k_idx, block_size, is_causal):
+def _msa_token_scores(q_idx, k_idx, is_causal):
     B, G, T, index_dim = q_idx.shape
     require(k_idx.shape[:2] == (B, T), "index keys must match batch and sequence length")
     require(k_idx.size(-1) == index_dim, "index query/key dims must match")
+
+    scores = torch.einsum("bgtd,bsd->bgts", q_idx.float(), k_idx.float()) / math.sqrt(index_dim)
+    if is_causal:
+        pos = torch.arange(T, device=q_idx.device)
+        future = pos[None, :] > pos[:, None]
+        scores = scores.masked_fill(future.view(1, 1, T, T), float("-inf"))
+    return scores
+
+
+def _msa_block_max_scores_from_token_scores(token_scores, block_size):
+    T = token_scores.size(-1)
     num_blocks = math.ceil(T / block_size)
 
-    with torch.no_grad():
-        scores = torch.einsum("bgtd,bsd->bgts", q_idx.float(), k_idx.float()) / math.sqrt(index_dim)
-        if is_causal:
-            pos = torch.arange(T, device=q_idx.device)
-            future = pos[None, :] > pos[:, None]
-            scores = scores.masked_fill(future.view(1, 1, T, T), float("-inf"))
+    pad = num_blocks * block_size - T
+    if pad > 0:
+        token_scores = F.pad(token_scores, (0, pad), value=float("-inf"))
+    return token_scores.view(*token_scores.shape[:-1], num_blocks, block_size).amax(dim=-1)
 
-        pad = num_blocks * block_size - T
-        if pad > 0:
-            scores = F.pad(scores, (0, pad), value=float("-inf"))
-        return scores.view(B, G, T, num_blocks, block_size).amax(dim=-1)
+
+def _msa_block_max_scores(q_idx, k_idx, block_size, is_causal):
+    return _msa_block_max_scores_from_token_scores(_msa_token_scores(q_idx, k_idx, is_causal), block_size)
 
 
 def _msa_block_indexes_from_scores(block_scores, top_k_blocks):
@@ -150,32 +161,146 @@ def _msa_block_indexes_from_scores(block_scores, top_k_blocks):
     return torch.stack(rows, dim=0).permute(0, 2, 1, 3).contiguous()
 
 
-def _learned_block_attention_bias(q_idx, k_idx, block_size, top_k_blocks, local_blocks, kv_group_size, dtype, is_causal):
-    B, G, T, _ = q_idx.shape
+def _msa_block_indexes_with_local(block_scores, block_size, top_k_blocks):
+    B, G, T, num_blocks = block_scores.shape
+    if top_k_blocks >= num_blocks:
+        return _msa_block_indexes_from_scores(block_scores, top_k_blocks)
+
+    local = torch.div(
+        torch.arange(T, device=block_scores.device),
+        block_size,
+        rounding_mode="floor",
+    ).view(1, 1, T, 1).expand(B, G, T, 1)
+    if top_k_blocks == 1:
+        return local.to(torch.int32).contiguous()
+
+    dynamic_scores = block_scores.clone()
+    dynamic_scores.scatter_(-1, local.long(), float("-inf"))
+    dynamic = _msa_block_indexes_from_scores(dynamic_scores, top_k_blocks - 1)
+    selected = torch.cat([local.to(dynamic.dtype), dynamic], dim=-1)
+    sentinel = torch.full_like(selected, num_blocks)
+    order = torch.argsort(torch.where(selected != MSA_SPARSE_INDEX_PAD, selected, sentinel), dim=-1)
+    return torch.gather(selected, -1, order).to(torch.int32).contiguous()
+
+
+def _token_support_from_block_indexes(block_indexes, block_size, local_blocks, is_causal):
+    B, G, T, _ = block_indexes.shape
     num_blocks = math.ceil(T / block_size)
-    with torch.no_grad():
-        block_scores = _msa_block_max_scores(q_idx, k_idx, block_size, is_causal)
-        block_indexes = _msa_block_indexes_from_scores(block_scores, top_k_blocks)
-        key_blocks = torch.div(torch.arange(T, device=q_idx.device), block_size, rounding_mode="floor")
-        allowed = (block_indexes.unsqueeze(-1).long() == key_blocks.view(1, 1, 1, 1, T)).any(dim=-2)
+    key_blocks = torch.div(torch.arange(T, device=block_indexes.device), block_size, rounding_mode="floor")
+    allowed = (block_indexes.unsqueeze(-1).long() == key_blocks.view(1, 1, 1, 1, T)).any(dim=-2)
 
-        if local_blocks > 0:
-            blocks = torch.arange(num_blocks, device=q_idx.device)
-            keep_blocks = (block_indexes.unsqueeze(-1).long() == blocks.view(1, 1, 1, 1, num_blocks)).any(dim=-2)
-            q_blocks = torch.div(torch.arange(T, device=q_idx.device), block_size, rounding_mode="floor")
-            delta = q_blocks[:, None] - blocks[None, :]
-            if is_causal:
-                local = (delta >= 0) & (delta <= local_blocks)
-            else:
-                local = delta.abs() <= local_blocks
-            keep_blocks |= local.view(1, 1, T, num_blocks)
-            allowed = keep_blocks.repeat_interleave(block_size, dim=-1)[..., :T]
-
+    if local_blocks > 0:
+        blocks = torch.arange(num_blocks, device=block_indexes.device)
+        keep_blocks = (block_indexes.unsqueeze(-1).long() == blocks.view(1, 1, 1, 1, num_blocks)).any(dim=-2)
+        q_blocks = torch.div(torch.arange(T, device=block_indexes.device), block_size, rounding_mode="floor")
+        delta = q_blocks[:, None] - blocks[None, :]
         if is_causal:
-            pos = torch.arange(T, device=q_idx.device)
-            allowed &= (pos[None, :] <= pos[:, None]).view(1, 1, T, T)
+            local = (delta >= 0) & (delta <= local_blocks)
+        else:
+            local = delta.abs() <= local_blocks
+        keep_blocks |= local.view(1, 1, T, num_blocks)
+        allowed = keep_blocks.repeat_interleave(block_size, dim=-1)[..., :T]
 
-    return _bool_to_additive_bias(allowed.repeat_interleave(kv_group_size, dim=1), dtype)
+    if is_causal:
+        pos = torch.arange(T, device=block_indexes.device)
+        allowed &= (pos[None, :] <= pos[:, None]).view(1, 1, T, T)
+    return allowed
+
+
+def _learned_block_attention_support_from_scores(block_scores, block_size, top_k_blocks, local_blocks, is_causal):
+    with torch.no_grad():
+        block_indexes = _msa_block_indexes_with_local(block_scores.detach(), block_size, top_k_blocks)
+        return _token_support_from_block_indexes(block_indexes, block_size, local_blocks, is_causal)
+
+
+def _learned_block_attention_bias_from_scores(block_scores, block_size, top_k_blocks, local_blocks, kv_group_size, dtype, is_causal):
+    support = _learned_block_attention_support_from_scores(
+        block_scores,
+        block_size,
+        top_k_blocks,
+        local_blocks,
+        is_causal,
+    )
+    return _bool_to_additive_bias(support.repeat_interleave(kv_group_size, dim=1), dtype)
+
+
+def _learned_block_attention_bias(q_idx, k_idx, block_size, top_k_blocks, local_blocks, kv_group_size, dtype, is_causal):
+    block_scores = _msa_block_max_scores(q_idx, k_idx, block_size, is_causal)
+    return _learned_block_attention_bias_from_scores(
+        block_scores,
+        block_size,
+        top_k_blocks,
+        local_blocks,
+        kv_group_size,
+        dtype,
+        is_causal,
+    )
+
+
+def _full_attention_support(batch_size, num_kv_heads, seq_len, device, is_causal):
+    support = torch.ones(batch_size, num_kv_heads, seq_len, seq_len, device=device, dtype=torch.bool)
+    if is_causal:
+        pos = torch.arange(seq_len, device=device)
+        support &= (pos[None, :] <= pos[:, None]).view(1, 1, seq_len, seq_len)
+    return support
+
+
+def _broadcast_additive_attention_bias(attn_bias, batch_size, num_heads, q_len, kv_len, device):
+    if attn_bias is None or attn_bias.dtype == torch.bool:
+        return None
+    bias = attn_bias.to(device=device, dtype=torch.float32)
+    if bias.dim() == 2:
+        require(bias.shape == (q_len, kv_len), "2D attn_bias must match query/key lengths")
+        return bias.view(1, 1, q_len, kv_len)
+    if bias.dim() == 3:
+        require(bias.size(-2) == q_len and bias.size(-1) == kv_len, "3D attn_bias must match query/key lengths")
+        if bias.size(0) == num_heads:
+            return bias.view(1, num_heads, q_len, kv_len)
+        require(bias.size(0) == batch_size, "3D attn_bias must be keyed by heads or batch")
+        return bias.view(batch_size, 1, q_len, kv_len)
+    if bias.dim() == 4:
+        require(bias.size(-2) == q_len and bias.size(-1) == kv_len, "4D attn_bias must match query/key lengths")
+        require(bias.size(0) in {1, batch_size}, "4D attn_bias batch dimension must be 1 or batch size")
+        require(bias.size(1) in {1, num_heads}, "4D attn_bias head dimension must be 1 or num_heads")
+        return bias
+    raise ValueError("attn_bias must have 2, 3, or 4 dimensions")
+
+
+def _safe_log_softmax(scores, support):
+    fallback = torch.zeros_like(support)
+    fallback[..., 0] = True
+    safe_support = support | (~support.any(dim=-1, keepdim=True) & fallback)
+    return F.log_softmax(scores.masked_fill(~safe_support, float("-inf")), dim=-1)
+
+
+def _learned_block_kl_loss(index_scores, q, k_attn, token_support, kv_group_size, attn_bias, loss_weight):
+    if loss_weight == 0.0 or not torch.is_grad_enabled():
+        return index_scores.sum() * 0.0
+    B, G, T, _ = index_scores.shape
+    H = q.size(1)
+    head_support = token_support.repeat_interleave(kv_group_size, dim=1)
+    additive_bias = _broadcast_additive_attention_bias(attn_bias, B, H, T, T, q.device)
+    if attn_bias is not None:
+        head_support = head_support & _attention_support_from_bias(attn_bias.to(q.device), B, H, T, T)
+
+    with torch.no_grad():
+        main_scores = torch.matmul(q.detach().float(), k_attn.detach().float().transpose(-2, -1)) / math.sqrt(q.size(-1))
+        if additive_bias is not None:
+            main_scores = main_scores + additive_bias
+        main_log_probs = _safe_log_softmax(main_scores, head_support)
+        teacher = main_log_probs.exp().view(B, G, kv_group_size, T, T).mean(dim=2)
+        group_support = head_support.view(B, G, kv_group_size, T, T).any(dim=2)
+        teacher = teacher * group_support
+        teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(teacher.dtype).tiny)
+        support = teacher > 0
+
+    index_log_probs = _safe_log_softmax(index_scores.float(), support)
+    teacher_log = teacher.clamp_min(torch.finfo(teacher.dtype).tiny).log()
+    kl = (teacher * (teacher_log - index_log_probs)).masked_fill(~support, 0.0).sum(dim=-1)
+    valid = support.any(dim=-1)
+    if not bool(valid.any().item()):
+        return index_scores.sum() * 0.0
+    return loss_weight * kl[valid].mean().to(index_scores.dtype)
 
 
 def _lighthouse_metadata(T, num_levels, pooling_factor, device):
@@ -278,7 +403,16 @@ class LighthouseAttention(nn.Module):
     and causal shifted scatter-back. It is not an optimized long-context kernel.
     """
 
-    def __init__(self, dim, num_heads, dropout=0.0, num_levels=3, pooling_factor=2, top_k=32):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        dropout=0.0,
+        num_levels=3,
+        pooling_factor=2,
+        top_k=32,
+        attention_backend=DEFAULT_ATTENTION_BACKEND,
+    ):
         super().__init__()
         require(dim > 0, "dim must be > 0")
         require(num_heads > 0, "num_heads must be > 0")
@@ -293,6 +427,7 @@ class LighthouseAttention(nn.Module):
         self.num_levels = num_levels
         self.pooling_factor = pooling_factor
         self.top_k = top_k
+        self.attention_backend = attention_backend
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -335,13 +470,14 @@ class LighthouseAttention(nn.Module):
                 selected_ends = ends.index_select(0, selected)
                 allowed = selected_ends.view(-1, 1) >= selected_ends.view(1, -1)
                 bias = _bool_to_additive_bias(allowed, x.dtype)
-                attended = F.scaled_dot_product_attention(
+                attended = attention_sdpa(
                     q_sel.view(1, 1, q_sel.size(0), self.head_dim),
                     k_sel.view(1, 1, k_sel.size(0), self.head_dim),
                     v_sel.view(1, 1, v_sel.size(0), self.head_dim),
-                    attn_mask=bias,
-                    dropout_p=self.dropout if self.training else 0.0,
-                    is_causal=False,
+                    bias,
+                    self.dropout if self.training else 0.0,
+                    False,
+                    backend=self.attention_backend,
                 ).view(q_sel.size(0), self.head_dim)
                 head_outputs.append(self._scatter_selected(attended, selected, starts, sizes, T))
             batch_outputs.append(torch.stack(head_outputs, dim=0))
@@ -363,7 +499,7 @@ class LighthouseAttention(nn.Module):
 class InterleavedHeadAttention(nn.Module):
     """Cross-head mixing: each pseudo Q/K is a learned linear combination of all H original Q/K."""
 
-    def __init__(self, dim, num_heads, dropout=0.0):
+    def __init__(self, dim, num_heads, dropout=0.0, attention_backend=DEFAULT_ATTENTION_BACKEND):
         super().__init__()
         require(dim > 0, "dim must be > 0")
         require(num_heads > 0, "num_heads must be > 0")
@@ -372,6 +508,7 @@ class InterleavedHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.dropout = dropout
+        self.attention_backend = attention_backend
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -393,10 +530,14 @@ class InterleavedHeadAttention(nn.Module):
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=is_causal and attn_bias is None,
+        out = attention_sdpa(
+            q,
+            k,
+            v,
+            attn_bias,
+            self.dropout if self.training else 0.0,
+            is_causal and attn_bias is None,
+            backend=self.attention_backend,
         )
         return self.out(out.transpose(1, 2).reshape(B, T, C))
 
@@ -420,6 +561,8 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         top_k_blocks=32,
         local_blocks=0,
         index_dim=None,
+        kl_loss_weight=0.0,
+        attention_backend=DEFAULT_ATTENTION_BACKEND,
     ):
         super().__init__()
         require(dim > 0, "dim must be > 0")
@@ -431,6 +574,7 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         require(block_size > 0, "block_size must be > 0")
         require(top_k_blocks > 0, "top_k_blocks must be > 0")
         require(local_blocks >= 0, "local_blocks must be >= 0")
+        require(kl_loss_weight >= 0, "kl_loss_weight must be >= 0")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
@@ -439,6 +583,9 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         self.block_size = block_size
         self.top_k_blocks = top_k_blocks
         self.local_blocks = local_blocks
+        self.kl_loss_weight = kl_loss_weight
+        self.sparse_index_warmup = False
+        self.attention_backend = attention_backend
         self.index_dim = self.head_dim if index_dim is None else index_dim
         require(self.index_dim > 0, "index_dim must be > 0")
 
@@ -449,39 +596,49 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         self.q_idx_proj = nn.Linear(dim, num_kv_heads * self.index_dim, bias=False)
         self.k_idx_proj = nn.Linear(dim, self.index_dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
+
+    def set_sparse_index_warmup(self, active):
+        self.sparse_index_warmup = bool(active)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         B, T, C = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q_idx = self.q_idx_proj(x).reshape(B, T, self.num_kv_heads, self.index_dim).transpose(1, 2)
-        k_idx = self.k_idx_proj(x)
+        index_input = x.detach()
+        q_idx = self.q_idx_proj(index_input).reshape(B, T, self.num_kv_heads, self.index_dim).transpose(1, 2)
+        k_idx = self.k_idx_proj(index_input)
 
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
 
         k_attn = k.repeat_interleave(self.kv_group_size, dim=1)
         v_attn = v.repeat_interleave(self.kv_group_size, dim=1)
-        bias = _learned_block_attention_bias(
-            q_idx,
-            k_idx,
-            self.block_size,
-            self.top_k_blocks,
-            self.local_blocks,
-            self.kv_group_size,
-            x.dtype,
-            is_causal,
-        )
-        bias = _merge_attention_bias(bias, attn_bias)
-        out = F.scaled_dot_product_attention(
+        index_scores = _msa_token_scores(q_idx, k_idx, is_causal)
+        block_scores = _msa_block_max_scores_from_token_scores(index_scores, self.block_size)
+        if self.training and self.sparse_index_warmup:
+            token_support = _full_attention_support(B, self.num_kv_heads, T, x.device, is_causal)
+        else:
+            token_support = _learned_block_attention_support_from_scores(
+                block_scores,
+                self.block_size,
+                self.top_k_blocks,
+                self.local_blocks,
+                is_causal,
+            )
+        bias = _bool_to_additive_bias(token_support.repeat_interleave(self.kv_group_size, dim=1), x.dtype)
+        self.aux_loss = _learned_block_kl_loss(
+            index_scores,
             q,
             k_attn,
-            v_attn,
-            attn_mask=bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
+            token_support,
+            self.kv_group_size,
+            attn_bias,
+            self.kl_loss_weight,
         )
+        bias = _merge_attention_bias(bias, attn_bias)
+        out = attention_sdpa(q, k_attn, v_attn, bias, self.dropout if self.training else 0.0, False, backend=self.attention_backend)
         return self.out(out.transpose(1, 2).reshape(B, T, C))
 
 
@@ -493,7 +650,7 @@ class SlidingWindowAttention(nn.Module):
     bidirectional mode it attends to a symmetric local band.
     """
 
-    def __init__(self, dim, num_heads, dropout=0.0, window_size=128):
+    def __init__(self, dim, num_heads, dropout=0.0, window_size=128, attention_backend=DEFAULT_ATTENTION_BACKEND):
         super().__init__()
         require(dim > 0, "dim must be > 0")
         require(num_heads > 0, "num_heads must be > 0")
@@ -504,6 +661,7 @@ class SlidingWindowAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.window_size = window_size
         self.dropout = dropout
+        self.attention_backend = attention_backend
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -518,11 +676,7 @@ class SlidingWindowAttention(nn.Module):
             q, k = apply_rotary_emb(q, k, *freqs_cis)
         bias = _local_attention_bias(T, self.window_size, x.device, x.dtype, is_causal)
         bias = _merge_attention_bias(bias, attn_bias)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
-        )
+        out = attention_sdpa(q, k, v, bias, self.dropout if self.training else 0.0, False, backend=self.attention_backend)
         return self.out(out.transpose(1, 2).reshape(B, T, C))
 
 
@@ -546,6 +700,7 @@ class BlockSparseAttention(nn.Module):
         global_tokens=1,
         random_blocks=2,
         seed=0,
+        attention_backend=DEFAULT_ATTENTION_BACKEND,
     ):
         super().__init__()
         require(dim > 0, "dim must be > 0")
@@ -564,6 +719,7 @@ class BlockSparseAttention(nn.Module):
         self.global_tokens = global_tokens
         self.random_blocks = random_blocks
         self.seed = seed
+        self.attention_backend = attention_backend
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -581,9 +737,5 @@ class BlockSparseAttention(nn.Module):
             self.random_blocks, self.seed, x.device, x.dtype, is_causal,
         )
         bias = _merge_attention_bias(bias, attn_bias)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
-        )
+        out = attention_sdpa(q, k, v, bias, self.dropout if self.training else 0.0, False, backend=self.attention_backend)
         return self.out(out.transpose(1, 2).reshape(B, T, C))
