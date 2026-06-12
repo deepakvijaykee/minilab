@@ -36,6 +36,12 @@ def _call_sdpa(q, k, v, attn_bias, dropout_p, is_causal):
     )
 
 
+def _causal_attention_mask(q_len, kv_len, causal_offset, device):
+    query_pos = torch.arange(causal_offset, causal_offset + q_len, device=device).view(q_len, 1)
+    key_pos = torch.arange(kv_len, device=device).view(1, kv_len)
+    return key_pos <= query_pos
+
+
 def _broadcast_attention_bias(attn_bias, batch_size, num_heads, q_len, kv_len, device):
     if attn_bias is None:
         return None
@@ -66,14 +72,14 @@ def _apply_attention_bias_tile(scores, bias, q_start, q_end, k_start, k_end):
     return scores + bias_tile.to(dtype=scores.dtype)
 
 
-def _apply_causal_tile(scores, q_start, q_end, k_start, k_end):
-    q_pos = torch.arange(q_start, q_end, device=scores.device)
+def _apply_causal_tile(scores, q_start, q_end, k_start, k_end, causal_offset):
+    q_pos = torch.arange(causal_offset + q_start, causal_offset + q_end, device=scores.device)
     k_pos = torch.arange(k_start, k_end, device=scores.device)
     allowed = k_pos.view(1, -1) <= q_pos.view(-1, 1)
     return scores.masked_fill(~allowed.view(1, 1, q_end - q_start, k_end - k_start), float("-inf"))
 
 
-def _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal):
+def _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal, causal_offset):
     B, H, q_len, head_dim = q.shape
     kv_len = k.size(-2)
     scale = 1.0 / math.sqrt(head_dim)
@@ -93,7 +99,7 @@ def _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal):
             k_end = min(k_start + _FLASH_BLOCK_N, kv_len)
             scores = torch.matmul(q_block, k[..., k_start:k_end, :].float().transpose(-2, -1)) * scale
             if is_causal:
-                scores = _apply_causal_tile(scores, q_start, q_end, k_start, k_end)
+                scores = _apply_causal_tile(scores, q_start, q_end, k_start, k_end, causal_offset)
             scores = _apply_attention_bias_tile(scores, bias, q_start, q_end, k_start, k_end)
 
             block_m = scores.amax(dim=-1)
@@ -116,9 +122,20 @@ def _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal):
     return out.to(dtype=q.dtype)
 
 
-def attention_sdpa(q, k, v, attn_bias=None, dropout_p=0.0, is_causal=False, kv_group_size=1, backend=None):
+def attention_sdpa(
+    q,
+    k,
+    v,
+    attn_bias=None,
+    dropout_p=0.0,
+    is_causal=False,
+    kv_group_size=1,
+    backend=None,
+    causal_offset=0,
+):
     """Shared attention backend for dense SDPA-compatible attention variants."""
     backend = _resolve_attention_backend(backend)
+    require(type(causal_offset) is int, "causal_offset must be an integer")
     require(q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "attention q/k/v must have shape (B, H, T, D)")
     require(q.size(-2) > 0 and k.size(-2) > 0, "attention q/k sequence lengths must be > 0")
     require(q.size(-1) > 0 and v.size(-1) > 0, "attention head dims must be > 0")
@@ -127,19 +144,33 @@ def attention_sdpa(q, k, v, attn_bias=None, dropout_p=0.0, is_causal=False, kv_g
     require(k.size(-1) == q.size(-1), "attention query/key head dims must match")
     require(v.size(0) == q.size(0), "attention value batch dim must match query")
     require(kv_group_size > 0, "kv_group_size must be > 0")
+    require(causal_offset >= 0, "causal_offset must be >= 0")
+    require(causal_offset == 0 or is_causal, "causal_offset only applies to causal attention")
+    require(causal_offset == 0 or k.size(-2) == q.size(-2) + causal_offset, (
+        "causal_offset expects a contiguous KV cache with kv_len == q_len + causal_offset"
+    ))
     require(attn_bias is None or not is_causal, "SDPA causal mode cannot be combined with an explicit attention bias")
 
     use_gqa = q.size(-3) != k.size(-3)
     if use_gqa:
         require(q.size(-3) == k.size(-3) * kv_group_size, "query heads must equal key heads * kv_group_size")
         require(k.size(-3) == v.size(-3), "GQA keys and values must have the same number of heads")
+    else:
+        require(q.size(-3) == k.size(-3), "attention query/key heads must match unless using GQA")
+        require(kv_group_size == 1, "kv_group_size must be 1 when query/key heads already match")
+
+    if backend == "flash":
+        return triton_flash_attention(q, k, v, attn_bias, dropout_p, is_causal, causal_offset, kv_group_size)
+
+    if use_gqa:
         k = k.repeat_interleave(kv_group_size, dim=-3)
         v = v.repeat_interleave(kv_group_size, dim=-3)
 
     if backend == "flash_ref":
-        return _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal)
-    if backend == "flash":
-        return triton_flash_attention(q, k, v, attn_bias, dropout_p, is_causal)
+        return _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal, causal_offset)
+    if is_causal and causal_offset > 0:
+        attn_bias = _causal_attention_mask(q.size(-2), k.size(-2), causal_offset, q.device)
+        return _call_sdpa(q, k, v, attn_bias, dropout_p, False)
     return _call_sdpa(q, k, v, attn_bias, dropout_p, is_causal)
 
 

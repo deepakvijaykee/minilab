@@ -29,7 +29,15 @@ from minilab.nn.attention_common import DEFAULT_ATTENTION_BACKEND, attention_bac
 from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER
 from minilab.presets import get_lm_model_preset, lm_model_preset_choices
 from minilab.tokenizers import load_tokenizer
-from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
+from minilab.trainer import (
+    LMTrainer,
+    TrainConfig,
+    autocast_context,
+    run_signature,
+    set_seed,
+    tokenizer_signature,
+    validate_checkpoint_tokenizer,
+)
 from minilab.generation import generate
 from minilab.evaluation import perplexity
 from minilab.models.transformer_utils import (
@@ -474,10 +482,11 @@ trainer.train()
 model = trainer.model
 
 model.eval()
-if eval_ds is not None:
-    ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))
-    print(f"\nEval perplexity: {ppl:.1f}")
+with autocast_context(next(model.parameters()).device, tc.dtype):
+    if eval_ds is not None:
+        ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))
+        print(f"\nEval perplexity: {ppl:.1f}")
 
-for text in ["once upon a time", "the little dog", "she was very happy"]:
-    out = generate(model, torch.tensor([tok.encode(text)]), max_new_tokens=80, temperature=0.8, top_k=40)
-    print(f"  {tok.decode(out[0].tolist())[:120]}")
+    for text in ["once upon a time", "the little dog", "she was very happy"]:
+        out = generate(model, torch.tensor([tok.encode(text)]), max_new_tokens=80, temperature=0.8, top_k=40)
+        print(f"  {tok.decode(out[0].tolist())[:120]}")

@@ -4,7 +4,6 @@ import torch.nn as nn
 from minilab.checks import require
 from minilab.nn.attention_common import (
     _apply_tail_rotary,
-    _bool_to_additive_bias,
     _local_attention_bias,
     _merge_attention_bias,
     _QKClipMixin,
@@ -29,13 +28,6 @@ def _append_kv_cache(k, v, past_kv):
     require(past_k.size(2) == past_v.size(2), "cached keys and values must have the same sequence length")
     past_len = past_k.size(2)
     return torch.cat([past_k, k], dim=2), torch.cat([past_v, v], dim=2), past_len
-
-
-def _cached_causal_bias(q_len, kv_len, past_len, device, dtype):
-    require(kv_len == past_len + q_len, "cached causal attention expects contiguous KV cache")
-    query_pos = torch.arange(past_len, past_len + q_len, device=device).view(q_len, 1)
-    key_pos = torch.arange(kv_len, device=device).view(1, kv_len)
-    return _bool_to_additive_bias(key_pos <= query_pos, dtype)
 
 
 def _partial_rope_dim(head_dim, rope_fraction):
@@ -99,13 +91,24 @@ class MultiHeadAttention(_QKClipMixin, nn.Module):
             q, k = apply_rotary_emb(q, k, *freqs_cis)
         k, v, past_len = _append_kv_cache(k, v, past_kv)
         causal = is_causal and attn_bias is None
+        causal_offset = 0
         if past_len > 0:
             require(attn_bias is None, "cached MHA does not support external attention bias")
-            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
-            causal = False
-        self._record_qk_clip_logits(q, k, attn_bias=attn_bias, is_causal=causal, past_len=past_len)
+            require(is_causal, "cached MHA requires causal attention")
+            causal = True
+            causal_offset = past_len
+        self._record_qk_clip_logits(q, k, attn_bias=attn_bias, is_causal=causal, past_len=causal_offset)
 
-        out = attention_sdpa(q, k, v, attn_bias, self.dropout if self.training else 0.0, causal, backend=self.attention_backend)
+        out = attention_sdpa(
+            q,
+            k,
+            v,
+            attn_bias,
+            self.dropout if self.training else 0.0,
+            causal,
+            backend=self.attention_backend,
+            causal_offset=causal_offset,
+        )
         out = self.out(out.transpose(1, 2).reshape(B, T, C))
         if return_kv:
             return out, (k, v)
@@ -158,16 +161,18 @@ class GroupedQueryAttention(_QKClipMixin, nn.Module):
         k, v, past_len = _append_kv_cache(k, v, past_kv)
         cache = (k, v)
         causal = is_causal and attn_bias is None
+        causal_offset = 0
         if past_len > 0:
             require(attn_bias is None, "cached GQA does not support external attention bias")
-            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
-            causal = False
+            require(is_causal, "cached GQA requires causal attention")
+            causal = True
+            causal_offset = past_len
         self._record_qk_clip_logits(
             q,
             k,
             attn_bias=attn_bias,
             is_causal=causal,
-            past_len=past_len,
+            past_len=causal_offset,
             kv_group_size=self.kv_group_size,
         )
 
@@ -180,6 +185,7 @@ class GroupedQueryAttention(_QKClipMixin, nn.Module):
             causal,
             self.kv_group_size,
             backend=self.attention_backend,
+            causal_offset=causal_offset,
         )
         out = self.out(out.transpose(1, 2).reshape(B, T, C))
         if return_kv:
@@ -218,12 +224,23 @@ class MultiHeadQKNormAttention(_QKNormClipMixin, MultiHeadAttention):
             q, k = apply_rotary_emb(q, k, *freqs_cis)
         k, v, past_len = _append_kv_cache(k, v, past_kv)
         causal = is_causal and attn_bias is None
+        causal_offset = 0
         if past_len > 0:
             require(attn_bias is None, "cached QK-Norm MHA does not support external attention bias")
-            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
-            causal = False
-        self._record_qk_clip_logits(q, k, attn_bias=attn_bias, is_causal=causal, past_len=past_len)
-        out = attention_sdpa(q, k, v, attn_bias, self.dropout if self.training else 0.0, causal, backend=self.attention_backend)
+            require(is_causal, "cached QK-Norm MHA requires causal attention")
+            causal = True
+            causal_offset = past_len
+        self._record_qk_clip_logits(q, k, attn_bias=attn_bias, is_causal=causal, past_len=causal_offset)
+        out = attention_sdpa(
+            q,
+            k,
+            v,
+            attn_bias,
+            self.dropout if self.training else 0.0,
+            causal,
+            backend=self.attention_backend,
+            causal_offset=causal_offset,
+        )
         out = self.out(out.transpose(1, 2).reshape(B, T, C))
         if return_kv:
             return out, (k, v)
@@ -258,16 +275,18 @@ class GroupedQueryQKNormAttention(_QKNormClipMixin, GroupedQueryAttention):
         k, v, past_len = _append_kv_cache(k, v, past_kv)
         cache = (k, v)
         causal = is_causal and attn_bias is None
+        causal_offset = 0
         if past_len > 0:
             require(attn_bias is None, "cached QK-Norm GQA does not support external attention bias")
-            attn_bias = _cached_causal_bias(T, k.size(2), past_len, x.device, x.dtype)
-            causal = False
+            require(is_causal, "cached QK-Norm GQA requires causal attention")
+            causal = True
+            causal_offset = past_len
         self._record_qk_clip_logits(
             q,
             k,
             attn_bias=attn_bias,
             is_causal=causal,
-            past_len=past_len,
+            past_len=causal_offset,
             kv_group_size=self.kv_group_size,
         )
         out = attention_sdpa(
@@ -279,6 +298,7 @@ class GroupedQueryQKNormAttention(_QKNormClipMixin, GroupedQueryAttention):
             causal,
             self.kv_group_size,
             backend=self.attention_backend,
+            causal_offset=causal_offset,
         )
         out = self.out(out.transpose(1, 2).reshape(B, T, C))
         if return_kv:
