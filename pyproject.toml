@@ -18,6 +18,10 @@ dependencies = [
 [project.optional-dependencies]
 data = ["datasets>=2.14"]
 logging = ["aim>=3.17"]
-flash = ["flash-attn>=2.3"]
+flash = ["triton>=2.3"]
+triton = ["triton>=2.3"]
 hf = ["transformers>=4.40", "huggingface_hub>=0.23", "safetensors>=0.4"]
 dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["minilab*"]

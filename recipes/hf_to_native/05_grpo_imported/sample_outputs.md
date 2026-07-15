@@ -16,6 +16,7 @@ GSM8K: train=100 test=20
 GSM8K test subset (20 of full split) accuracy: 1/20 = 5.0%
 ```
 
-The accuracy number varies widely seed to seed at this scale. A
-single-digit value is the expected ballpark for the default budget.
-It reflects the rollout budget, not the quality of the RLVR run.
+The accuracy number swings widely from seed to seed at this scale, and
+a single-digit value is the expected ballpark for the default budget.
+It says more about how little signal twenty-five steps of two-generation
+rollouts can carry than about the RLVR method itself.

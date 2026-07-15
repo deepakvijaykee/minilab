@@ -25,6 +25,14 @@ _LR_SCHEDULES = {"cosine", "linear", "constant", "wsd"}
 _DECAYING_LR_SCHEDULES = {"cosine", "linear", "wsd"}
 
 
+def autocast_context(device, dtype):
+    if isinstance(dtype, str):
+        require(dtype in _DTYPES, f"Unknown dtype: '{dtype}'. Available: {sorted(_DTYPES)}")
+        dtype = _DTYPES[dtype]
+    device_type = torch.device(device).type
+    return torch.autocast(device_type, dtype=dtype, enabled=dtype != torch.float32)
+
+
 @dataclass
 class TrainConfig(BaseConfig):
     max_steps: int = 10000
@@ -654,10 +662,11 @@ class Trainer:
             pbar = tqdm(range(self.step + 1, self.config.max_steps + 1), desc="Training")
 
             for self.step in pbar:
+                unwrap_model(self.model).set_training_step(self.step)
                 total_loss = 0.0
                 for _ in range(self.config.grad_accum_steps):
                     batch = self._next_batch()
-                    with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+                    with autocast_context(self.device, self.dtype):
                         loss = self.compute_loss(batch) / self.config.grad_accum_steps
                     self.scaler.scale(loss).backward()
                     total_loss += loss.item()
@@ -698,7 +707,7 @@ class Trainer:
             if i >= self.config.eval_steps:
                 break
             batch = {k: v.to(self.device) for k, v in batch.items()}
-            with torch.autocast(self.device, dtype=self.dtype, enabled=self.dtype != torch.float32):
+            with autocast_context(self.device, self.dtype):
                 total += self.compute_loss(batch).item()
             count += 1
         require(count > 0, "Eval loader produced no batches")

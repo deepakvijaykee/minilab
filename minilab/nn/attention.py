@@ -20,6 +20,7 @@ from minilab.nn.attention_sparse import (
     LearnedBlockSparseGQAAttention,
     LighthouseAttention,
     SlidingWindowAttention,
+    msa_sparse_topk_select,
 )
 from minilab.nn.attention_linear import (
     CosFormerAttention,
@@ -59,4 +60,5 @@ __all__ = [
     "MultiQueryAttention",
     "SlidingWindowAttention",
     "SlidingWindowGroupedQueryQKNormAttention",
+    "msa_sparse_topk_select",
 ]

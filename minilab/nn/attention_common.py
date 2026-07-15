@@ -1,8 +1,177 @@
 import math
 
 import torch
+import torch.nn.functional as F
 
 from minilab.checks import require
+from minilab.nn.attention_triton import triton_flash_attention
+
+
+_ATTENTION_BACKENDS = ("sdpa", "flash_ref", "flash")
+DEFAULT_ATTENTION_BACKEND = "sdpa"
+_FLASH_BLOCK_M = 64
+_FLASH_BLOCK_N = 64
+
+
+def attention_backend_choices():
+    return _ATTENTION_BACKENDS
+
+
+def _resolve_attention_backend(backend):
+    if backend is None:
+        return DEFAULT_ATTENTION_BACKEND
+    backend = str(backend).strip().lower()
+    require(backend in _ATTENTION_BACKENDS, f"attention backend must be one of {_ATTENTION_BACKENDS}")
+    return backend
+
+
+def _call_sdpa(q, k, v, attn_bias, dropout_p, is_causal):
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_bias,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+    )
+
+
+def _causal_attention_mask(q_len, kv_len, causal_offset, device):
+    query_pos = torch.arange(causal_offset, causal_offset + q_len, device=device).view(q_len, 1)
+    key_pos = torch.arange(kv_len, device=device).view(1, kv_len)
+    return key_pos <= query_pos
+
+
+def _broadcast_attention_bias(attn_bias, batch_size, num_heads, q_len, kv_len, device):
+    if attn_bias is None:
+        return None
+    require(attn_bias.size(-2) == q_len and attn_bias.size(-1) == kv_len, (
+        f"attn_bias must end with shape ({q_len}, {kv_len})"
+    ))
+    bias = attn_bias.to(device=device)
+    if bias.dim() == 2:
+        return bias.view(1, 1, q_len, kv_len)
+    if bias.dim() == 3:
+        if bias.size(0) == num_heads:
+            return bias.view(1, num_heads, q_len, kv_len)
+        require(bias.size(0) == batch_size, "3D attn_bias must be keyed by heads or batch")
+        return bias.view(batch_size, 1, q_len, kv_len)
+    if bias.dim() == 4:
+        require(bias.size(0) in {1, batch_size}, "4D attn_bias batch dimension must be 1 or batch size")
+        require(bias.size(1) in {1, num_heads}, "4D attn_bias head dimension must be 1 or num_heads")
+        return bias
+    raise ValueError("attn_bias must have 2, 3, or 4 dimensions")
+
+
+def _apply_attention_bias_tile(scores, bias, q_start, q_end, k_start, k_end):
+    if bias is None:
+        return scores
+    bias_tile = bias[..., q_start:q_end, k_start:k_end]
+    if bias_tile.dtype == torch.bool:
+        return scores.masked_fill(~bias_tile, float("-inf"))
+    return scores + bias_tile.to(dtype=scores.dtype)
+
+
+def _apply_causal_tile(scores, q_start, q_end, k_start, k_end, causal_offset):
+    q_pos = torch.arange(causal_offset + q_start, causal_offset + q_end, device=scores.device)
+    k_pos = torch.arange(k_start, k_end, device=scores.device)
+    allowed = k_pos.view(1, -1) <= q_pos.view(-1, 1)
+    return scores.masked_fill(~allowed.view(1, 1, q_end - q_start, k_end - k_start), float("-inf"))
+
+
+def _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal, causal_offset):
+    B, H, q_len, head_dim = q.shape
+    kv_len = k.size(-2)
+    scale = 1.0 / math.sqrt(head_dim)
+    bias = _broadcast_attention_bias(attn_bias, B, H, q_len, kv_len, q.device)
+    out = torch.empty(B, H, q_len, v.size(-1), device=q.device, dtype=torch.float32)
+    tiny = torch.finfo(torch.float32).tiny
+
+    for q_start in range(0, q_len, _FLASH_BLOCK_M):
+        q_end = min(q_start + _FLASH_BLOCK_M, q_len)
+        q_block = q[..., q_start:q_end, :].float()
+        rows = q_end - q_start
+        row_m = torch.full((B, H, rows), float("-inf"), device=q.device, dtype=torch.float32)
+        row_l = torch.zeros((B, H, rows), device=q.device, dtype=torch.float32)
+        row_o = torch.zeros((B, H, rows, v.size(-1)), device=q.device, dtype=torch.float32)
+
+        for k_start in range(0, kv_len, _FLASH_BLOCK_N):
+            k_end = min(k_start + _FLASH_BLOCK_N, kv_len)
+            scores = torch.matmul(q_block, k[..., k_start:k_end, :].float().transpose(-2, -1)) * scale
+            if is_causal:
+                scores = _apply_causal_tile(scores, q_start, q_end, k_start, k_end, causal_offset)
+            scores = _apply_attention_bias_tile(scores, bias, q_start, q_end, k_start, k_end)
+
+            block_m = scores.amax(dim=-1)
+            new_m = torch.maximum(row_m, block_m)
+            old_scale = torch.exp(row_m - new_m).masked_fill(torch.isneginf(row_m), 0.0)
+            probs = torch.exp(scores - new_m.unsqueeze(-1)).masked_fill(torch.isneginf(scores), 0.0)
+            row_l = row_l * old_scale + probs.sum(dim=-1)
+            if dropout_p > 0.0:
+                probs = F.dropout(probs, p=dropout_p, training=True)
+            row_o = row_o * old_scale.unsqueeze(-1) + torch.matmul(probs, v[..., k_start:k_end, :].float())
+            row_m = new_m
+
+        valid = row_l > 0
+        out[..., q_start:q_end, :] = torch.where(
+            valid.unsqueeze(-1),
+            row_o / row_l.clamp_min(tiny).unsqueeze(-1),
+            torch.zeros_like(row_o),
+        )
+
+    return out.to(dtype=q.dtype)
+
+
+def attention_sdpa(
+    q,
+    k,
+    v,
+    attn_bias=None,
+    dropout_p=0.0,
+    is_causal=False,
+    kv_group_size=1,
+    backend=None,
+    causal_offset=0,
+):
+    """Shared attention backend for dense SDPA-compatible attention variants."""
+    backend = _resolve_attention_backend(backend)
+    require(type(causal_offset) is int, "causal_offset must be an integer")
+    require(q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "attention q/k/v must have shape (B, H, T, D)")
+    require(q.size(-2) > 0 and k.size(-2) > 0, "attention q/k sequence lengths must be > 0")
+    require(q.size(-1) > 0 and v.size(-1) > 0, "attention head dims must be > 0")
+    require(k.shape[:2] == v.shape[:2], "attention keys and values must have matching batch/head dims")
+    require(k.size(-2) == v.size(-2), "attention keys and values must have matching sequence length")
+    require(k.size(-1) == q.size(-1), "attention query/key head dims must match")
+    require(v.size(0) == q.size(0), "attention value batch dim must match query")
+    require(kv_group_size > 0, "kv_group_size must be > 0")
+    require(causal_offset >= 0, "causal_offset must be >= 0")
+    require(causal_offset == 0 or is_causal, "causal_offset only applies to causal attention")
+    require(causal_offset == 0 or k.size(-2) == q.size(-2) + causal_offset, (
+        "causal_offset expects a contiguous KV cache with kv_len == q_len + causal_offset"
+    ))
+    require(attn_bias is None or not is_causal, "SDPA causal mode cannot be combined with an explicit attention bias")
+
+    use_gqa = q.size(-3) != k.size(-3)
+    if use_gqa:
+        require(q.size(-3) == k.size(-3) * kv_group_size, "query heads must equal key heads * kv_group_size")
+        require(k.size(-3) == v.size(-3), "GQA keys and values must have the same number of heads")
+    else:
+        require(q.size(-3) == k.size(-3), "attention query/key heads must match unless using GQA")
+        require(kv_group_size == 1, "kv_group_size must be 1 when query/key heads already match")
+
+    if backend == "flash":
+        return triton_flash_attention(q, k, v, attn_bias, dropout_p, is_causal, causal_offset, kv_group_size)
+
+    if use_gqa:
+        k = k.repeat_interleave(kv_group_size, dim=-3)
+        v = v.repeat_interleave(kv_group_size, dim=-3)
+
+    if backend == "flash_ref":
+        return _flash_attention_torch(q, k, v, attn_bias, dropout_p, is_causal, causal_offset)
+    if is_causal and causal_offset > 0:
+        attn_bias = _causal_attention_mask(q.size(-2), k.size(-2), causal_offset, q.device)
+        return _call_sdpa(q, k, v, attn_bias, dropout_p, False)
+    return _call_sdpa(q, k, v, attn_bias, dropout_p, is_causal)
 
 
 def rotate_half(x):
@@ -38,10 +207,13 @@ class _QKClipMixin:
         if not enabled:
             self._reset_qk_clip_stats()
 
-    def _record_qk_clip_logits(self, q, k, attn_bias=None, is_causal=False, past_len=0):
+    def _record_qk_clip_logits(self, q, k, attn_bias=None, is_causal=False, past_len=0, kv_group_size=1):
         if not self._qk_clip_recording or not torch.is_grad_enabled():
             return
         with torch.no_grad():
+            if q.size(1) != k.size(1):
+                require(q.size(1) == k.size(1) * kv_group_size, "query heads must equal key heads * kv_group_size")
+                k = k.repeat_interleave(kv_group_size, dim=1)
             scores = torch.matmul(q.detach().float(), k.detach().float().transpose(-2, -1)) / math.sqrt(q.size(-1))
             scores = _mask_qk_scores_to_attention_support(scores, attn_bias, is_causal, past_len)
             max_logits = scores.amax(dim=(0, 2, 3)).to(self._qk_clip_max_logits.dtype)

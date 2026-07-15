@@ -22,10 +22,19 @@ from common import (
     resolve_save_every,
 )
 from minilab.checks import require
+from minilab.nn.attention_common import DEFAULT_ATTENTION_BACKEND, attention_backend_choices
 from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER
 from minilab.presets import get_lm_model_preset, lm_model_preset_choices
 from minilab.tokenizers import load_tokenizer
-from minilab.trainer import LMTrainer, TrainConfig, run_signature, set_seed, tokenizer_signature, validate_checkpoint_tokenizer
+from minilab.trainer import (
+    LMTrainer,
+    TrainConfig,
+    autocast_context,
+    run_signature,
+    set_seed,
+    tokenizer_signature,
+    validate_checkpoint_tokenizer,
+)
 from minilab.generation import generate
 from minilab.evaluation import perplexity
 from minilab.models.transformer_utils import (
@@ -40,6 +49,8 @@ from minilab.models.transformer_utils import (
     DEFAULT_ROPE_SCALING_FACTOR,
     DEFAULT_SPARSE_BLOCK_SIZE,
     DEFAULT_SPARSE_INDEX_DIM,
+    DEFAULT_SPARSE_INDEX_WARMUP_STEPS,
+    DEFAULT_SPARSE_KL_LOSS_WEIGHT,
     DEFAULT_SPARSE_LOCAL_BLOCKS,
     DEFAULT_SPARSE_TOP_K_BLOCKS,
     DEFAULT_LIGHTHOUSE_NUM_LEVELS,
@@ -58,12 +69,13 @@ from minilab.nn.architecture import (
 
 _MODEL_SELECTOR_FLAGS = ("preset",)
 _MODEL_BUILD_FLAGS = (
-    "dim", "num_layers", "num_heads", "num_kv_heads", "attention", "position",
-    "norm",
+    "dim", "num_layers", "num_heads", "num_kv_heads", "attention",
+    "attention_backend", "position", "norm",
     "rope_base", "rope_local_base", "rope_global_base", "rope_scaling_factor",
     "rope_original_max_seq_len", "rope_partial_rotary_factor", "yarn_beta_fast",
     "yarn_beta_slow", "local_attention_window", "qwen3_next_full_attention_interval",
     "sparse_block_size", "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
+    "sparse_kl_loss_weight", "sparse_index_warmup_steps",
     "lighthouse_num_levels", "lighthouse_pooling_factor", "lighthouse_top_k",
     "attention_k_eq_v", "per_layer_embedding_dim", "final_logit_softcap",
     "connection", "ffn", "num_experts", "top_k_experts", "post_norm",
@@ -88,6 +100,7 @@ p.add_argument("--num-heads", type=int, default=None)
 p.add_argument("--num-kv-heads", type=int, default=None, help="KV heads for GQA; defaults to num_heads")
 p.add_argument("--seq-len", type=int, default=None)
 p.add_argument("--attention", default=None)
+p.add_argument("--attention-backend", choices=attention_backend_choices(), default=None)
 p.add_argument("--position", default=None)
 p.add_argument("--norm", default=None)
 p.add_argument("--rope-base", type=float, default=None)
@@ -104,6 +117,8 @@ p.add_argument("--sparse-block-size", type=int, default=None)
 p.add_argument("--sparse-top-k-blocks", type=int, default=None)
 p.add_argument("--sparse-local-blocks", type=int, default=None)
 p.add_argument("--sparse-index-dim", type=int, default=None, help="0 uses the attention head dimension")
+p.add_argument("--sparse-kl-loss-weight", type=float, default=None)
+p.add_argument("--sparse-index-warmup-steps", type=int, default=None)
 p.add_argument("--lighthouse-num-levels", type=int, default=None)
 p.add_argument("--lighthouse-pooling-factor", type=int, default=None)
 p.add_argument("--lighthouse-top-k", type=int, default=None)
@@ -177,6 +192,7 @@ num_layers = resolve_default(args.num_layers, preset.get("num_layers", 6))
 num_heads = resolve_default(args.num_heads, preset.get("num_heads", 8))
 seq_len = resolve_default(args.seq_len, preset.get("seq_len", 256))
 attention = resolve_default(args.attention, "mha")
+attention_backend = resolve_default(args.attention_backend, DEFAULT_ATTENTION_BACKEND)
 position = resolve_default(args.position, "rope")
 norm = resolve_default(args.norm, "rmsnorm")
 rope_base = resolve_default(args.rope_base, DEFAULT_ROPE_BASE)
@@ -196,6 +212,8 @@ sparse_block_size = resolve_default(args.sparse_block_size, DEFAULT_SPARSE_BLOCK
 sparse_top_k_blocks = resolve_default(args.sparse_top_k_blocks, DEFAULT_SPARSE_TOP_K_BLOCKS)
 sparse_local_blocks = resolve_default(args.sparse_local_blocks, DEFAULT_SPARSE_LOCAL_BLOCKS)
 sparse_index_dim = resolve_default(args.sparse_index_dim, DEFAULT_SPARSE_INDEX_DIM)
+sparse_kl_loss_weight = resolve_default(args.sparse_kl_loss_weight, DEFAULT_SPARSE_KL_LOSS_WEIGHT)
+sparse_index_warmup_steps = resolve_default(args.sparse_index_warmup_steps, DEFAULT_SPARSE_INDEX_WARMUP_STEPS)
 lighthouse_num_levels = resolve_default(args.lighthouse_num_levels, DEFAULT_LIGHTHOUSE_NUM_LEVELS)
 lighthouse_pooling_factor = resolve_default(args.lighthouse_pooling_factor, DEFAULT_LIGHTHOUSE_POOLING_FACTOR)
 lighthouse_top_k = resolve_default(args.lighthouse_top_k, DEFAULT_LIGHTHOUSE_TOP_K)
@@ -250,6 +268,8 @@ if (
     or args.sparse_top_k_blocks is not None
     or args.sparse_local_blocks is not None
     or args.sparse_index_dim is not None
+    or args.sparse_kl_loss_weight is not None
+    or args.sparse_index_warmup_steps is not None
 ):
     require(
         attention == "learned_block_gqa",
@@ -345,6 +365,7 @@ else:
         num_kv_heads=args.num_kv_heads,
         max_seq_len=seq_len,
         attention=attention,
+        attention_backend=attention_backend,
         position=position,
         norm=norm,
         connection=connection,
@@ -366,6 +387,8 @@ else:
         sparse_top_k_blocks=sparse_top_k_blocks,
         sparse_local_blocks=sparse_local_blocks,
         sparse_index_dim=sparse_index_dim,
+        sparse_kl_loss_weight=sparse_kl_loss_weight,
+        sparse_index_warmup_steps=sparse_index_warmup_steps,
         lighthouse_num_levels=lighthouse_num_levels,
         lighthouse_pooling_factor=lighthouse_pooling_factor,
         lighthouse_top_k=lighthouse_top_k,
@@ -406,10 +429,11 @@ trainer.train()
 model = trainer.model
 
 model.eval()
-if eval_ds is not None:
-    ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))
-    print(f"\nEval perplexity: {ppl:.1f}")
+with autocast_context(next(model.parameters()).device, tc.dtype):
+    if eval_ds is not None:
+        ppl = perplexity(model, DataLoader(eval_ds, batch_size=32))
+        print(f"\nEval perplexity: {ppl:.1f}")
 
-for text in ["once upon a time", "the little dog", "she was very happy"]:
-    out = generate(model, torch.tensor([tok.encode(text)]), max_new_tokens=80, temperature=0.8, top_k=40)
-    print(f"  {tok.decode(out[0].tolist())[:120]}")
+    for text in ["once upon a time", "the little dog", "she was very happy"]:
+        out = generate(model, torch.tensor([tok.encode(text)]), max_new_tokens=80, temperature=0.8, top_k=40)
+        print(f"  {tok.decode(out[0].tolist())[:120]}")

@@ -20,9 +20,9 @@ or margin-based regularizer. The savings show up directly in
 are the default choice on memory-constrained machines.
 
 The recipe samples from three prompts (`What makes a good friend?`,
-`How do I learn to cook?`, `Tell me about dogs.`) that are deliberately
-different from the SFT recipe's three. The point is that the
-qualitative read is not measuring memorization of SFT prompts.
+`How do I learn to cook?`, `Tell me about dogs.`) chosen to differ from
+the SFT recipe's three, so the qualitative read is not just measuring
+memorization of the SFT prompts.
 Preference tuning shifts which coherent answer the policy prefers among
 the answers the base already assigns nontrivial mass to. How coherent
 any of those answers is in absolute terms is fixed by the base.
