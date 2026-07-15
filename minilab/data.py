@@ -40,24 +40,6 @@ class TextDataset(Dataset):
         return {"input_ids": chunk[:-1], "labels": chunk[1:]}
 
 
-class DiffusionDataset(Dataset):
-    """No shift — input_ids are both the noising input and the denoising target."""
-
-    def __init__(self, tokens, seq_len):
-        require(seq_len > 0, f"DiffusionDataset requires seq_len > 0, got {seq_len}")
-        require(tokens.dim() == 1, "DiffusionDataset requires a 1D token tensor")
-        require(len(tokens) >= seq_len, f"Need >= {seq_len} tokens, got {len(tokens)}")
-        self.tokens = tokens
-        self.seq_len = seq_len
-
-    def __len__(self):
-        return len(self.tokens) // self.seq_len
-
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        return {"input_ids": self.tokens[start : start + self.seq_len]}
-
-
 class SFTDataset(Dataset):
 
     def __init__(self, examples, tokenizer, seq_len):
@@ -72,36 +54,6 @@ class SFTDataset(Dataset):
                 "labels": _labels(p, r, prompt_len, seq_len),
             })
         require(self.data, "SFTDataset received no examples")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
-class DiffusionSFTDataset(Dataset):
-    """Instruction tuning for masked diffusion LMs.
-
-    The full prompt+response sequence is the clean sequence. `loss_mask` marks
-    response tokens only; trainers keep all other tokens fixed as conditioning
-    context and only diffuse/supervise response positions.
-    """
-
-    def __init__(self, examples, tokenizer, seq_len):
-        require(seq_len > 1, f"DiffusionSFTDataset requires seq_len > 1, got {seq_len}")
-        self.data = []
-        for ex in examples:
-            p, r = _prompt_response_tokens(ex, tokenizer, "Diffusion SFT")
-            prompt_len = min(len(p), seq_len - 1)
-            input_ids, loss_mask, valid_mask = _diffusion_pack(p, r, prompt_len, seq_len)
-
-            self.data.append({
-                "input_ids": input_ids,
-                "loss_mask": loss_mask,
-                "valid_mask": valid_mask,
-            })
-        require(self.data, "DiffusionSFTDataset received no examples")
 
     def __len__(self):
         return len(self.data)
@@ -197,34 +149,6 @@ class KTOBalancedBatchSampler(Sampler):
         return (self.dataset.num_pairs + self.pairs_per_batch - 1) // self.pairs_per_batch
 
 
-class DiffusionPreferenceDataset(Dataset):
-    """Chosen/rejected instruction pairs for diffusion preference tuning."""
-
-    def __init__(self, examples, tokenizer, seq_len):
-        require(seq_len > 1, f"DiffusionPreferenceDataset requires seq_len > 1, got {seq_len}")
-        self.data = []
-        for ex in examples:
-            p, c, r = _preference_tokens(ex, tokenizer, "Diffusion preference")
-            prompt_len = min(len(p), seq_len - 1)
-            chosen_ids, chosen_mask, chosen_valid = _diffusion_pack(p, c, prompt_len, seq_len)
-            rejected_ids, rejected_mask, rejected_valid = _diffusion_pack(p, r, prompt_len, seq_len)
-            self.data.append({
-                "chosen_ids": chosen_ids,
-                "chosen_loss_mask": chosen_mask,
-                "chosen_valid_mask": chosen_valid,
-                "rejected_ids": rejected_ids,
-                "rejected_loss_mask": rejected_mask,
-                "rejected_valid_mask": rejected_valid,
-            })
-        require(self.data, "DiffusionPreferenceDataset received no examples")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-
 class PromptDataset(Dataset):
     """Takes pre-tokenized examples ({"ids": list[int]}) so the caller
     owns any task-specific truncation (e.g. preserving a format-instruction suffix)."""
@@ -279,10 +203,6 @@ def load_alpaca(tokenizer, seq_len, max_examples=5000):
     return SFTDataset(_alpaca_examples(max_examples), tokenizer, seq_len)
 
 
-def load_alpaca_diffusion(tokenizer, seq_len, max_examples=5000):
-    return DiffusionSFTDataset(_alpaca_examples(max_examples), tokenizer, seq_len)
-
-
 def _alpaca_examples(max_examples):
     ds = load_dataset("tatsu-lab/alpaca", split="train")
     examples = []
@@ -302,10 +222,6 @@ def load_hh_rlhf(tokenizer, seq_len, max_examples=5000):
 
 def load_hh_rlhf_kto(tokenizer, seq_len, max_examples=5000):
     return KTODataset(_hh_rlhf_examples(max_examples), tokenizer, seq_len)
-
-
-def load_hh_rlhf_diffusion(tokenizer, seq_len, max_examples=5000):
-    return DiffusionPreferenceDataset(_hh_rlhf_examples(max_examples), tokenizer, seq_len)
 
 
 def _hh_rlhf_examples(max_examples):
@@ -367,26 +283,6 @@ def load_gsm8k(tokenizer, seq_len, max_examples=2000, split="train"):
     return AnsweredPromptDataset(examples, seq_len)
 
 
-def load_gsm8k_diffusion(tokenizer, seq_len, max_response_tokens, max_examples=2000, split="train"):
-    require(max_response_tokens > 0, "max_response_tokens must be > 0")
-    require(max_response_tokens < seq_len, "diffusion GSM8K requires seq_len > max_response_tokens")
-    ds = load_dataset("openai/gsm8k", "main", split=split)
-    n = _example_limit(max_examples, len(ds))
-    prompt_budget = seq_len - max_response_tokens
-    examples = []
-    for row in ds.select(range(n)):
-        answer = parse_gold_answer(row["answer"])
-        body, suffix = prompt_parts(row["question"])
-        body_ids = tokenizer.encode(body)
-        suffix_ids = tokenizer.encode(suffix)
-        require(len(suffix_ids) < prompt_budget, (
-            f"suffix alone ({len(suffix_ids)} tok) exceeds diffusion prompt budget {prompt_budget}"
-        ))
-        body_ids = body_ids[: prompt_budget - len(suffix_ids)]
-        examples.append({"ids": body_ids + suffix_ids, "answer": answer})
-    return AnsweredPromptDataset(examples, seq_len)
-
-
 def load_openwebtext(tokenizer, seq_len, max_examples=50000, mode="lm"):
     require(max_examples > 0, "streaming OpenWebText requires max_examples > 0")
     limit = _example_limit(max_examples)
@@ -401,10 +297,6 @@ def load_openwebtext(tokenizer, seq_len, max_examples=50000, mode="lm"):
 def load_dolly(tokenizer, seq_len, max_examples=5000):
     """Databricks Dolly-15k. Maps instruction->prompt, response->response."""
     return SFTDataset(_dolly_examples(max_examples), tokenizer, seq_len)
-
-
-def load_dolly_diffusion(tokenizer, seq_len, max_examples=5000):
-    return DiffusionSFTDataset(_dolly_examples(max_examples), tokenizer, seq_len)
 
 
 def _dolly_examples(max_examples):
@@ -427,10 +319,6 @@ def load_ultrafeedback(tokenizer, seq_len, max_examples=5000):
 
 def load_ultrafeedback_kto(tokenizer, seq_len, max_examples=5000):
     return KTODataset(_ultrafeedback_examples(max_examples), tokenizer, seq_len)
-
-
-def load_ultrafeedback_diffusion(tokenizer, seq_len, max_examples=5000):
-    return DiffusionPreferenceDataset(_ultrafeedback_examples(max_examples), tokenizer, seq_len)
 
 
 def _ultrafeedback_examples(max_examples):
@@ -516,23 +404,6 @@ def _kto_row(prompt, response, prompt_len, seq_len, desirable):
     }
 
 
-def _diffusion_pack(prompt, response, prompt_len, seq_len):
-    full = _packed_sequence(prompt, response, prompt_len, seq_len)
-    require(len(full) > prompt_len, "diffusion packed example has no response tokens after truncation")
-    padded = _padded(full, seq_len)
-    loss_mask = [False] * seq_len
-    valid_mask = [False] * seq_len
-    for i in range(prompt_len, len(full)):
-        loss_mask[i] = True
-    for i in range(len(full)):
-        valid_mask[i] = True
-    return (
-        torch.tensor(padded, dtype=torch.long),
-        torch.tensor(loss_mask, dtype=torch.bool),
-        torch.tensor(valid_mask, dtype=torch.bool),
-    )
-
-
 def _packed_sequence(prompt, response, prompt_len, seq_len):
     require(prompt_len > 0, f"prompt_len must be > 0, got {prompt_len}")
     return (prompt[:prompt_len] + response)[:seq_len]
@@ -563,8 +434,6 @@ def prepare_dataset(text, tokenizer, seq_len, mode="lm"):
     tokens = torch.tensor(tokenizer.encode(text), dtype=torch.long)
     if mode == "lm":
         return TextDataset(tokens, seq_len)
-    if mode == "diffusion":
-        return DiffusionDataset(tokens, seq_len)
     raise ValueError(f"Unknown mode: {mode}")
 
 

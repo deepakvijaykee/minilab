@@ -5,8 +5,6 @@ from minilab.registry import (
     get_model,
     get_norm,
     get_position,
-    get_sampler,
-    get_scheduler,
     get_task,
     get_tokenizer,
     get_trainer,
@@ -14,40 +12,27 @@ from minilab.registry import (
 from minilab.config import BaseConfig
 from minilab.base import BaseModel, BaseTokenizer
 
-from minilab import alignment as alignment
-from minilab import diffusion as diffusion
-from minilab import evalbench as evalbench
-from minilab import generation as generation
-from minilab import models as models
-from minilab import nn as nn
-from minilab import tasks as tasks
-from minilab import tokenizers as tokenizers
-from minilab import trainer as trainer
-from minilab import verifiers as verifiers
+from minilab import nn as _nn
+from minilab import tokenizers as _tokenizers
+from minilab import models as _models
+from minilab import generation as _generation
+from minilab import trainer as _trainer
+from minilab import alignment as _alignment
+from minilab import tasks as _tasks
+from minilab import evalbench as _evalbench
+from minilab import verifiers as _verifiers
 
 __all__ = [
     "BaseConfig",
     "BaseModel",
     "BaseTokenizer",
-    "alignment",
-    "diffusion",
-    "evalbench",
-    "generation",
     "get_attention",
     "get_connection",
     "get_ffn",
     "get_model",
     "get_norm",
     "get_position",
-    "get_sampler",
-    "get_scheduler",
     "get_task",
     "get_tokenizer",
     "get_trainer",
-    "models",
-    "nn",
-    "tasks",
-    "tokenizers",
-    "trainer",
-    "verifiers",
 ]

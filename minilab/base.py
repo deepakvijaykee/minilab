@@ -9,42 +9,8 @@ from minilab.losses import causal_lm_cross_entropy
 from minilab.nn.norm import ZeroCenteredRMSNorm
 
 
-def apply_conditional_diffusion_mask(
-    z_t,
-    noised_mask,
-    x_0,
-    loss_mask,
-    valid_mask,
-    mask_token_id,
-    context="conditional diffusion",
-):
-    require(z_t.shape == x_0.shape, f"{context} noised tokens must match input_ids")
-    require(noised_mask.shape == x_0.shape, f"{context} noised mask must match input_ids")
-    require(noised_mask.dtype == torch.bool, f"{context} noised mask must be bool")
-    require(loss_mask is not None, f"{context} loss_mask is required")
-    require(loss_mask.shape == x_0.shape, f"{context} loss_mask must match input_ids")
-    require(loss_mask.dtype == torch.bool, f"{context} loss_mask must be bool")
-    loss_mask = loss_mask.to(x_0.device)
-    require(loss_mask.any(dim=-1).all(), f"{context} requires at least one supervised token per example")
-    if valid_mask is not None:
-        require(valid_mask.shape == x_0.shape, f"{context} valid_mask must match input_ids")
-        require(valid_mask.dtype == torch.bool, f"{context} valid_mask must be bool")
-        valid_mask = valid_mask.to(x_0.device)
-        require((loss_mask & ~valid_mask).sum().item() == 0, (
-            f"{context} loss_mask must be contained in valid_mask"
-        ))
-
-    z_t = torch.where(loss_mask, z_t, x_0)
-    if valid_mask is not None:
-        z_t = torch.where(valid_mask, z_t, torch.full_like(z_t, mask_token_id))
-    return z_t, noised_mask.to(x_0.device) & loss_mask
-
-
 class BaseModel(nn.Module):
     config_class = None
-    forward_process_type = None
-    reverse_parameterization = None
-    requires_terminal_mask_prior = False
     provides_hidden_states = False
 
     def __init__(self, config):
@@ -124,34 +90,6 @@ class BaseModel(nn.Module):
 
     def token_superposition_loss(self, idx, targets, bag_size):
         raise ValueError(f"{type(self).__name__} does not support token-superposition training")
-
-    def supports_unconditional_diffusion_sampling(self):
-        return True
-
-    def diffusion_forward_kwargs(self, x_0):
-        return {}
-
-    def diffusion_training_state(self, forward_process, x_0, device):
-        t = forward_process.sample_time(x_0.size(0), device, mode=self.config.time_sampling)
-        z_t, mask = forward_process.q_sample(x_0, t)
-        return z_t, mask, t, self.diffusion_forward_kwargs(x_0)
-
-    def diffusion_conditional_training_state(self, forward_process, x_0, loss_mask, valid_mask, device, t=None):
-        if t is None:
-            t = forward_process.sample_time(x_0.size(0), device, mode=self.config.time_sampling)
-        else:
-            t = t.to(device)
-            require(t.shape == (x_0.size(0),), "generic conditional diffusion time must have shape (batch,)")
-        z_t, mask = forward_process.q_sample(x_0, t)
-        z_t, mask = apply_conditional_diffusion_mask(
-            z_t,
-            mask,
-            x_0,
-            loss_mask,
-            valid_mask,
-            forward_process.mask_token_id,
-        )
-        return z_t, mask, t, self.diffusion_forward_kwargs(x_0)
 
     def muon_parameter_groups(self):
         auxiliary_ids = {

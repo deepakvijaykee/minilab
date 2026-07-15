@@ -31,9 +31,4 @@ ALGORITHM=simpo bash recipes/local_training/03_preference_tiny/run.sh
 ALGORITHM=orpo bash recipes/local_training/03_preference_tiny/run.sh
 ```
 
-The `--dataset` flag accepts `hh` and `ultrafeedback`. The diffusion
-counterpart (recipe 08) uses the string `hh-rlhf` instead of `hh`. Both
-ultimately resolve to the same HH-RLHF loader, but the spelling
-differs because the diffusion preference loaders are registered under
-different names in their own script. The mismatch is real and lives in
-the loader registries rather than in the data.
+The `--dataset` flag accepts `hh` and `ultrafeedback`.

@@ -3,24 +3,16 @@ from pathlib import Path
 from minilab.checks import require
 from minilab.data import load_openwebtext, load_text8, load_tinystories, load_wikitext
 from minilab.evaluation import perplexity
-from minilab import generation as _generation
 from minilab import models as _models
-from minilab.registry import get_model, get_sampler
+from minilab.registry import get_model
 from minilab.trainer import LMTrainer, set_seed, tokenizer_signature
 from torch.utils.data import DataLoader
 
 
-# These imports execute model and sampler decorators before registry lookups below.
-_REGISTRY_IMPORTS = (_models, _generation)
+# This import executes model decorators before registry lookups below.
+_REGISTRY_IMPORTS = (_models,)
 
-MODEL_CHOICES = ("gpt", "hymba", "hybrid", "mamba", "mamba2", "xlstm", "byte_latent")
-DIFFUSION_MODEL_CHOICES = ("mdlm", "sedd", "d3pm", "block_diffusion")
-_DIFFUSION_SAMPLER_NAMES = {
-    "mdlm": "ancestral",
-    "sedd": "sedd_analytical",
-    "d3pm": "d3pm_ancestral",
-    "block_diffusion": "ancestral",
-}
+MODEL_CHOICES = ("gpt",)
 PRETRAIN_DATASET_CHOICES = ("tinystories", "text8", "wikitext", "openwebtext")
 PRETRAIN_EVAL_DATASET_CHOICES = ("tinystories", "text8", "wikitext")
 
@@ -104,152 +96,58 @@ def lm_model_kwargs(
     jacobi_loss_weight=None,
     jacobi_iterations=None,
 ):
+    _require_choice(model_name, MODEL_CHOICES, "model")
     kwargs = _base_lm_kwargs(vocab_size, dim, num_layers, max_seq_len)
-    if model_name == "gpt":
-        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
-        _update_supplied(kwargs, {
-            "num_kv_heads": num_kv_heads,
-            "attention": attention,
-            "attention_backend": attention_backend,
-            "position": position,
-            "norm": norm,
-            "connection": connection,
-            "ffn": ffn,
-            "num_experts": num_experts,
-            "top_k_experts": top_k_experts,
-            "post_norm": post_norm,
-            "rope_base": rope_base,
-            "rope_local_base": rope_local_base,
-            "rope_global_base": rope_global_base,
-            "rope_scaling_factor": rope_scaling_factor,
-            "rope_original_max_seq_len": rope_original_max_seq_len,
-            "rope_partial_rotary_factor": rope_partial_rotary_factor,
-            "yarn_beta_fast": yarn_beta_fast,
-            "yarn_beta_slow": yarn_beta_slow,
-            "local_attention_window": local_attention_window,
-            "qwen3_next_full_attention_interval": qwen3_next_full_attention_interval,
-            "sparse_block_size": sparse_block_size,
-            "sparse_top_k_blocks": sparse_top_k_blocks,
-            "sparse_local_blocks": sparse_local_blocks,
-            "sparse_index_dim": sparse_index_dim,
-            "sparse_kl_loss_weight": sparse_kl_loss_weight,
-            "sparse_index_warmup_steps": sparse_index_warmup_steps,
-            "lighthouse_num_levels": lighthouse_num_levels,
-            "lighthouse_pooling_factor": lighthouse_pooling_factor,
-            "lighthouse_top_k": lighthouse_top_k,
-            "attention_k_eq_v": attention_k_eq_v,
-            "per_layer_embedding_dim": per_layer_embedding_dim,
-            "final_logit_softcap": final_logit_softcap,
-            "mtp_depth": mtp_depth,
-            "mtp_loss_weight": mtp_loss_weight,
-            "mtp_mode": mtp_mode,
-            "layerskip_loss_weight": layerskip_loss_weight,
-            "layerskip_dropout": layerskip_dropout,
-            "layerskip_min_layer": layerskip_min_layer,
-            "future_summary_window": future_summary_window,
-            "future_summary_loss_weight": future_summary_loss_weight,
-            "jacobi_loss_weight": jacobi_loss_weight,
-            "jacobi_iterations": jacobi_iterations,
-        })
-    elif model_name in {"hybrid", "hymba"}:
-        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
-        _update_supplied(kwargs, {
-            "num_kv_heads": num_kv_heads,
-            "attention": attention,
-            "attention_backend": attention_backend,
-            "position": position,
-            "norm": norm,
-            "ffn": ffn,
-            "num_experts": num_experts,
-            "top_k_experts": top_k_experts,
-            "post_norm": post_norm,
-            "rope_base": rope_base,
-            "rope_scaling_factor": rope_scaling_factor,
-            "rope_original_max_seq_len": rope_original_max_seq_len,
-            "rope_partial_rotary_factor": rope_partial_rotary_factor,
-            "yarn_beta_fast": yarn_beta_fast,
-            "yarn_beta_slow": yarn_beta_slow,
-            "local_attention_window": local_attention_window,
-            "qwen3_next_full_attention_interval": qwen3_next_full_attention_interval,
-            "final_logit_softcap": final_logit_softcap,
-        })
-    elif model_name in {"mamba", "mamba2"}:
-        return kwargs
-    elif model_name == "byte_latent":
-        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
-        _update_supplied(kwargs, {
-            "num_kv_heads": num_kv_heads,
-            "attention": attention,
-            "attention_backend": attention_backend,
-            "norm": norm,
-            "ffn": ffn,
-            "num_experts": num_experts,
-            "top_k_experts": top_k_experts,
-        })
-    elif model_name == "xlstm":
-        kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
-    else:
-        raise ValueError(f"Unhandled model family: {model_name}")
+    kwargs["num_heads"] = _require_num_heads(model_name, num_heads)
+    _update_supplied(kwargs, {
+        "num_kv_heads": num_kv_heads,
+        "attention": attention,
+        "attention_backend": attention_backend,
+        "position": position,
+        "norm": norm,
+        "connection": connection,
+        "ffn": ffn,
+        "num_experts": num_experts,
+        "top_k_experts": top_k_experts,
+        "post_norm": post_norm,
+        "rope_base": rope_base,
+        "rope_local_base": rope_local_base,
+        "rope_global_base": rope_global_base,
+        "rope_scaling_factor": rope_scaling_factor,
+        "rope_original_max_seq_len": rope_original_max_seq_len,
+        "rope_partial_rotary_factor": rope_partial_rotary_factor,
+        "yarn_beta_fast": yarn_beta_fast,
+        "yarn_beta_slow": yarn_beta_slow,
+        "local_attention_window": local_attention_window,
+        "qwen3_next_full_attention_interval": qwen3_next_full_attention_interval,
+        "sparse_block_size": sparse_block_size,
+        "sparse_top_k_blocks": sparse_top_k_blocks,
+        "sparse_local_blocks": sparse_local_blocks,
+        "sparse_index_dim": sparse_index_dim,
+        "sparse_kl_loss_weight": sparse_kl_loss_weight,
+        "sparse_index_warmup_steps": sparse_index_warmup_steps,
+        "lighthouse_num_levels": lighthouse_num_levels,
+        "lighthouse_pooling_factor": lighthouse_pooling_factor,
+        "lighthouse_top_k": lighthouse_top_k,
+        "attention_k_eq_v": attention_k_eq_v,
+        "per_layer_embedding_dim": per_layer_embedding_dim,
+        "final_logit_softcap": final_logit_softcap,
+        "mtp_depth": mtp_depth,
+        "mtp_loss_weight": mtp_loss_weight,
+        "mtp_mode": mtp_mode,
+        "layerskip_loss_weight": layerskip_loss_weight,
+        "layerskip_dropout": layerskip_dropout,
+        "layerskip_min_layer": layerskip_min_layer,
+        "future_summary_window": future_summary_window,
+        "future_summary_loss_weight": future_summary_loss_weight,
+        "jacobi_loss_weight": jacobi_loss_weight,
+        "jacobi_iterations": jacobi_iterations,
+    })
     return kwargs
 
 
 def _update_supplied(target, fields):
     target.update({name: value for name, value in fields.items() if value is not None})
-
-
-def diffusion_model_class(name):
-    _require_choice(name, DIFFUSION_MODEL_CHOICES, "diffusion model")
-    return get_model(name)
-
-
-def build_diffusion_model(name, **config_kwargs):
-    cls = diffusion_model_class(name)
-    return cls(cls.config_class(**config_kwargs))
-
-
-def diffusion_model_kwargs(
-    model_name,
-    *,
-    vocab_size,
-    mask_token_id,
-    dim,
-    num_layers,
-    num_heads,
-    num_kv_heads,
-    max_seq_len,
-    attention,
-    ffn,
-    num_experts,
-    top_k_experts,
-    block_size=None,
-    block_diffusion_unconditional=None,
-    antithetic_time_sampling=None,
-):
-    kwargs = {
-        "vocab_size": vocab_size,
-        "dim": dim,
-        "num_layers": num_layers,
-        "num_heads": num_heads,
-        "num_kv_heads": num_kv_heads,
-        "max_seq_len": max_seq_len,
-        "attention": attention,
-        "ffn": ffn,
-        "num_experts": num_experts,
-        "top_k_experts": top_k_experts,
-        "mask_token_id": mask_token_id,
-    }
-    if model_name == "block_diffusion":
-        kwargs.update(
-            block_size=resolve_default(block_size, 32),
-            cross_attention=not resolve_default(block_diffusion_unconditional, False),
-            antithetic_time_sampling=resolve_default(antithetic_time_sampling, False),
-        )
-    return kwargs
-
-
-def diffusion_sampler(name):
-    _require_choice(name, DIFFUSION_MODEL_CHOICES, "diffusion model")
-    return get_sampler(_DIFFUSION_SAMPLER_NAMES[name])
 
 
 def flag_name(name):
@@ -326,15 +224,6 @@ def _checkpoint_model_name(path, choices, kind):
 def load_model_checkpoint(path, requested_model=None, device="cpu"):
     model_name = requested_model or _checkpoint_model_name(path, MODEL_CHOICES, "language model")
     return model_name, model_class(model_name).load(path, device=device)
-
-
-def load_diffusion_model_checkpoint(path, requested_model=None, device="cpu"):
-    model_name = requested_model or _checkpoint_model_name(
-        path,
-        DIFFUSION_MODEL_CHOICES,
-        "diffusion model",
-    )
-    return model_name, diffusion_model_class(model_name).load(path, device=device)
 
 
 def compare_lm_variants(

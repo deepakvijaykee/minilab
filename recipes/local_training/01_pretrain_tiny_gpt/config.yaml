@@ -16,7 +16,7 @@ defaults:
   grad_checkpoint: true
 environment_overrides:
   TOKENIZER: tokenizer path
-  PRESET: gpt-10m, gpt-25m, gpt-60m, or mamba-25m
+  PRESET: gpt-10m, gpt-25m, or gpt-60m
   SAVE_DIR: checkpoint directory
   DATASET: pretraining dataset
   SEQ_LEN: token sequence length

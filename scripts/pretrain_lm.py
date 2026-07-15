@@ -3,9 +3,6 @@
     python scripts/pretrain_lm.py --tokenizer tokenizer.json
     python scripts/pretrain_lm.py --tokenizer tokenizer.json --attention iha --connection mhc
     python scripts/pretrain_lm.py --tokenizer tokenizer.json --attention gqa --num-kv-heads 4
-    python scripts/pretrain_lm.py --tokenizer tokenizer.json --model mamba
-    python scripts/pretrain_lm.py --tokenizer tokenizer.json --model mamba2
-    python scripts/pretrain_lm.py --tokenizer tokenizer.json --model hymba
 """
 
 import argparse
@@ -87,44 +84,6 @@ _MODEL_BUILD_FLAGS = (
     "future_summary_window", "future_summary_loss_weight",
     "jacobi_loss_weight", "jacobi_iterations",
 )
-_MAMBA_BUILD_FLAGS = ("dim", "num_layers")
-_XLSTM_BUILD_FLAGS = ("dim", "num_layers", "num_heads")
-_BYTE_LATENT_BUILD_FLAGS = (
-    "dim", "num_layers", "num_heads", "num_kv_heads", "attention",
-    "attention_backend", "norm", "ffn", "num_experts", "top_k_experts",
-)
-_MAMBA_ONLY_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _MAMBA_BUILD_FLAGS)
-_XLSTM_ONLY_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _XLSTM_BUILD_FLAGS)
-_BYTE_LATENT_REJECTED_FLAGS = tuple(name for name in _MODEL_BUILD_FLAGS if name not in _BYTE_LATENT_BUILD_FLAGS)
-_GPT_ONLY_BUILD_FLAGS = (
-    "rope_local_base",
-    "rope_global_base",
-    "attention_k_eq_v",
-    "sparse_block_size",
-    "sparse_top_k_blocks",
-    "sparse_local_blocks",
-    "sparse_index_dim",
-    "sparse_kl_loss_weight",
-    "sparse_index_warmup_steps",
-    "lighthouse_num_levels",
-    "lighthouse_pooling_factor",
-    "lighthouse_top_k",
-    "per_layer_embedding_dim",
-    "connection",
-    "mtp_depth",
-    "mtp_loss_weight",
-    "mtp_mode",
-    "layerskip_loss_weight",
-    "layerskip_dropout",
-    "layerskip_min_layer",
-    "future_summary_window",
-    "future_summary_loss_weight",
-    "jacobi_loss_weight",
-    "jacobi_iterations",
-)
-_TOKEN_SUPERPOSITION_FLAGS = ("token_superposition_size", "token_superposition_steps")
-_QK_CLIP_FLAGS = ("qk_clip_threshold", "qk_clip_balance")
-_QK_CLIP_MODEL_CHOICES = {"gpt", "hybrid", "hymba", "byte_latent"}
 _LOCAL_WINDOW_ATTENTIONS = {"gemma3", "gemma4", "sliding_window", "sliding_window_gqa_qknorm"}
 _PARTIAL_ROPE_ATTENTIONS = {"gqa_qknorm_partial_rope", "gated_gqa_qknorm_partial_rope", "qwen3_next"}
 
@@ -209,18 +168,6 @@ model_name = preset.get("model") or args.model or "gpt"
 
 if args.resume_from:
     reject_supplied(args, _MODEL_SELECTOR_FLAGS + _MODEL_BUILD_FLAGS, "only applies when starting a new model")
-elif model_name in {"mamba", "mamba2"}:
-    reject_supplied(args, _MAMBA_ONLY_REJECTED_FLAGS, "does not apply to --model mamba or mamba2")
-elif model_name in {"hybrid", "hymba"}:
-    reject_supplied(args, _GPT_ONLY_BUILD_FLAGS, "only applies to --model gpt")
-elif model_name == "xlstm":
-    reject_supplied(args, _XLSTM_ONLY_REJECTED_FLAGS, "does not apply to --model xlstm")
-elif model_name == "byte_latent":
-    reject_supplied(args, _BYTE_LATENT_REJECTED_FLAGS, "does not apply to --model byte_latent")
-if not args.resume_from and model_name != "gpt":
-    reject_supplied(args, _TOKEN_SUPERPOSITION_FLAGS, "only applies to --model gpt")
-if not args.resume_from and model_name not in _QK_CLIP_MODEL_CHOICES:
-    reject_supplied(args, _QK_CLIP_FLAGS, "only applies to QK-Clip-capable attention models")
 if args.qk_clip_threshold is not None:
     require(args.qk_clip_threshold > 0, "--qk-clip-threshold must be > 0 when supplied")
 if args.qk_clip_balance is not None:

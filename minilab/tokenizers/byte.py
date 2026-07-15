@@ -1,4 +1,4 @@
-"""UTF-8 byte tokenizer used by byte-latent experiments."""
+"""Fixed UTF-8 byte tokenizer."""
 
 from minilab.base import BaseTokenizer
 from minilab.checks import require
