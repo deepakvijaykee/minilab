@@ -1,11 +1,4 @@
 from minilab.alignment_common import resolve_reference_path
-from minilab.diffusion_alignment import (
-    DiffusionDPOTrainer,
-    DiffusionGRPOTrainConfig,
-    DiffusionGRPOTrainer,
-    DiffusionVRPOTrainConfig,
-    DiffusionVRPOTrainer,
-)
 from minilab.online_rl import (
     ASPOTrainer,
     DAPOTrainConfig,
@@ -67,11 +60,6 @@ __all__ = [
     "DGTrainer",
     "DPOTrainConfig",
     "DPOTrainer",
-    "DiffusionDPOTrainer",
-    "DiffusionGRPOTrainConfig",
-    "DiffusionGRPOTrainer",
-    "DiffusionVRPOTrainConfig",
-    "DiffusionVRPOTrainer",
     "DrGRPOTrainConfig",
     "DrGRPOTrainer",
     "FilteredDGTrainer",

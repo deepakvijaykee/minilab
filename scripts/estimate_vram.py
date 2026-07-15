@@ -7,11 +7,8 @@ components before launching a run so recipes can be adjusted to fit a local GPU.
 import argparse
 
 from common import (
-    DIFFUSION_MODEL_CHOICES,
     MODEL_CHOICES,
-    build_diffusion_model,
     build_lm_model,
-    diffusion_model_kwargs,
     lm_model_kwargs,
     resolve_default,
 )
@@ -20,7 +17,6 @@ from minilab.diagnostics import optimizer_state_bytes
 from minilab.online_rl import ONLINE_RL_REFERENCE_ALGORITHMS
 from minilab.models.transformer_utils import DEFAULT_NUM_EXPERTS, DEFAULT_TOP_K_EXPERTS
 from minilab.presets import (
-    DIFFUSION_MODEL_PRESETS,
     LM_MODEL_PRESETS,
     all_model_preset_choices,
     get_any_model_preset,
@@ -31,25 +27,14 @@ REFERENCE_METHODS = {
     "dpo",
     "ipo",
     "kto",
-    "diffusion_dpo",
-    "diffusion_vrpo",
-    "diffusion_grpo",
 } | ONLINE_RL_REFERENCE_ALGORITHMS
 GROUP_ROLLOUT_METHODS = {
     "grpo", "drgrpo", "grpo_lite", "gspo", "rloo", "dapo",
     "tpo", "tpo_no_anchor", "group_pg", "vpo",
     "dg", "kondo", "uncertainty_dg", "filtered_dg", "reward_variance_dg",
     "aspo", "r2vpo", "replay_dg", "fresh_dg",
-    "diffusion_grpo",
 }
 ROLLOUT_METHODS = {"ppo"} | GROUP_ROLLOUT_METHODS
-DIFFUSION_METHODS = {
-    "diffusion_pretrain",
-    "diffusion_sft",
-    "diffusion_dpo",
-    "diffusion_vrpo",
-    "diffusion_grpo",
-}
 METHODS = (
     "pretrain",
     "sft",
@@ -80,15 +65,10 @@ METHODS = (
     "r2vpo",
     "replay_dg",
     "fresh_dg",
-    "diffusion_pretrain",
-    "diffusion_sft",
-    "diffusion_dpo",
-    "diffusion_vrpo",
-    "diffusion_grpo",
 )
-FAMILY_CHOICES = MODEL_CHOICES + DIFFUSION_MODEL_CHOICES
+FAMILY_CHOICES = MODEL_CHOICES
 MODEL_OR_PRESET_CHOICES = all_model_preset_choices() + FAMILY_CHOICES
-TRANSFORMER_FAMILIES = {"gpt", "hybrid", "hymba", "xlstm", "byte_latent", "mdlm", "sedd", "d3pm", "block_diffusion"}
+TRANSFORMER_FAMILIES = {"gpt"}
 
 
 def _gb(num_bytes):
@@ -106,12 +86,12 @@ def _optimizer_bytes(model, optimizer):
 
 
 def _resolve_spec(args):
-    if args.model in LM_MODEL_PRESETS or args.model in DIFFUSION_MODEL_PRESETS:
+    if args.model in LM_MODEL_PRESETS:
         spec = get_any_model_preset(args.model)
     else:
         require(args.model in FAMILY_CHOICES, f"Unknown model or preset: {args.model}")
         spec = {
-            "kind": "diffusion" if args.model in DIFFUSION_MODEL_CHOICES else "lm",
+            "kind": "lm",
             "model": args.model,
             "dim": 256,
             "num_layers": 6,
@@ -121,39 +101,17 @@ def _resolve_spec(args):
 
     spec["dim"] = resolve_default(args.dim, spec["dim"])
     spec["num_layers"] = resolve_default(args.num_layers, spec["num_layers"])
-    if spec["model"] in {"mamba", "mamba2"}:
-        require(args.num_heads is None, "--num-heads does not apply to Mamba-family models")
-    else:
-        require("num_heads" in spec, f"{spec['model']} VRAM estimation requires num_heads")
-        spec["num_heads"] = resolve_default(args.num_heads, spec["num_heads"])
+    require("num_heads" in spec, f"{spec['model']} VRAM estimation requires num_heads")
+    spec["num_heads"] = resolve_default(args.num_heads, spec["num_heads"])
     spec["seq_len"] = resolve_default(args.seq_len, spec["seq_len"])
     require(spec["dim"] > 0, "--dim must be > 0")
     require(spec["num_layers"] > 0, "--num-layers must be > 0")
     require(spec["seq_len"] > 0, "--seq-len must be > 0")
-    if spec["model"] not in {"mamba", "mamba2"}:
-        require(spec["num_heads"] > 0, "--num-heads must be > 0")
+    require(spec["num_heads"] > 0, "--num-heads must be > 0")
     return spec
 
 
 def _build_model(spec, vocab_size):
-    if spec["kind"] == "diffusion":
-        mask_token_id = vocab_size
-        kwargs = diffusion_model_kwargs(
-            spec["model"],
-            vocab_size=vocab_size + 1,
-            mask_token_id=mask_token_id,
-            dim=spec["dim"],
-            num_layers=spec["num_layers"],
-            num_heads=spec["num_heads"],
-            num_kv_heads=None,
-            max_seq_len=spec["seq_len"],
-            attention="mha",
-            ffn="swiglu",
-            num_experts=DEFAULT_NUM_EXPERTS,
-            top_k_experts=DEFAULT_TOP_K_EXPERTS,
-        )
-        return build_diffusion_model(spec["model"], **kwargs)
-
     kwargs = lm_model_kwargs(
         spec["model"],
         vocab_size=vocab_size,
@@ -209,11 +167,6 @@ def _generation_cache_bytes(spec, args):
 
 def _estimate(args):
     spec = _resolve_spec(args)
-    expected_kind = "diffusion" if args.method in DIFFUSION_METHODS else "non-diffusion"
-    require(
-        (args.method in DIFFUSION_METHODS) == (spec["kind"] == "diffusion"),
-        f"--method {args.method} expects a {expected_kind} model",
-    )
     require(args.batch_size > 0, "--batch-size must be > 0")
     require(args.num_generations > 0, "--num-generations must be > 0")
     require(args.vpo_num_candidates > 0, "--vpo-num-candidates must be > 0")

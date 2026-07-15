@@ -57,8 +57,6 @@ require(not (args.checkpoint and args.resume_from), "SFT accepts --checkpoint or
 
 if args.resume_from or args.checkpoint:
     reject_supplied(args, _MODEL_BUILD_FLAGS, "only applies when starting a new model")
-elif model_name in {"mamba", "mamba2"}:
-    reject_supplied(args, ("num_heads",), "only applies to --model gpt, hybrid, hymba, xlstm, or byte_latent")
 
 set_seed(args.seed)
 

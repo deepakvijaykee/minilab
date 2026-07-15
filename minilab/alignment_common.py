@@ -224,20 +224,6 @@ def _model_max_seq_len(model, context):
     return max_seq_len
 
 
-def _diffusion_loss_per_example(model, fwd, x_0, loss_mask, t, z_t, mask):
-    core = unwrap_model(model)
-    output = model(z_t, t, **core.diffusion_forward_kwargs(x_0))
-    return core.compute_loss_per_example(
-        output,
-        x_0,
-        mask,
-        t,
-        fwd,
-        loss_mask=loss_mask,
-        normalization="none",
-    )
-
-
 def _rollout_policy_train_loop(trainer, inner_epochs):
     def loop():
         trainer.model.eval()

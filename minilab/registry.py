@@ -10,8 +10,6 @@ __all__ = [
     "get_model",
     "get_norm",
     "get_position",
-    "get_sampler",
-    "get_scheduler",
     "get_task",
     "get_tokenizer",
     "get_trainer",
@@ -23,8 +21,6 @@ __all__ = [
     "register_model",
     "register_norm",
     "register_position",
-    "register_sampler",
-    "register_scheduler",
     "register_task",
     "register_tokenizer",
     "register_trainer",
@@ -82,14 +78,6 @@ def register_tokenizer(name):
     return register("tokenizer", name)
 
 
-def register_scheduler(name):
-    return register("scheduler", name)
-
-
-def register_sampler(name):
-    return register("sampler", name)
-
-
 def register_trainer(name):
     return register("trainer", name)
 
@@ -124,14 +112,6 @@ def get_connection(name):
 
 def get_tokenizer(name):
     return get("tokenizer", name)
-
-
-def get_scheduler(name):
-    return get("scheduler", name)
-
-
-def get_sampler(name):
-    return get("sampler", name)
 
 
 def get_trainer(name):

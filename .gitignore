@@ -203,6 +203,7 @@ cython_debug/
 
 # Codex local tooling state
 .codex
+checkpoints/
 
 # Marimo
 marimo/_static/

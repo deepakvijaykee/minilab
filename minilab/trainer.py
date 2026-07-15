@@ -12,10 +12,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from minilab.base import BaseModel, apply_conditional_diffusion_mask, unwrap_model
+from minilab.base import BaseModel, unwrap_model
 from minilab.checks import require, require_finite_number, require_integer, require_integer_fields
 from minilab.config import BaseConfig
-from minilab.diffusion import forward_process_signature
 from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER, Lion, Muon
 from minilab.registry import register_trainer
 
@@ -750,77 +749,6 @@ class LMTrainer(Trainer):
         return supervised_lm_batch_loss(self.model, batch)
 
 
-@register_trainer("diffusion")
-class DiffusionTrainer(Trainer):
-    def __init__(self, model, forward_process, train_dataset, config, *, signature, tokenizer_sig="", eval_dataset=None):
-        if not config.resume_from:
-            _validate_diffusion_trainer_contract(model, forward_process)
-        # Bind the forward process into the resume signature so a checkpoint built
-        # with one forward process cannot be silently resumed under another.
-        fwd_signature = forward_process_signature(forward_process)
-        signature = hashlib.sha256((signature + fwd_signature).encode()).hexdigest()
-        super().__init__(model, train_dataset, config, signature=signature, tokenizer_sig=tokenizer_sig, eval_dataset=eval_dataset)
-        self.fwd = forward_process
-        _validate_diffusion_trainer_contract(self.model, forward_process)
-
-    def save_checkpoint(self):
-        super().save_checkpoint()
-        self.fwd.save(Path(self.config.save_dir) / f"step_{self.step}" / "forward_process.json")
-
-    def compute_loss(self, batch):
-        x_0 = batch["input_ids"]
-        model = unwrap_model(self.model)
-        z_t, mask, t, forward_kwargs = model.diffusion_training_state(self.fwd, x_0, self.device)
-        output = self.model(z_t, t, **forward_kwargs)
-        return model.compute_loss(output, x_0, mask, t, self.fwd) + model_aux_loss(self.model)
-
-
-@register_trainer("diffusion_sft")
-class DiffusionSFTTrainer(DiffusionTrainer):
-    """Response-only supervised fine-tuning for masked diffusion LMs.
-
-    The prompt is kept fixed as conditioning context. Only `loss_mask` positions
-    are noised and supervised, matching the masked-SFT recipe used by dLLM
-    post-training work instead of AR next-token shifting.
-    """
-
-    def compute_loss(self, batch):
-        x_0 = batch["input_ids"]
-        loss_mask = batch["loss_mask"]
-        valid_mask = batch["valid_mask"]
-        model = unwrap_model(self.model)
-        z_t, mask, t, forward_kwargs = model.diffusion_conditional_training_state(
-            self.fwd,
-            x_0,
-            loss_mask,
-            valid_mask,
-            self.device,
-        )
-        output = self.model(z_t, t, **forward_kwargs)
-        per_example = model.compute_loss_per_example(
-            output,
-            x_0,
-            mask,
-            t,
-            self.fwd,
-            loss_mask=loss_mask,
-            normalization="target",
-        )
-        return per_example.mean() + model_aux_loss(self.model)
-
-
-def conditional_q_sample(fwd, x_0, t, loss_mask, valid_mask=None):
-    z_t, mask = fwd.q_sample(x_0, t)
-    return apply_conditional_diffusion_mask(
-        z_t,
-        mask,
-        x_0,
-        loss_mask,
-        valid_mask,
-        fwd.mask_token_id,
-    )
-
-
 def model_aux_loss(model):
     return unwrap_model(model).auxiliary_loss()
 
@@ -832,23 +760,3 @@ def supervised_lm_batch_loss(model, batch):
 
 def commit_post_optimizer_updates(model, qk_clip_threshold, qk_clip_balance):
     unwrap_model(model).post_optimizer_step(qk_clip_threshold, qk_clip_balance)
-
-
-def _validate_diffusion_trainer_contract(model, forward_process):
-    model = unwrap_model(model)
-    require(isinstance(model, BaseModel), "DiffusionTrainer requires a BaseModel")
-    model_config = model.config
-    expected_process = model.forward_process_type
-    require(expected_process is not None, "DiffusionTrainer requires model.forward_process_type")
-    require(forward_process.process_type == expected_process, (
-        f"DiffusionTrainer forward process mismatch: model expects {expected_process!r}, "
-        f"got {forward_process.process_type!r}"
-    ))
-    require(model_config.mask_token_id == forward_process.mask_token_id, (
-        "model config and forward process must use the same mask_token_id"
-    ))
-    if model.requires_terminal_mask_prior:
-        require(forward_process.has_terminal_mask_prior(), (
-            f"{type(model).__name__} requires a forward process with alpha[-1] = 0 "
-            "so q(x_T | x_0) matches the all-mask terminal prior"
-        ))

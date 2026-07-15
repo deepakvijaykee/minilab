@@ -5,8 +5,6 @@ from minilab.registry import (
     get_model,
     get_norm,
     get_position,
-    get_sampler,
-    get_scheduler,
     get_task,
     get_tokenizer,
     get_trainer,
@@ -17,7 +15,6 @@ from minilab.base import BaseModel, BaseTokenizer
 from minilab import nn as _nn
 from minilab import tokenizers as _tokenizers
 from minilab import models as _models
-from minilab import diffusion as _diffusion
 from minilab import generation as _generation
 from minilab import trainer as _trainer
 from minilab import alignment as _alignment
@@ -35,8 +32,6 @@ __all__ = [
     "get_model",
     "get_norm",
     "get_position",
-    "get_sampler",
-    "get_scheduler",
     "get_task",
     "get_tokenizer",
     "get_trainer",

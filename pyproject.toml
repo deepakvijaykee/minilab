@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "minilab"
 version = "0.1.0"
-description = "A laptop-GPU-friendly training lab for end-to-end language model training, alignment, RLVR, and diffusion LM experiments."
+description = "A laptop-GPU-friendly GPT training, alignment, and RLVR lab."
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
