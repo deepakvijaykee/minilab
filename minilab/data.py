@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, Sampler
 
+from minilab.base import BaseTokenizer
 from minilab.checks import require
 from minilab.hf_cache import configure_hf_cache
 from minilab.tasks.gsm8k import parse_gold_answer, prompt_parts
@@ -42,11 +43,19 @@ class TextDataset(Dataset):
 
 class SFTDataset(Dataset):
 
-    def __init__(self, examples, tokenizer, seq_len):
+    def __init__(self, examples, tokenizer, seq_len, allow_truncation=True):
         require(seq_len > 1, f"SFTDataset requires seq_len > 1, got {seq_len}")
+        require(type(allow_truncation) is bool, (
+            "SFTDataset allow_truncation must be bool"
+        ))
         self.data = []
         for ex in examples:
             p, r = _prompt_response_tokens(ex, tokenizer, "SFT")
+            if not allow_truncation:
+                require(len(p) + len(r) <= seq_len, (
+                    "SFT example does not fit seq_len without truncation: "
+                    f"prompt={len(p)} response={len(r)} seq_len={seq_len}"
+                ))
             prompt_len = min(len(p), seq_len - 1)
 
             self.data.append({
@@ -331,51 +340,51 @@ def _ultrafeedback_examples(max_examples):
     return examples
 
 
-def _encoded_field(example, tokenizer, field, message):
-    require(field in example, f"example is missing required field: {field}")
-    ids = tokenizer.encode(example[field])
-    require(len(ids) > 0, message)
-    return ids
+def _supervised_messages(example, context):
+    has_prompt = "prompt" in example
+    has_messages = "messages" in example
+    require(has_prompt != has_messages, (
+        f"{context} example requires exactly one of prompt or messages"
+    ))
+    if has_messages:
+        return example["messages"]
+    prompt = example["prompt"]
+    require(type(prompt) is str and prompt, f"{context} example has empty prompt")
+    return [{"role": "user", "content": prompt}]
+
+
+def _supervised_tokens(example, tokenizer, response_field, context):
+    require(response_field in example, (
+        f"example is missing required field: {response_field}"
+    ))
+    response = example[response_field]
+    require(type(response) is str and response, (
+        f"{context} example has empty {response_field}"
+    ))
+    require(isinstance(tokenizer, BaseTokenizer), (
+        f"{context} tokenizer must inherit BaseTokenizer"
+    ))
+    prompt_ids, response_ids = tokenizer.encode_supervised(
+        _supervised_messages(example, context), response
+    )
+    require(prompt_ids, f"{context} example has empty encoded prompt")
+    require(response_ids, f"{context} example has empty encoded {response_field}")
+    return prompt_ids, response_ids
 
 
 def _prompt_response_tokens(example, tokenizer, context):
-    return (
-        _encoded_field(
-            tokenizer=tokenizer,
-            example=example,
-            field="prompt",
-            message=f"{context} example has empty prompt",
-        ),
-        _encoded_field(
-            tokenizer=tokenizer,
-            example=example,
-            field="response",
-            message=f"{context} example has empty response",
-        ),
-    )
+    return _supervised_tokens(example, tokenizer, "response", context)
 
 
 def _preference_tokens(example, tokenizer, context):
-    return (
-        _encoded_field(
-            tokenizer=tokenizer,
-            example=example,
-            field="prompt",
-            message=f"{context} example has empty prompt",
-        ),
-        _encoded_field(
-            tokenizer=tokenizer,
-            example=example,
-            field="chosen",
-            message=f"{context} example has empty chosen response",
-        ),
-        _encoded_field(
-            tokenizer=tokenizer,
-            example=example,
-            field="rejected",
-            message=f"{context} example has empty rejected response",
-        ),
+    prompt, chosen = _supervised_tokens(example, tokenizer, "chosen", context)
+    rejected_prompt, rejected = _supervised_tokens(
+        example, tokenizer, "rejected", context
     )
+    require(rejected_prompt == prompt, (
+        f"{context} chosen/rejected chat templates produced different prompt prefixes"
+    ))
+    return prompt, chosen, rejected
 
 
 def _pack(prompt, response, prompt_len, seq_len):

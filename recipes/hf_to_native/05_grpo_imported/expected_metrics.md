@@ -1,9 +1,9 @@
 # Expected signals
 
 The `Trainable:` and `Frozen reference:` lines print at startup. DAPO
-omits the reference line because it has no reference model by design,
-which is the visible signature of having dropped the reference KL in
-favor of asymmetric ratio clipping.
+omits the reference line because it has no reference model to load, and
+that absence is the visible signature of having dropped the reference KL
+in favor of asymmetric ratio clipping.
 
 The eval block mirrors recipe 04 in `local_training/`. It prints up
 to five `Q/A/(predicted, expected, OK|WRONG)` lines followed by a

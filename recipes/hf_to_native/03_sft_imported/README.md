@@ -29,3 +29,27 @@ rate reflects that.
 ```bash
 MODEL=smollm2-360m MAX_STEPS=200 bash recipes/hf_to_native/03_sft_imported/run.sh
 ```
+
+Native Q/V LoRA can be enabled directly on any compatible imported checkpoint:
+
+```bash
+python scripts/sft.py \
+  --tokenizer checkpoints/imported/qwen3-0.6b/tokenizer.json \
+  --checkpoint checkpoints/imported/qwen3-0.6b \
+  --save-dir checkpoints/imported/qwen3-0.6b-lora-sft \
+  --lora-rank 8 \
+  --lora-alpha 16 \
+  --max-steps 100
+```
+
+Only adapter parameters are optimizer-owned. Resume restores the saved adapter
+structure, so `--lora-rank` and `--lora-alpha` are checkpoint-creation options
+and must not be repeated with `--resume-from`.
+
+An imported instruction tokenizer serializes the whole supervised
+conversation through its saved chat template, masking the prompt prefix
+from the loss and labeling the assistant response down to its turn
+terminator. For the deterministic exact-envelope curriculum, pass
+`--dataset structured_output`. Where open-ended Alpaca loading would
+truncate a long example, that curriculum drops it instead of teaching a
+broken envelope.

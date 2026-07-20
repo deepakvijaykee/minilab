@@ -26,6 +26,8 @@ from minilab.checks import require, require_finite_number, require_integer_field
 from minilab.generation import generate
 from minilab.registry import register_trainer
 from minilab.rl_diagnostics import (
+    agentic_rollout_records,
+    agentic_trajectory_rollout_records,
     append_jsonl,
     group_stats,
     ppo_stats,
@@ -35,6 +37,15 @@ from minilab.rl_diagnostics import (
     stack_reward_results,
     split_reward_result,
     vpo_rollout_records,
+)
+from minilab.tasks.agentic_calculator import (
+    CalculatorTarget,
+    CalculatorTrajectoryTarget,
+    calculator_agent_components,
+    calculator_intermediate_observation,
+    calculator_trajectory_components,
+    calculator_tool_observation,
+    execute_calculator_tool,
 )
 from minilab.trainer import (
     TrainConfig,
@@ -47,6 +58,14 @@ from minilab.trainer import (
 
 
 ONLINE_RL_REFERENCE_ALGORITHMS = frozenset({"ppo", "grpo", "drgrpo", "gspo", "rloo"})
+AGENTIC_ADVANTAGE_ESTIMATORS = frozenset({
+    "group_standardized",
+    "group_centered",
+})
+AGENTIC_LOSS_NORMALIZERS = frozenset({
+    "response_length",
+    "generation_budget",
+})
 
 
 def online_rl_uses_reference(algorithm):
@@ -128,6 +147,46 @@ class GRPOLiteTrainConfig(GRPOTrainConfig):
         require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
             "GRPO-lite does not use PPO clipping; leave grpo_clip_ratio at the inherited default"
         ))
+
+
+@dataclass
+class AgenticTurnTrainConfig(GRPOTrainConfig):
+    """One on-policy update with separate tool-turn and answer-turn credit."""
+
+    grpo_kl_coef: float = 0.0
+    grpo_inner_epochs: int = 1
+
+    def __post_init__(self):
+        super().__post_init__()
+        require(self.grpo_inner_epochs == 1, (
+            "agentic turn credit uses one on-policy update; set grpo_inner_epochs=1"
+        ))
+        require(self.grpo_kl_coef == 0.0, (
+            "agentic turn credit is reference-free; set grpo_kl_coef=0"
+        ))
+        require(self.grpo_clip_ratio == GRPOTrainConfig.grpo_clip_ratio, (
+            "agentic turn credit does not use clipping; leave grpo_clip_ratio at its default"
+        ))
+
+
+@dataclass
+class AgenticTrajectoryTrainConfig(AgenticTurnTrainConfig):
+    """Factorized group credit for observation-conditioned trajectories."""
+
+    agentic_advantage_estimator: str = "group_standardized"
+    agentic_loss_normalizer: str = "response_length"
+
+    def __post_init__(self):
+        super().__post_init__()
+        require(
+            self.agentic_advantage_estimator in AGENTIC_ADVANTAGE_ESTIMATORS,
+            "agentic_advantage_estimator must be group_standardized or "
+            "group_centered",
+        )
+        require(
+            self.agentic_loss_normalizer in AGENTIC_LOSS_NORMALIZERS,
+            "agentic_loss_normalizer must be response_length or generation_budget",
+        )
 
 
 @dataclass
@@ -329,6 +388,69 @@ class GroupRollout:
 
 
 @dataclass
+class AgenticTurnRollout:
+    tool_seqs: list
+    tool_label_seqs: list
+    tool_completions: list
+    tool_completion_masks: list
+    answer_seqs: list
+    answer_label_seqs: list
+    answer_completions: list
+    answer_completion_masks: list
+    tool_observations: list
+    rewards: torch.Tensor
+    adv: torch.Tensor
+    tool_adv: torch.Tensor
+    reward_components: dict
+    age: int = 0
+    generation_latency_ms: float = 0.0
+    reward_latency_ms: float = 0.0
+    environment_latency_ms: float = 0.0
+    generated_tokens: int = 0
+    reward_calls: int = 0
+    queue_depth: int = 0
+    dropped_stale_count: int = 0
+    staleness_delay: int = 0
+    drop_stale_after: int = 0
+    accepted_for_training: bool = True
+    drop_reason: str = ""
+
+
+@dataclass
+class AgenticTrajectoryRollout:
+    first_tool_seqs: list
+    first_tool_label_seqs: list
+    first_tool_completions: list
+    first_tool_completion_masks: list
+    second_tool_seqs: list
+    second_tool_label_seqs: list
+    second_tool_completions: list
+    second_tool_completion_masks: list
+    answer_seqs: list
+    answer_label_seqs: list
+    answer_completions: list
+    answer_completion_masks: list
+    trajectory_observations: list
+    rewards: torch.Tensor
+    adv: torch.Tensor
+    first_tool_adv: torch.Tensor
+    second_tool_adv: torch.Tensor
+    reward_components: dict
+    age: int = 0
+    generation_latency_ms: float = 0.0
+    reward_latency_ms: float = 0.0
+    environment_latency_ms: float = 0.0
+    generated_tokens: int = 0
+    reward_calls: int = 0
+    queue_depth: int = 0
+    dropped_stale_count: int = 0
+    staleness_delay: int = 0
+    drop_stale_after: int = 0
+    accepted_for_training: bool = True
+    drop_reason: str = ""
+
+
+@dataclass
 class VPORollout:
     seqs: list
     label_seqs: list
@@ -353,20 +475,264 @@ class VPORollout:
     drop_reason: str = ""
 
 
-def _sample_completion(model, prompt, max_new_tokens, context):
+def _sample_completion(
+    model,
+    prompt,
+    max_new_tokens,
+    context,
+    *,
+    stop_texts=None,
+    tokenizer=None,
+    temperature=1.0,
+):
     require(max_new_tokens > 0, f"{context} requires room for at least one generated token")
     out = generate(
         model,
         prompt,
         max_new_tokens=max_new_tokens,
-        temperature=1.0,
+        temperature=temperature,
         top_k=0,
         top_p=1.0,
         repetition_penalty=1.0,
+        stop_texts=stop_texts,
+        tokenizer=tokenizer,
     )
     gen = out[0, prompt.size(1):]
     require(gen.numel() > 0, f"{context} requires at least one generated token per prompt")
     return gen
+
+
+@dataclass(frozen=True)
+class CalculatorAgentTurn:
+    tool_tokens: torch.Tensor
+    answer_prompt_tokens: torch.Tensor
+    answer_tokens: torch.Tensor
+    observation: str
+    components: dict
+    generation_latency_ms: float
+    environment_latency_ms: float
+    reward_latency_ms: float
+
+
+@dataclass(frozen=True)
+class CalculatorTrajectoryTurn:
+    first_tool_tokens: torch.Tensor
+    second_prompt_tokens: torch.Tensor
+    second_tool_tokens: torch.Tensor
+    answer_prompt_tokens: torch.Tensor
+    answer_tokens: torch.Tensor
+    first_observation: str
+    second_observation: str
+    components: dict
+    generation_latency_ms: float
+    environment_latency_ms: float
+    reward_latency_ms: float
+
+
+def _agentic_prompt_tensor(token_ids, device, context):
+    require(type(token_ids) is list and token_ids, (
+        f"{context} must encode to a non-empty token list"
+    ))
+    require(all(type(token_id) is int and token_id >= 0 for token_id in token_ids), (
+        f"{context} token ids must be non-negative integers"
+    ))
+    return torch.tensor(token_ids, device=device, dtype=torch.long)
+
+
+def calculator_agent_turn(
+    model,
+    tokenizer,
+    prompt,
+    user_prompt,
+    target,
+    max_new_tokens,
+    *,
+    temperature=1.0,
+):
+    """Run one model -> tool -> model transition in the calculator environment."""
+    require(prompt.dim() == 2 and prompt.size(0) == 1, (
+        "calculator agent turn requires one 2D prompt"
+    ))
+    require(type(user_prompt) is str and user_prompt, (
+        "calculator agent turn requires the original non-empty user prompt"
+    ))
+    require(isinstance(target, CalculatorTarget), (
+        "calculator agent turn requires a CalculatorTarget"
+    ))
+    prompt = prompt.to(next(model.parameters()).device)
+    generation_started = time.perf_counter()
+    tool_tokens = _sample_completion(
+        model,
+        prompt,
+        max_new_tokens,
+        "agentic calculator tool turn",
+        stop_texts=["</tool_call>"],
+        tokenizer=tokenizer,
+        temperature=temperature,
+    )
+    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+    tool_text = tokenizer.decode(tool_tokens.tolist())
+    environment_started = time.perf_counter()
+    execution = execute_calculator_tool(tool_text)
+    observation = calculator_tool_observation(execution)
+    environment_latency_ms = (time.perf_counter() - environment_started) * 1000.0
+    answer_prompt_ids = tokenizer.encode_agentic_followup(
+        user_prompt,
+        tool_text,
+        observation,
+        prompt[0].detach().cpu().tolist(),
+        tool_tokens.detach().cpu().tolist(),
+    )
+    answer_prompt = _agentic_prompt_tensor(
+        answer_prompt_ids,
+        prompt.device,
+        "calculator agent follow-up",
+    )
+    generation_started = time.perf_counter()
+    answer_tokens = _sample_completion(
+        model,
+        answer_prompt.unsqueeze(0),
+        max_new_tokens,
+        "agentic calculator answer turn",
+        stop_texts=["</answer>"],
+        tokenizer=tokenizer,
+        temperature=temperature,
+    )
+    generation_latency_ms += (time.perf_counter() - generation_started) * 1000.0
+    answer_text = tokenizer.decode(answer_tokens.tolist())
+    reward_started = time.perf_counter()
+    components = calculator_agent_components(execution, answer_text, target)
+    reward_latency_ms = (time.perf_counter() - reward_started) * 1000.0
+    return CalculatorAgentTurn(
+        tool_tokens=tool_tokens,
+        answer_prompt_tokens=answer_prompt,
+        answer_tokens=answer_tokens,
+        observation=execution.observation,
+        components=components,
+        generation_latency_ms=generation_latency_ms,
+        environment_latency_ms=environment_latency_ms,
+        reward_latency_ms=reward_latency_ms,
+    )
+
+
+def calculator_trajectory_turn(
+    model,
+    tokenizer,
+    prompt,
+    user_prompt,
+    target,
+    max_new_tokens,
+    *,
+    temperature=1.0,
+):
+    """Run model -> tool -> model -> tool -> model in the calculator."""
+    require(prompt.dim() == 2 and prompt.size(0) == 1, (
+        "calculator trajectory turn requires one 2D prompt"
+    ))
+    require(type(user_prompt) is str and user_prompt, (
+        "calculator trajectory turn requires the original user prompt"
+    ))
+    require(isinstance(target, CalculatorTrajectoryTarget), (
+        "calculator trajectory turn requires a CalculatorTrajectoryTarget"
+    ))
+    prompt = prompt.to(next(model.parameters()).device)
+    generation_started = time.perf_counter()
+    first_tool_tokens = _sample_completion(
+        model,
+        prompt,
+        max_new_tokens,
+        "calculator trajectory first tool turn",
+        stop_texts=["</tool_call>"],
+        tokenizer=tokenizer,
+        temperature=temperature,
+    )
+    generation_latency_ms = (time.perf_counter() - generation_started) * 1000.0
+    first_tool_text = tokenizer.decode(first_tool_tokens.tolist())
+    environment_started = time.perf_counter()
+    first_execution = execute_calculator_tool(first_tool_text)
+    first_observation_text = calculator_intermediate_observation(
+        first_execution, target.second_arguments[1]
+    )
+    environment_latency_ms = (time.perf_counter() - environment_started) * 1000.0
+    second_prompt_ids = tokenizer.encode_agentic_followup(
+        user_prompt,
+        first_tool_text,
+        first_observation_text,
+        prompt[0].detach().cpu().tolist(),
+        first_tool_tokens.detach().cpu().tolist(),
+    )
+    second_prompt = _agentic_prompt_tensor(
+        second_prompt_ids,
+        prompt.device,
+        "calculator trajectory second-turn follow-up",
+    )
+    generation_started = time.perf_counter()
+    second_tool_tokens = _sample_completion(
+        model,
+        second_prompt.unsqueeze(0),
+        max_new_tokens,
+        "calculator trajectory second tool turn",
+        stop_texts=["</tool_call>"],
+        tokenizer=tokenizer,
+        temperature=temperature,
+    )
+    generation_latency_ms += (time.perf_counter() - generation_started) * 1000.0
+    second_tool_text = tokenizer.decode(second_tool_tokens.tolist())
+    environment_started = time.perf_counter()
+    second_execution = execute_calculator_tool(second_tool_text)
+    second_observation_text = calculator_tool_observation(second_execution)
+    environment_latency_ms += (time.perf_counter() - environment_started) * 1000.0
+    history = [
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": first_tool_text},
+        {"role": "user", "content": first_observation_text},
+        {"role": "assistant", "content": second_tool_text},
+        {"role": "user", "content": second_observation_text},
+    ]
+    answer_prompt_ids = tokenizer.encode_agentic_continuation(
+        history,
+        second_prompt.detach().cpu().tolist(),
+        second_tool_tokens.detach().cpu().tolist(),
+        second_observation_text,
+    )
+    answer_prompt = _agentic_prompt_tensor(
+        answer_prompt_ids,
+        prompt.device,
+        "calculator trajectory answer-turn follow-up",
+    )
+    generation_started = time.perf_counter()
+    answer_tokens = _sample_completion(
+        model,
+        answer_prompt.unsqueeze(0),
+        max_new_tokens,
+        "calculator trajectory answer turn",
+        stop_texts=["</answer>"],
+        tokenizer=tokenizer,
+        temperature=temperature,
+    )
+    generation_latency_ms += (time.perf_counter() - generation_started) * 1000.0
+    answer_text = tokenizer.decode(answer_tokens.tolist())
+    reward_started = time.perf_counter()
+    components = calculator_trajectory_components(
+        first_execution,
+        second_execution,
+        answer_text,
+        target,
+    )
+    reward_latency_ms = (time.perf_counter() - reward_started) * 1000.0
+    return CalculatorTrajectoryTurn(
+        first_tool_tokens=first_tool_tokens,
+        second_prompt_tokens=second_prompt,
+        second_tool_tokens=second_tool_tokens,
+        answer_prompt_tokens=answer_prompt,
+        answer_tokens=answer_tokens,
+        first_observation=first_execution.observation,
+        second_observation=second_execution.observation,
+        components=components,
+        generation_latency_ms=generation_latency_ms,
+        environment_latency_ms=environment_latency_ms,
+        reward_latency_ms=reward_latency_ms,
+    )
 
 
 def _pack_prompt_completions(prompt_ids, prompt_lens, completions, device):
@@ -406,8 +772,50 @@ def _pack_prompt_completions(prompt_ids, prompt_lens, completions, device):
     return completion_pad, completion_mask, seq_pad, label_pad, comp_lens
 
 
+def _pack_variable_prompt_completions(prompts, completions, device):
+    require(len(prompts) > 0, "variable prompt packing requires at least one prompt")
+    require(len(prompts) == len(completions), (
+        "variable prompts must match their completions"
+    ))
+    for prompt in prompts:
+        require(prompt.dim() == 1, "variable prompts must be 1D token tensors")
+        require(prompt.dtype == torch.long, "variable prompts must use dtype torch.long")
+        require(prompt.numel() > 0, "variable prompts must contain at least one token")
+    prompt_lens = torch.tensor(
+        [prompt.numel() for prompt in prompts], device=device, dtype=torch.long
+    )
+    prompt_pad = torch.zeros(
+        len(prompts), int(prompt_lens.max().item()), device=device, dtype=torch.long
+    )
+    for index, prompt in enumerate(prompts):
+        prompt_pad[index, : prompt.numel()] = prompt
+    return _pack_prompt_completions(
+        prompt_pad, prompt_lens, completions, device
+    )
+
+
 def _group_centered_advantages(rewards):
     return rewards - rewards.mean(dim=1, keepdim=True)
+
+
+def _leave_one_out_advantages(rewards):
+    require(
+        rewards.dim() == 2 and rewards.size(1) > 1,
+        "leave-one-out advantages require [batch, generations] with generations > 1",
+    )
+    return (
+        rewards * rewards.size(1) - rewards.sum(dim=1, keepdim=True)
+    ) / (rewards.size(1) - 1)
+
+
+def _agentic_group_advantages(rewards, estimator):
+    if estimator == "group_standardized":
+        return _group_normalized_advantages(rewards)
+    require(
+        estimator == "group_centered",
+        "unknown agentic advantage estimator",
+    )
+    return _group_centered_advantages(rewards)
 
 
 def _tpo_skill(rewards):
@@ -789,6 +1197,11 @@ class GRPOTrainer(ReferenceCheckpointMixin, Trainer):
         # PPO-style update structure.
         raise NotImplementedError("GRPO runs its own train loop; compute_loss is not called")
 
+    def _backward_policy_loss(self, rollout):
+        loss = self._policy_loss(rollout)
+        self.scaler.scale(loss).backward()
+        return loss.detach()
+
     def _rollout(self, batch):
         """Sample K completions per prompt under the current policy, compute
         group-relative advantages, and freeze the old-policy log-probs that the
@@ -1043,6 +1456,691 @@ class GRPOLiteTrainer(GRPOTrainer):
 
     def _algorithm_name(self):
         return "grpo_lite"
+
+
+@register_trainer("agentic_turn")
+class AgenticTurnTrainer(GRPOTrainer):
+    """Two-turn calculator agent with turn-level group-relative credit.
+
+    The first generated segment selects and calls a deterministic tool. The
+    environment appends the tool observation, then the policy generates a final
+    answer segment. Tool correctness and grounded final-answer correctness get
+    separate group-relative advantages so one turn cannot hide the other.
+    """
+
+    _uses_reference_model = False
+    _scores_old_policy = False
+
+    def __init__(
+        self,
+        model,
+        train_dataset,
+        config,
+        *,
+        tokenizer,
+        targets,
+        signature,
+        tokenizer_sig="",
+        eval_dataset=None,
+    ):
+        require(isinstance(config, AgenticTurnTrainConfig), (
+            "AgenticTurnTrainer requires AgenticTurnTrainConfig"
+        ))
+        require(
+            hasattr(tokenizer, "encode")
+            and hasattr(tokenizer, "decode")
+            and hasattr(tokenizer, "encode_agentic_followup"),
+            "AgenticTurnTrainer requires a tokenizer with encode/decode and "
+            "encode_agentic_followup",
+        )
+        require(
+            len(targets) == len(train_dataset)
+            and all(isinstance(target, CalculatorTarget) for target in targets),
+            "agentic calculator targets must match the training dataset",
+        )
+        super().__init__(
+            model,
+            reward_fn=None,
+            train_dataset=train_dataset,
+            config=config,
+            ref_model_path=None,
+            signature=signature,
+            tokenizer_sig=tokenizer_sig,
+            eval_dataset=eval_dataset,
+        )
+        self.tokenizer = tokenizer
+        self.targets = list(targets)
+
+    def _rollout(self, batch):
+        prompt_ids = batch["prompt_ids"]
+        prompt_lens = batch["prompt_len"]
+        raw_prompt_ids = batch.get("raw_prompt_ids")
+        raw_prompt_lens = batch.get("raw_prompt_len")
+        indices = batch.get("idx")
+        require(prompt_ids.dim() == 2 and prompt_ids.size(0) > 0, (
+            "agentic calculator prompt_ids must have shape [batch, seq]"
+        ))
+        batch_size = prompt_ids.size(0)
+        require(prompt_lens.shape == (batch_size,), (
+            "agentic calculator prompt_len must have shape [batch]"
+        ))
+        require((prompt_lens > 0).all(), (
+            "agentic calculator requires prompt_len > 0 for every prompt"
+        ))
+        require(
+            raw_prompt_ids is not None
+            and raw_prompt_ids.dim() == 2
+            and raw_prompt_ids.size(0) == batch_size,
+            "agentic calculator batches require raw_prompt_ids with shape [batch, seq]",
+        )
+        require(
+            raw_prompt_lens is not None
+            and raw_prompt_lens.shape == (batch_size,)
+            and (raw_prompt_lens > 0).all(),
+            "agentic calculator batches require positive raw_prompt_len values",
+        )
+        require(indices is not None and indices.shape == (batch_size,), (
+            "agentic calculator batches require idx with shape [batch]"
+        ))
+        targets = []
+        for index in indices.detach().cpu().tolist():
+            require(0 <= index < len(self.targets), (
+                "agentic calculator batch idx is outside the target set"
+            ))
+            targets.append(self.targets[index])
+
+        tool_seqs = []
+        tool_label_seqs = []
+        tool_completions = []
+        tool_completion_masks = []
+        answer_seqs = []
+        answer_label_seqs = []
+        answer_completions = []
+        answer_completion_masks = []
+        tool_observations = []
+        reward_results = []
+        generation_latency_ms = 0.0
+        environment_latency_ms = 0.0
+        reward_latency_ms = 0.0
+        generated_tokens = 0
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                for _ in range(self.K):
+                    turns = []
+                    for b in range(batch_size):
+                        prompt_len = int(prompt_lens[b].item())
+                        raw_prompt_len = int(raw_prompt_lens[b].item())
+                        user_prompt = self.tokenizer.decode(
+                            raw_prompt_ids[b, :raw_prompt_len].detach().cpu().tolist()
+                        )
+                        turns.append(calculator_agent_turn(
+                            self.model,
+                            self.tokenizer,
+                            prompt_ids[b : b + 1, :prompt_len],
+                            user_prompt,
+                            targets[b],
+                            self.max_new_tokens,
+                        ))
+                    generation_latency_ms += sum(
+                        turn.generation_latency_ms for turn in turns
+                    )
+                    environment_latency_ms += sum(
+                        turn.environment_latency_ms for turn in turns
+                    )
+                    reward_latency_ms += sum(
+                        turn.reward_latency_ms for turn in turns
+                    )
+
+                    tool_tokens = [turn.tool_tokens for turn in turns]
+                    tool_pad, tool_mask, tool_seq, tool_labels, _ = (
+                        _pack_prompt_completions(
+                            prompt_ids,
+                            prompt_lens,
+                            tool_tokens,
+                            self.device,
+                        )
+                    )
+                    answer_tokens = [turn.answer_tokens for turn in turns]
+                    answer_pad, answer_mask, answer_seq, answer_labels, _ = (
+                        _pack_variable_prompt_completions(
+                            [turn.answer_prompt_tokens for turn in turns],
+                            answer_tokens,
+                            self.device,
+                        )
+                    )
+                    tool_seqs.append(tool_seq)
+                    tool_label_seqs.append(tool_labels)
+                    tool_completions.append(tool_pad)
+                    tool_completion_masks.append(tool_mask)
+                    answer_seqs.append(answer_seq)
+                    answer_label_seqs.append(answer_labels)
+                    answer_completions.append(answer_pad)
+                    answer_completion_masks.append(answer_mask)
+                    tool_observations.append([turn.observation for turn in turns])
+                    reward_results.append({
+                        name: torch.tensor(
+                            [turn.components[name] for turn in turns],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for name in turns[0].components
+                    })
+                    generated_tokens += int(tool_mask.sum().item() + answer_mask.sum().item())
+
+            rewards, reward_components = stack_reward_results(
+                reward_results, self.device
+            )
+            require("tool_result" in reward_components, (
+                "agentic calculator reward must expose tool_result"
+            ))
+            answer_adv = _group_normalized_advantages(rewards)
+            tool_adv = _group_normalized_advantages(
+                reward_components["tool_result"]
+            )
+            return AgenticTurnRollout(
+                tool_seqs=tool_seqs,
+                tool_label_seqs=tool_label_seqs,
+                tool_completions=tool_completions,
+                tool_completion_masks=tool_completion_masks,
+                answer_seqs=answer_seqs,
+                answer_label_seqs=answer_label_seqs,
+                answer_completions=answer_completions,
+                answer_completion_masks=answer_completion_masks,
+                tool_observations=tool_observations,
+                rewards=rewards,
+                adv=answer_adv,
+                tool_adv=tool_adv,
+                reward_components=reward_components,
+                generation_latency_ms=generation_latency_ms,
+                reward_latency_ms=reward_latency_ms,
+                environment_latency_ms=environment_latency_ms,
+                generated_tokens=generated_tokens,
+                reward_calls=batch_size * self.K,
+            )
+        finally:
+            self.model.train(was_training)
+
+    def _policy_loss(self, rollout):
+        require(len(rollout.tool_seqs) == self.K, (
+            "agentic tool segment count must match configured generations"
+        ))
+        require(len(rollout.answer_seqs) == self.K, (
+            "agentic answer segment count must match configured generations"
+        ))
+        total = torch.tensor(0.0, device=self.device)
+        aux_total = torch.tensor(0.0, device=self.device)
+        for k in range(self.K):
+            tool_logp, tool_mask, tool_aux = _generation_context_token_logp(
+                self.model,
+                rollout.tool_seqs[k],
+                rollout.tool_label_seqs[k],
+                return_aux=True,
+            )
+            answer_logp, answer_mask, answer_aux = _generation_context_token_logp(
+                self.model,
+                rollout.answer_seqs[k],
+                rollout.answer_label_seqs[k],
+                return_aux=True,
+            )
+            tool_score, _ = _safe_sequence_scores(tool_logp, rollout.tool_label_seqs[k])
+            answer_score, _ = _safe_sequence_scores(
+                answer_logp, rollout.answer_label_seqs[k]
+            )
+            tool_length = tool_mask.sum(dim=-1).clamp_min(1.0)
+            answer_length = answer_mask.sum(dim=-1).clamp_min(1.0)
+            tool_loss = -(
+                tool_score / tool_length * rollout.tool_adv[:, k].detach()
+            ).mean()
+            answer_loss = -(
+                answer_score / answer_length * rollout.adv[:, k].detach()
+            ).mean()
+            total = total + 0.5 * (tool_loss + answer_loss)
+            aux_total = aux_total + 0.5 * (tool_aux + answer_aux)
+        self._last_policy_metrics = {
+            "tool_turn_adv_abs_mean": float(rollout.tool_adv.abs().mean().item()),
+            "answer_turn_adv_abs_mean": float(rollout.adv.abs().mean().item()),
+            "agentic_turns_per_trajectory": 2.0,
+        }
+        return total / self.K + aux_total / self.K
+
+    def _record_online_rollout(self, batch, rollout):
+        if self.config.rl_metrics_every > 0 and self.step % self.config.rl_metrics_every == 0:
+            metrics = group_stats(
+                rollout.rewards,
+                rollout.adv,
+                components=rollout.reward_components,
+            )
+            tool_lengths = torch.stack([
+                mask.sum(dim=1).float() for mask in rollout.tool_completion_masks
+            ], dim=1)
+            answer_lengths = torch.stack([
+                mask.sum(dim=1).float() for mask in rollout.answer_completion_masks
+            ], dim=1)
+            total_lengths = tool_lengths + answer_lengths
+            metrics.update({
+                "completion_length_mean": float(total_lengths.mean().item()),
+                "completion_length_max": float(total_lengths.max().item()),
+                "tool_completion_length_mean": float(tool_lengths.mean().item()),
+                "answer_completion_length_mean": float(answer_lengths.mean().item()),
+                "environment_latency_ms": float(rollout.environment_latency_ms),
+            })
+            metrics.update(rollout_system_stats(rollout))
+            metrics.update(self._last_policy_metrics)
+            append_jsonl(
+                Path(self.config.save_dir) / "online_rl_metrics.jsonl",
+                [scalar_record(
+                    type(self).__name__, self.step, self._algorithm_name(), metrics
+                )],
+            )
+        if self.config.rl_trace_samples > 0:
+            append_jsonl(
+                Path(self.config.save_dir) / "trajectories.jsonl",
+                agentic_rollout_records(
+                    type(self).__name__,
+                    self.step,
+                    self._algorithm_name(),
+                    rollout,
+                    self.config.rl_trace_samples,
+                ),
+            )
+
+    def _algorithm_name(self):
+        return "agentic_turn"
+
+
+@register_trainer("agentic_trajectory")
+class AgenticTrajectoryTrainer(GRPOTrainer):
+    """Three-stage calculator policy with separate credit for both calls."""
+
+    _uses_reference_model = False
+    _scores_old_policy = False
+    _extra_critical_fields = GRPOTrainer._extra_critical_fields + (
+        "agentic_advantage_estimator",
+        "agentic_loss_normalizer",
+    )
+
+    def __init__(
+        self,
+        model,
+        train_dataset,
+        config,
+        *,
+        tokenizer,
+        targets,
+        signature,
+        tokenizer_sig="",
+        eval_dataset=None,
+    ):
+        require(isinstance(config, AgenticTrajectoryTrainConfig), (
+            "AgenticTrajectoryTrainer requires AgenticTrajectoryTrainConfig"
+        ))
+        require(
+            hasattr(tokenizer, "encode")
+            and hasattr(tokenizer, "decode")
+            and hasattr(tokenizer, "encode_agentic_followup")
+            and hasattr(tokenizer, "encode_agentic_continuation"),
+            "AgenticTrajectoryTrainer requires a tokenizer with agentic "
+            "follow-up and continuation encoding",
+        )
+        require(
+            len(targets) == len(train_dataset)
+            and all(isinstance(target, CalculatorTrajectoryTarget) for target in targets),
+            "calculator trajectory targets must match the training dataset",
+        )
+        super().__init__(
+            model,
+            reward_fn=None,
+            train_dataset=train_dataset,
+            config=config,
+            ref_model_path=None,
+            signature=signature,
+            tokenizer_sig=tokenizer_sig,
+            eval_dataset=eval_dataset,
+        )
+        self.tokenizer = tokenizer
+        self.targets = list(targets)
+        self.advantage_estimator = config.agentic_advantage_estimator
+        self.loss_normalizer = config.agentic_loss_normalizer
+
+    def _rollout(self, batch):
+        prompt_ids = batch["prompt_ids"]
+        prompt_lens = batch["prompt_len"]
+        raw_prompt_ids = batch.get("raw_prompt_ids")
+        raw_prompt_lens = batch.get("raw_prompt_len")
+        indices = batch.get("idx")
+        require(prompt_ids.dim() == 2 and prompt_ids.size(0) > 0, (
+            "calculator trajectory prompt_ids must have shape [batch, seq]"
+        ))
+        batch_size = prompt_ids.size(0)
+        require(prompt_lens.shape == (batch_size,), (
+            "calculator trajectory prompt_len must have shape [batch]"
+        ))
+        require((prompt_lens > 0).all(), (
+            "calculator trajectory requires prompt_len > 0 for every prompt"
+        ))
+        require(
+            raw_prompt_ids is not None
+            and raw_prompt_ids.dim() == 2
+            and raw_prompt_ids.size(0) == batch_size,
+            "calculator trajectory batches require raw_prompt_ids with shape [batch, seq]",
+        )
+        require(
+            raw_prompt_lens is not None
+            and raw_prompt_lens.shape == (batch_size,)
+            and (raw_prompt_lens > 0).all(),
+            "calculator trajectory batches require positive raw_prompt_len values",
+        )
+        require(indices is not None and indices.shape == (batch_size,), (
+            "calculator trajectory batches require idx with shape [batch]"
+        ))
+        targets = []
+        for index in indices.detach().cpu().tolist():
+            require(0 <= index < len(self.targets), (
+                "calculator trajectory batch idx is outside the target set"
+            ))
+            targets.append(self.targets[index])
+
+        first_tool_seqs = []
+        first_tool_label_seqs = []
+        first_tool_completions = []
+        first_tool_completion_masks = []
+        second_tool_seqs = []
+        second_tool_label_seqs = []
+        second_tool_completions = []
+        second_tool_completion_masks = []
+        answer_seqs = []
+        answer_label_seqs = []
+        answer_completions = []
+        answer_completion_masks = []
+        trajectory_observations = []
+        reward_results = []
+        generation_latency_ms = 0.0
+        environment_latency_ms = 0.0
+        reward_latency_ms = 0.0
+        generated_tokens = 0
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                for _ in range(self.K):
+                    turns = []
+                    for b in range(batch_size):
+                        prompt_len = int(prompt_lens[b].item())
+                        raw_prompt_len = int(raw_prompt_lens[b].item())
+                        user_prompt = self.tokenizer.decode(
+                            raw_prompt_ids[b, :raw_prompt_len]
+                            .detach().cpu().tolist()
+                        )
+                        turns.append(calculator_trajectory_turn(
+                            self.model,
+                            self.tokenizer,
+                            prompt_ids[b : b + 1, :prompt_len],
+                            user_prompt,
+                            targets[b],
+                            self.max_new_tokens,
+                        ))
+                    generation_latency_ms += sum(
+                        turn.generation_latency_ms for turn in turns
+                    )
+                    environment_latency_ms += sum(
+                        turn.environment_latency_ms for turn in turns
+                    )
+                    reward_latency_ms += sum(
+                        turn.reward_latency_ms for turn in turns
+                    )
+
+                    first_tokens = [turn.first_tool_tokens for turn in turns]
+                    first_pad, first_mask, first_seq, first_labels, _ = (
+                        _pack_prompt_completions(
+                            prompt_ids, prompt_lens, first_tokens, self.device
+                        )
+                    )
+                    second_tokens = [turn.second_tool_tokens for turn in turns]
+                    second_pad, second_mask, second_seq, second_labels, _ = (
+                        _pack_variable_prompt_completions(
+                            [turn.second_prompt_tokens for turn in turns],
+                            second_tokens,
+                            self.device,
+                        )
+                    )
+                    answer_tokens = [turn.answer_tokens for turn in turns]
+                    answer_pad, answer_mask, answer_seq, answer_labels, _ = (
+                        _pack_variable_prompt_completions(
+                            [turn.answer_prompt_tokens for turn in turns],
+                            answer_tokens,
+                            self.device,
+                        )
+                    )
+                    first_tool_seqs.append(first_seq)
+                    first_tool_label_seqs.append(first_labels)
+                    first_tool_completions.append(first_pad)
+                    first_tool_completion_masks.append(first_mask)
+                    second_tool_seqs.append(second_seq)
+                    second_tool_label_seqs.append(second_labels)
+                    second_tool_completions.append(second_pad)
+                    second_tool_completion_masks.append(second_mask)
+                    answer_seqs.append(answer_seq)
+                    answer_label_seqs.append(answer_labels)
+                    answer_completions.append(answer_pad)
+                    answer_completion_masks.append(answer_mask)
+                    trajectory_observations.append([
+                        (turn.first_observation, turn.second_observation)
+                        for turn in turns
+                    ])
+                    reward_results.append({
+                        name: torch.tensor(
+                            [turn.components[name] for turn in turns],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for name in turns[0].components
+                    })
+                    generated_tokens += int(
+                        first_mask.sum().item()
+                        + second_mask.sum().item()
+                        + answer_mask.sum().item()
+                    )
+
+            rewards, reward_components = stack_reward_results(
+                reward_results, self.device
+            )
+            for name in (
+                "first_arguments_match",
+                "first_tool_result",
+                "second_arguments_match",
+                "second_tool_result",
+            ):
+                require(name in reward_components, (
+                    f"calculator trajectory reward must expose {name}"
+                ))
+            first_reward = torch.minimum(
+                reward_components["first_arguments_match"],
+                reward_components["first_tool_result"],
+            )
+            second_reward = torch.minimum(
+                reward_components["second_arguments_match"],
+                reward_components["second_tool_result"],
+            )
+            return AgenticTrajectoryRollout(
+                first_tool_seqs=first_tool_seqs,
+                first_tool_label_seqs=first_tool_label_seqs,
+                first_tool_completions=first_tool_completions,
+                first_tool_completion_masks=first_tool_completion_masks,
+                second_tool_seqs=second_tool_seqs,
+                second_tool_label_seqs=second_tool_label_seqs,
+                second_tool_completions=second_tool_completions,
+                second_tool_completion_masks=second_tool_completion_masks,
+                answer_seqs=answer_seqs,
+                answer_label_seqs=answer_label_seqs,
+                answer_completions=answer_completions,
+                answer_completion_masks=answer_completion_masks,
+                trajectory_observations=trajectory_observations,
+                rewards=rewards,
+                adv=_agentic_group_advantages(
+                    rewards, self.advantage_estimator
+                ),
+                first_tool_adv=_agentic_group_advantages(
+                    first_reward, self.advantage_estimator
+                ),
+                second_tool_adv=_agentic_group_advantages(
+                    second_reward, self.advantage_estimator
+                ),
+                reward_components=reward_components,
+                generation_latency_ms=generation_latency_ms,
+                reward_latency_ms=reward_latency_ms,
+                environment_latency_ms=environment_latency_ms,
+                generated_tokens=generated_tokens,
+                reward_calls=batch_size * self.K,
+            )
+        finally:
+            self.model.train(was_training)
+
+    def _policy_segments(self, rollout):
+        segments = (
+            (
+                rollout.first_tool_seqs,
+                rollout.first_tool_label_seqs,
+                rollout.first_tool_adv,
+                "first tool",
+            ),
+            (
+                rollout.second_tool_seqs,
+                rollout.second_tool_label_seqs,
+                rollout.second_tool_adv,
+                "second tool",
+            ),
+            (
+                rollout.answer_seqs,
+                rollout.answer_label_seqs,
+                rollout.adv,
+                "answer",
+            ),
+        )
+        for seqs, _labels, _adv, name in segments:
+            require(len(seqs) == self.K, (
+                f"agentic trajectory {name} segment count must match generations"
+            ))
+        self._last_policy_metrics = {
+            "agentic_advantage_estimator": self.advantage_estimator,
+            "agentic_loss_normalizer": self.loss_normalizer,
+            "first_tool_turn_adv_abs_mean": float(
+                rollout.first_tool_adv.abs().mean().item()
+            ),
+            "second_tool_turn_adv_abs_mean": float(
+                rollout.second_tool_adv.abs().mean().item()
+            ),
+            "answer_turn_adv_abs_mean": float(rollout.adv.abs().mean().item()),
+            "agentic_turns_per_trajectory": 3.0,
+        }
+        return segments
+
+    def _segment_policy_loss(self, seqs, labels, advantages):
+        token_logp, mask, aux = _generation_context_token_logp(
+            self.model,
+            seqs,
+            labels,
+            return_aux=True,
+        )
+        score, _ = _safe_sequence_scores(token_logp, labels)
+        if self.loss_normalizer == "response_length":
+            denominator = mask.sum(dim=-1).clamp_min(1.0)
+        else:
+            require(
+                self.loss_normalizer == "generation_budget",
+                "unknown agentic loss normalizer",
+            )
+            denominator = float(self.max_new_tokens)
+        policy_loss = -(
+            score / denominator * advantages.detach()
+        ).mean()
+        return policy_loss + aux
+
+    def _policy_loss(self, rollout):
+        segments = self._policy_segments(rollout)
+        total = torch.tensor(0.0, device=self.device)
+        for k in range(self.K):
+            for seqs, label_seqs, advantages, _name in segments:
+                total = total + self._segment_policy_loss(
+                    seqs[k], label_seqs[k], advantages[:, k]
+                )
+        return total / (self.K * len(segments))
+
+    def _backward_policy_loss(self, rollout):
+        segments = self._policy_segments(rollout)
+        denominator = self.K * len(segments)
+        total = torch.tensor(0.0, device=self.device)
+        for k in range(self.K):
+            for seqs, label_seqs, advantages, _name in segments:
+                term = self._segment_policy_loss(
+                    seqs[k], label_seqs[k], advantages[:, k]
+                ) / denominator
+                self.scaler.scale(term).backward()
+                total = total + term.detach()
+        return total
+
+    def _record_online_rollout(self, batch, rollout):
+        if (
+            self.config.rl_metrics_every > 0
+            and self.step % self.config.rl_metrics_every == 0
+        ):
+            metrics = group_stats(
+                rollout.rewards,
+                rollout.adv,
+                components=rollout.reward_components,
+            )
+            first_lengths = torch.stack([
+                mask.sum(dim=1).float()
+                for mask in rollout.first_tool_completion_masks
+            ], dim=1)
+            second_lengths = torch.stack([
+                mask.sum(dim=1).float()
+                for mask in rollout.second_tool_completion_masks
+            ], dim=1)
+            answer_lengths = torch.stack([
+                mask.sum(dim=1).float()
+                for mask in rollout.answer_completion_masks
+            ], dim=1)
+            total_lengths = first_lengths + second_lengths + answer_lengths
+            metrics.update({
+                "completion_length_mean": float(total_lengths.mean().item()),
+                "completion_length_max": float(total_lengths.max().item()),
+                "first_tool_completion_length_mean": float(
+                    first_lengths.mean().item()
+                ),
+                "second_tool_completion_length_mean": float(
+                    second_lengths.mean().item()
+                ),
+                "answer_completion_length_mean": float(
+                    answer_lengths.mean().item()
+                ),
+                "environment_latency_ms": float(rollout.environment_latency_ms),
+            })
+            metrics.update(rollout_system_stats(rollout))
+            metrics.update(self._last_policy_metrics)
+            append_jsonl(
+                Path(self.config.save_dir) / "online_rl_metrics.jsonl",
+                [scalar_record(
+                    type(self).__name__, self.step, self._algorithm_name(), metrics
+                )],
+            )
+        if self.config.rl_trace_samples > 0:
+            append_jsonl(
+                Path(self.config.save_dir) / "trajectories.jsonl",
+                agentic_trajectory_rollout_records(
+                    type(self).__name__,
+                    self.step,
+                    self._algorithm_name(),
+                    rollout,
+                    self.config.rl_trace_samples,
+                    advantage_estimator=self.advantage_estimator,
+                    loss_normalizer=self.loss_normalizer,
+                ),
+            )
+
+    def _algorithm_name(self):
+        return "agentic_trajectory"
 
 
 @register_trainer("tpo")

@@ -84,7 +84,7 @@ def _load_reference_model(model, ref_model_path, device, algorithm):
         f"can be loaded from the validated checkpoint path"
     ))
     ref_model = type(model).load(ref_model_path, device=device).eval()
-    require(ref_model.config.to_dict() == model.config.to_dict(), (
+    require(ref_model.reference_config() == model.reference_config(), (
         f"{algorithm} frozen reference config does not match the trainable model config"
     ))
     for p in ref_model.parameters():
@@ -236,8 +236,7 @@ def _rollout_policy_train_loop(trainer, inner_epochs):
             for _ in range(inner_epochs):
                 with record_function(f"{type(trainer).__name__}.update"):
                     with torch.autocast(trainer.device, dtype=trainer.dtype, enabled=trainer.dtype != torch.float32):
-                        loss = trainer._policy_loss(rollout)
-                trainer.scaler.scale(loss).backward()
+                        loss = trainer._backward_policy_loss(rollout)
                 trainer._optimizer_update()
                 total_loss += loss.item()
 

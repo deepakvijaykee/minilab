@@ -1,6 +1,20 @@
 # Local training recipes
 
-These recipes form one end-to-end GPT workflow. Run them from the repository root.
+These recipes form one end-to-end GPT workflow, from an untrained
+tokenizer to a verifier-scored policy, run entirely on a single device.
+The defaults are small on purpose: each stage finishes in minutes, which
+is the scale at which you can watch one checkpoint change the next and
+form intuition about what each stage actually contributes. They are sized
+for that, not for quality. Once the path runs cleanly, scale it up through
+`MAX_STEPS`, `MAX_EXAMPLES`, `PRESET`, and the batch settings rather than
+by changing the structure of the pipeline.
+
+Install the data extra first, then run the stages in order from the
+repository root:
+
+```bash
+python -m pip install -e ".[data]"
+```
 
 ```bash
 bash recipes/local_training/00_train_tokenizer/run.sh
@@ -11,21 +25,24 @@ bash recipes/local_training/04_grpo_tiny_math/run.sh
 bash recipes/local_training/05_eval_all/run.sh
 ```
 
+Each stage consumes the checkpoint the previous one wrote:
+
 | Recipe | Output |
 |---|---|
-| `00_train_tokenizer` | local tokenizer |
-| `01_pretrain_tiny_gpt` | base GPT checkpoint |
-| `02_sft_tiny_instruct` | instruction-tuned checkpoint |
-| `03_preference_tiny` | preference-tuned checkpoint |
-| `04_grpo_tiny_math` | verifier-reward checkpoint |
-| `05_eval_all` | consolidated evaluation results |
+| `00_train_tokenizer` | `checkpoints/local_training/tokenizer.json` |
+| `01_pretrain_tiny_gpt` | `checkpoints/local_training/lm/step_1000` |
+| `02_sft_tiny_instruct` | `checkpoints/local_training/sft/step_500` |
+| `03_preference_tiny` | `checkpoints/local_training/preference_dpo/step_300` |
+| `04_grpo_tiny_math` | `checkpoints/local_training/grpo/step_100` |
+| `05_eval_all` | consolidated evaluation across the four checkpoints |
 
-The defaults favor quick validation. Common overrides include:
+Every stage takes environment overrides, which is the intended way to
+scale a run up without touching the script:
 
 ```bash
 MAX_STEPS=3000 PRESET=gpt-25m bash recipes/local_training/01_pretrain_tiny_gpt/run.sh
 ALGORITHM=simpo bash recipes/local_training/03_preference_tiny/run.sh
-NUM_GENERATIONS=8 bash recipes/local_training/04_grpo_tiny_math/run.sh
+NUM_GENERATIONS=8 MAX_NEW_TOKENS=128 bash recipes/local_training/04_grpo_tiny_math/run.sh
 ```
 
 Estimate memory before a larger run:
@@ -33,3 +50,12 @@ Estimate memory before a larger run:
 ```bash
 python scripts/estimate_vram.py --model gpt-25m --method grpo --seq-len 512 --batch-size 1 --num-generations 4
 ```
+
+Every recipe writes `run_metrics.json` into its final checkpoint directory
+and copies it to the recipe save root. On CUDA that file records
+`max_memory_allocated_gb` and `max_memory_reserved_gb` from PyTorch's peak
+memory statistics. On CPU those keys are simply absent rather than zeroed.
+The division of labor across the track is that `run_metrics.json` carries
+the numbers a run actually produced, while each recipe's
+`expected_metrics.md` describes the shape those numbers should take and
+how to read them.

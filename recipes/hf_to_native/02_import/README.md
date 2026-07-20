@@ -13,7 +13,7 @@ bash recipes/hf_to_native/02_import/run.sh
 Out of the box the recipe pulls `smollm2-135m`, writes the converted
 checkpoint to `checkpoints/imported/smollm2-135m`, sets the native
 context length to 512, runs on CPU, and verifies logits. The verify
-step is the load-bearing safety check: it forwards both the original
+step is where the import is actually checked: it forwards both the original
 HF model and the converted native model on a short prompt and reports
 the maximum and mean absolute logit difference. Values around 1e-5 or
 smaller mean the mapping is clean and any remaining difference is
@@ -29,11 +29,15 @@ python scripts/sft.py \
   --save-dir checkpoints/imported/smollm2-135m-sft
 ```
 
-The importer currently accepts only Llama-compatible Hugging Face
-models, which today means SmolLM2. Qwen3 and Gemma3 trip the
-model-type guard in `scripts/import_hf.py` and require separate
-weight-mapping work before they can come through this path. The guard
-is intentional: silently importing a model whose attention bias or
-embedding tying differs from Llama would produce a checkpoint that
-loads but generates incorrect logits, which is a harder failure to
-debug than a refused import.
+The importer accepts Llama-compatible SmolLM2 and dense Qwen3 models. Qwen3 is
+not treated as a Llama alias: the mapping preserves its explicit attention head
+dimension and Q/K normalization parameters, and `--verify` compares native and
+source logits. Gemma3 still trips the model-type guard. That guard matters because the
+failure it prevents is silent: a model whose conventions differ from what
+the mapping assumes, its attention-bias or embedding-tying handling for
+instance, would otherwise import into a checkpoint that loads cleanly and
+only then generates wrong logits.
+
+```bash
+MODEL=qwen3-0.6b DEVICE=cpu bash recipes/hf_to_native/02_import/run.sh
+```

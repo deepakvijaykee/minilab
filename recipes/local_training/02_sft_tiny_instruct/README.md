@@ -21,8 +21,8 @@ response tokens, so the base language model's text habits carry over
 unchanged while the answer template is the only thing being relearned.
 With a thousand-step base, 500 steps of SFT, and 2000 Alpaca rows, the
 model begins producing answer-shaped continuations rather than the
-TinyStories drift that the base alone would emit. Genuine instruction
-quality is a separate axis and needs a stronger base. What shifts at
-this scale is shape rather than content. That asymmetry, format moving
-first and content moving later, is one of the more useful things this
-stage reveals about the alignment stack.
+TinyStories drift the base alone would emit. Genuine instruction quality
+is a separate axis that needs a stronger base. What moves at this scale
+is the shape of the answer, not its content, and that ordering, format
+before content, is the most instructive thing this stage shows about the
+alignment stack.
