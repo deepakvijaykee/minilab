@@ -1,10 +1,10 @@
 # Local training recipes
 
-These recipes form one end-to-end GPT workflow, from an untrained
+These recipes form one end-to-end GPT pipeline, from an untrained
 tokenizer to a verifier-scored policy, run entirely on a single device.
-The defaults are small on purpose: each stage finishes in minutes, which
-is the scale at which you can watch one checkpoint change the next and
-form intuition about what each stage actually contributes. They are sized
+The defaults are small so each stage finishes in minutes, the scale at
+which you can watch one checkpoint change the next and form intuition
+about what each stage contributes. They are sized
 for that, not for quality. Once the path runs cleanly, scale it up through
 `MAX_STEPS`, `MAX_EXAMPLES`, `PRESET`, and the batch settings rather than
 by changing the structure of the pipeline.
@@ -25,7 +25,8 @@ bash recipes/local_training/04_grpo_tiny_math/run.sh
 bash recipes/local_training/05_eval_all/run.sh
 ```
 
-Each stage consumes the checkpoint the previous one wrote:
+Pretraining feeds SFT; preference tuning and RLVR each branch from the
+SFT checkpoint, and evaluation covers all four:
 
 | Recipe | Output |
 |---|---|
@@ -36,8 +37,8 @@ Each stage consumes the checkpoint the previous one wrote:
 | `04_grpo_tiny_math` | `checkpoints/local_training/grpo/step_100` |
 | `05_eval_all` | consolidated evaluation across the four checkpoints |
 
-Every stage takes environment overrides, which is the intended way to
-scale a run up without touching the script:
+Every stage takes environment overrides, the way to scale a run up
+without touching the script:
 
 ```bash
 MAX_STEPS=3000 PRESET=gpt-25m bash recipes/local_training/01_pretrain_tiny_gpt/run.sh
@@ -55,7 +56,6 @@ Every recipe writes `run_metrics.json` into its final checkpoint directory
 and copies it to the recipe save root. On CUDA that file records
 `max_memory_allocated_gb` and `max_memory_reserved_gb` from PyTorch's peak
 memory statistics. On CPU those keys are simply absent rather than zeroed.
-The division of labor across the track is that `run_metrics.json` carries
-the numbers a run actually produced, while each recipe's
-`expected_metrics.md` describes the shape those numbers should take and
-how to read them.
+Across these recipes, `run_metrics.json` records the numbers a run
+produced, while each recipe's `expected_metrics.md` describes the shape
+those numbers should take and how to read them.

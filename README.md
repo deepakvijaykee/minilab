@@ -21,7 +21,7 @@ produced no strict successes, so RL had nothing to amplify. What unlocked
 the task was not more optimization but supervision that reproduced the
 environment transition inside each example: once the second tool call was
 demonstrated under the observation that fixes its arguments, held-out
-two-tool success rose by roughly 69 points across matched seeds. That
+two-tool success rose by roughly 71 points across matched seeds. That
 gain initially came at the expense of prior skills, until a
 canonical-biased replay mixture turned the handoff into a constrained
 curriculum that held them in place.
@@ -32,14 +32,14 @@ inconclusive, its paired interval spanning [-6.65, +17.07], so rather
 than promote an unstable point estimate the study raised resolution
 instead of budget. A fresh five-seed, twenty-step block then improved
 over matched learning-rate-zero controls in every seed, by 20.31 points
-on average (95% CI [3.07, 37.56]), with all monitored standard behavior
+on average (95% CI [3.07, 37.56]), with all monitored prior behavior
 preserved. The competence boundary proved narrower than it first looked:
 under a longer rollout budget even the weaker predecessor learned, which
-places the boundary at finite-budget observability rather than at an
+shows the boundary was set by the finite rollout budget, not by an
 intrinsic capability threshold. A closing objective factorization
 reproduced the learning effect in all four arms but moved completion
-length more clearly than reward, separating a policy's efficacy from the
-geometry of how it expresses success.
+length more clearly than reward, which separates whether the policy
+improved from how long its responses became.
 
 The decomposition that held the whole study together is
 **reachability -> preservation -> efficacy**: RL has no task-success
@@ -112,8 +112,8 @@ almost entirely through the token embeddings.
 
 ## What the tiny runs can and cannot show
 
-The defaults are sized so the whole loop runs in a coffee break, and that
-sizing decides what the runs can teach. The object worth studying here is
+The defaults are sized so the whole loop runs in minutes, and that sizing
+decides what the runs can teach. The object worth studying here is
 the loss curve and the qualitative shift from one checkpoint to the next,
 not absolute task scores. Three regularities show up cleanly at this
 scale, and they are most of the reason the lab exists.
@@ -125,10 +125,11 @@ as fluent but narratively flat and give a misleading impression of what
 training has done.
 
 Formatting moves faster than content. SFT and the preference methods
-shift response shape, the question-and-answer scaffolding and opening
-style, well before they move task accuracy. Shape lives in the final
-softmax, where a few thousand examples re-weight common tokens, while
-accuracy would need representations the base does not yet have. This
+shift response format, the question-and-answer scaffolding and opening
+style, well before they move task accuracy. Format is carried by the
+output distribution, where a few thousand examples re-weight common
+tokens, while accuracy would need representations the base does not yet
+have. This
 asymmetry is the dominant change between recipes 01 and 03, and it recurs
 all the way up the alignment stack.
 
@@ -153,7 +154,7 @@ and `max_memory_reserved_gb` from PyTorch's peak-memory statistics, which
 are the numbers to trust when sizing a longer experiment. Wall time is
 dominated by the rollout loop in recipe 04: sampling a group of
 completions for every prompt costs far more per step than the supervised
-stages, which is why its defaults are the most conservative in the track.
+stages, which is why its defaults are the most conservative in the workflow.
 
 ```bash
 python scripts/estimate_vram.py --model gpt-25m --method grpo --seq-len 512 --batch-size 1 --num-generations 4
@@ -207,7 +208,7 @@ python scripts/sft.py \
   --lora-alpha 16
 ```
 
-Run the deterministic two-turn agent smoke:
+Run the deterministic two-turn agent sanity check:
 
 ```bash
 python scripts/grpo.py \
@@ -251,8 +252,8 @@ and the same tiny policy can be pointed at each in turn to see where they
 actually diverge. Dr.GRPO, for instance, drops GRPO's
 group-standard-deviation scaling and response-length loss normalization
 in favor of centered rewards and a fixed generation-budget token
-denominator, so its difference from GRPO is a change in the geometry of
-the update rather than in the reward.
+denominator, so its difference from GRPO is in how the update is
+normalized, not in the reward.
 
 The reward does not have to come from GSM8K. Four deterministic-verifier
 tasks, `format_answer`, `mini_arithmetic`, `tool_call_json`, and

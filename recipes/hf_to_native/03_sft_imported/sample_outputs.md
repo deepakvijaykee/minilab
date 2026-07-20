@@ -14,5 +14,5 @@ Alpaca: 500 examples
 ```
 
 The parameter count above is for SmolLM2-135M. For `smollm2-360m` it
-is around 360M, with the rest of the block shape identical because
+is around 360M, with the rest of the output format identical because
 the trainer logging is shared across model sizes.

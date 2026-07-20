@@ -17,6 +17,6 @@ GSM8K test subset (20 of full split) accuracy: 1/20 = 5.0%
 ```
 
 The accuracy number swings widely from seed to seed at this scale, and
-a single-digit value is the expected ballpark for the default budget.
+a single-digit value is the expected range for the default budget.
 It says more about how little signal twenty-five steps of two-generation
 rollouts can carry than about the RLVR method itself.

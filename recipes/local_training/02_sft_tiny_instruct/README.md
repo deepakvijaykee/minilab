@@ -13,7 +13,7 @@ bash recipes/local_training/02_sft_tiny_instruct/run.sh
 
 By default the recipe loads `checkpoints/local_training/lm/step_1000`
 and trains for 500 steps with `batch_size=4`, `lr=1e-4`, over 2000
-Alpaca rows. The output checkpoint lands under
+Alpaca rows. The output checkpoint is written to
 `checkpoints/local_training/sft`.
 
 The SFT trainer masks loss on prompt tokens and supervises only the
