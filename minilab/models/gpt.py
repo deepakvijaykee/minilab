@@ -49,6 +49,7 @@ from minilab.nn.architecture import (
     resolve_deepseek_v4_attention,
 )
 from minilab.nn.connections import expand_residual_stream, reduce_residual_stream
+from minilab.nn.lora import LoRALinear
 from minilab.registry import get_attention, get_connection, get_ffn, get_norm, get_position, register_model
 
 
@@ -85,6 +86,7 @@ _ATTENTION_BACKEND_ATTENTIONS = {
     "mla",
 }
 _GPT_COMPAT_DEFAULT_FIELDS = {
+    "attention_head_dim",
     "sparse_block_size",
     "sparse_top_k_blocks",
     "sparse_local_blocks",
@@ -103,6 +105,8 @@ _GPT_COMPAT_DEFAULT_FIELDS = {
     "jacobi_loss_weight",
     "jacobi_iterations",
     "attention_backend",
+    "lora_rank",
+    "lora_alpha",
 }
 
 
@@ -113,6 +117,7 @@ class GPTConfig(BaseConfig):
     num_layers: int = 6
     num_heads: int = 8
     num_kv_heads: int | None = None
+    attention_head_dim: int = 0
     max_seq_len: int = 1024
     dropout: float = 0.0
     ffn_mult: float = 4.0
@@ -159,6 +164,8 @@ class GPTConfig(BaseConfig):
     future_summary_loss_weight: float = 0.0
     jacobi_loss_weight: float = 0.0
     jacobi_iterations: int = 0
+    lora_rank: int = 0
+    lora_alpha: float = 1.0
 
     @classmethod
     def from_dict(cls, d):
@@ -187,7 +194,8 @@ class GPTConfig(BaseConfig):
 
     def _validate_core_fields(self):
         require_finite_fields(self, (
-            "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads", "max_seq_len",
+            "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+            "attention_head_dim", "max_seq_len",
             "dropout", "ffn_mult", "norm_eps", "connection_expansion", "num_experts",
             "top_k_experts", "rope_base", "rope_local_base", "rope_global_base",
             "rope_scaling_factor", "rope_original_max_seq_len", "rope_partial_rotary_factor",
@@ -197,17 +205,19 @@ class GPTConfig(BaseConfig):
             "sparse_index_warmup_steps", "lighthouse_num_levels", "lighthouse_pooling_factor",
             "lighthouse_top_k", "per_layer_embedding_dim", "final_logit_softcap", "mtp_depth",
             "mtp_loss_weight", "layerskip_loss_weight", "layerskip_dropout", "layerskip_min_layer",
-            "future_summary_window", "future_summary_loss_weight", "jacobi_loss_weight", "jacobi_iterations",
+            "future_summary_window", "future_summary_loss_weight", "jacobi_loss_weight",
+            "jacobi_iterations", "lora_rank", "lora_alpha",
         ))
         require_integer_fields(self, (
             "vocab_size", "dim", "num_layers", "num_heads", "num_kv_heads",
+            "attention_head_dim",
             "max_seq_len", "connection_expansion", "num_experts", "top_k_experts",
             "rope_original_max_seq_len", "local_attention_window",
             "qwen3_next_full_attention_interval", "sparse_block_size",
             "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
             "sparse_index_warmup_steps", "lighthouse_num_levels", "lighthouse_pooling_factor",
             "lighthouse_top_k", "per_layer_embedding_dim", "mtp_depth", "layerskip_min_layer",
-            "future_summary_window", "jacobi_iterations",
+            "future_summary_window", "jacobi_iterations", "lora_rank",
         ))
         require(self.vocab_size > 0, "vocab_size must be > 0")
         require(self.dim > 0, "dim must be > 0")
@@ -215,7 +225,10 @@ class GPTConfig(BaseConfig):
         require(self.num_heads > 0, "num_heads must be > 0")
         require(self.num_kv_heads > 0, "num_kv_heads must be > 0")
         require(self.max_seq_len > 0, "max_seq_len must be > 0")
-        require(self.dim % self.num_heads == 0, "dim must be divisible by num_heads")
+        require(self.attention_head_dim >= 0, "attention_head_dim must be >= 0")
+        require(self.attention_head_dim > 0 or self.dim % self.num_heads == 0, (
+            "dim must be divisible by num_heads when attention_head_dim is not supplied"
+        ))
         require(0.0 <= self.dropout < 1.0, "dropout must be in [0, 1)")
         require(self.ffn_mult > 0, "ffn_mult must be > 0")
         require(self.norm_eps > 0, "norm_eps must be > 0")
@@ -266,6 +279,11 @@ class GPTConfig(BaseConfig):
         require((self.jacobi_iterations == 0) == (self.jacobi_loss_weight == 0), (
             "jacobi_iterations and jacobi_loss_weight must be enabled together"
         ))
+        require(self.lora_rank >= 0, "lora_rank must be >= 0")
+        require(self.lora_alpha > 0, "lora_alpha must be > 0")
+        require(self.lora_rank > 0 or self.lora_alpha == 1.0, (
+            "lora_alpha only applies when lora_rank > 0"
+        ))
         validate_attention_backend(self.attention_backend)
 
     def _validate_attention_position_contract(self):
@@ -274,7 +292,7 @@ class GPTConfig(BaseConfig):
         else:
             require(self.num_kv_heads == self.num_heads, "num_kv_heads only applies to GQA attention variants")
         if self.position in _ROPE_POSITIONS:
-            head_dim = self.dim // self.num_heads
+            head_dim = self.resolved_attention_head_dim
             require(head_dim % 2 == 0, "RoPE requires even head dimension")
         if self.position == "yarn_rope":
             require(
@@ -317,7 +335,7 @@ class GPTConfig(BaseConfig):
             "Gemma/Qwen local-global position='qwen3_next_rope' requires Qwen3-Next or partial-RoPE attention"
         ))
         if self.position in {"gemma4_rope", "qwen3_next_rope"}:
-            head_dim = self.dim // self.num_heads
+            head_dim = self.resolved_attention_head_dim
             require(int(self.rope_partial_rotary_factor * head_dim // 2) > 0, (
                 "Gemma/Qwen proportional RoPE must rotate at least one frequency; "
                 "increase head dimension or rope_partial_rotary_factor"
@@ -360,6 +378,12 @@ class GPTConfig(BaseConfig):
         )
         uses_learned_block = resolved_attention == "learned_block_gqa"
         uses_lighthouse = resolved_attention == "lighthouse_mha"
+        require_default_unless(
+            self.attention_head_dim,
+            0,
+            self.attention == "gqa_qknorm",
+            "attention_head_dim only applies to attention='gqa_qknorm'",
+        )
         require_default_unless(
             self.rope_base,
             DEFAULT_ROPE_BASE,
@@ -475,6 +499,10 @@ class GPTConfig(BaseConfig):
             "attention_k_eq_v only applies to attention='gemma4'",
         )
 
+    @property
+    def resolved_attention_head_dim(self):
+        return self.attention_head_dim or self.dim // self.num_heads
+
 
 PRESETS = {
     "gpt-tiny": {"dim": 128, "num_layers": 4, "num_heads": 4, "max_seq_len": 256},
@@ -538,6 +566,16 @@ def _build_transformer_attention(config, block_id):
                 kl_loss_weight=config.sparse_kl_loss_weight,
                 attention_backend=config.attention_backend,
             )
+        elif attention == "gqa_qknorm":
+            attn = attn_cls(
+                config.dim,
+                config.num_heads,
+                config.num_kv_heads,
+                config.dropout,
+                head_dim=config.resolved_attention_head_dim,
+                norm_eps=config.norm_eps,
+                attention_backend=config.attention_backend,
+            )
         else:
             attn = attn_cls(
                 config.dim,
@@ -578,7 +616,7 @@ def _build_transformer_attention(config, block_id):
 
 
 def _build_gpt_position_modules(config):
-    head_dim = config.dim // config.num_heads
+    head_dim = config.resolved_attention_head_dim
     if config.position == "rope":
         return get_position("rope")(head_dim, config.max_seq_len, base=config.rope_base), None, None
     if config.position in {"gemma3_rope", "gemma4_rope", "qwen3_next_rope"}:
@@ -817,6 +855,46 @@ class GPT(BaseModel):
             for block in self._optimizer_transformer_blocks():
                 block.attn_conn.reset_dynamic_parameters()
                 block.ffn_conn.reset_dynamic_parameters()
+        if config.lora_rank > 0:
+            self._install_lora()
+
+    def enable_lora(self, rank, alpha=None):
+        require(self.config.lora_rank == 0, "LoRA is already enabled for this GPT")
+        require(type(rank) is int and rank > 0, "LoRA rank must be a positive integer")
+        alpha = rank if alpha is None else alpha
+        require(isinstance(alpha, (int, float)) and math.isfinite(alpha) and alpha > 0, (
+            "LoRA alpha must be a finite positive number"
+        ))
+        self.config.lora_rank = rank
+        self.config.lora_alpha = float(alpha)
+        self._install_lora()
+        return self
+
+    def _install_lora(self):
+        targets = 0
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+        for block in self._optimizer_transformer_blocks():
+            for name in ("q_proj", "v_proj"):
+                linear = getattr(block.attn, name, None)
+                if linear is None:
+                    continue
+                require(isinstance(linear, nn.Linear), (
+                    f"LoRA target {type(block.attn).__name__}.{name} must be nn.Linear"
+                ))
+                setattr(
+                    block.attn,
+                    name,
+                    LoRALinear(linear, self.config.lora_rank, self.config.lora_alpha),
+                )
+                targets += 1
+        require(targets > 0, "LoRA requires attention modules with q_proj or v_proj targets")
+
+    def reference_config(self):
+        config = self.config.to_dict()
+        config["lora_rank"] = 0
+        config["lora_alpha"] = 1.0
+        return config
 
     def muon_auxiliary_modules(self):
         modules = [self.tok_emb, self.lm_head]
@@ -844,7 +922,7 @@ class GPT(BaseModel):
                 setter(warmup_active)
 
     def supports_qk_clip(self):
-        return transformer_supports_qk_clip(self.blocks)
+        return self.config.lora_rank == 0 and transformer_supports_qk_clip(self.blocks)
 
     def auxiliary_loss(self):
         return transformer_auxiliary_loss(self.blocks, self.config.ffn, next(self.parameters()))

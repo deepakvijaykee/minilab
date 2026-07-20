@@ -1,6 +1,6 @@
 import torch
 
-from minilab.base import BaseModel, unwrap_model
+from minilab.base import BaseModel, BaseTokenizer, unwrap_model
 from minilab.checks import require, require_finite_number, require_integer
 from minilab.config import BaseConfig
 
@@ -100,7 +100,9 @@ def _config_vocab_size(model_core, context):
     return config_state["vocab_size"]
 
 
-def _stop_requested(ids, prompt_len, stop_texts, tokenizer):
+def _stop_requested(ids, prompt_len, stop_texts, tokenizer, stop_token_ids=()):
+    if stop_token_ids and int(ids[0, -1].item()) in stop_token_ids:
+        return True
     if not stop_texts:
         return False
     tail = tokenizer.decode(ids[0, prompt_len:].tolist())
@@ -233,7 +235,8 @@ def generate(
     use_cache=True,
 ):
     """Autoregressive sampling. temperature=0 for greedy.
-    stop_texts: list of strings that trigger early stopping (batch_size=1 only, requires tokenizer)."""
+    stop_texts: list of strings that trigger early stopping (batch_size=1 only, requires tokenizer).
+    A BaseTokenizer's stop_token_ids are also honored when tokenizer is supplied."""
     _require_eval_model(model, "generate")
     model_core = _require_base_model(model, "generate")
     _validate_prompt_token_ids(prompt_ids, _config_vocab_size(model_core, "generate"), "generate")
@@ -250,9 +253,14 @@ def generate(
     require(top_k >= 0, "top_k must be >= 0")
     require(0 < top_p <= 1, "top_p must be in (0, 1]")
     require(repetition_penalty > 0, "repetition_penalty must be > 0")
-    if stop_texts:
-        require(tokenizer is not None, "stop_texts requires tokenizer")
-        require(prompt_ids.size(0) == 1, "stop_texts only supported for batch_size=1")
+    stop_token_ids = (
+        tokenizer.stop_token_ids if isinstance(tokenizer, BaseTokenizer) else ()
+    )
+    if stop_texts or stop_token_ids:
+        require(tokenizer is not None, "tokenizer-driven stopping requires tokenizer")
+        require(prompt_ids.size(0) == 1, (
+            "tokenizer-driven stopping only supports batch_size=1"
+        ))
     device = next(model.parameters()).device
     ids = prompt_ids.to(device)
     if max_new_tokens == 0:
@@ -276,6 +284,7 @@ def generate(
             stop_texts,
             tokenizer,
             prompt_len,
+            stop_token_ids,
         )
 
     for _ in range(max_new_tokens):
@@ -287,10 +296,10 @@ def generate(
 
         ids = torch.cat([ids, next_id], dim=1)
 
-        if stop_texts:
-            tail = tokenizer.decode(ids[0, prompt_len:].tolist())
-            if any(s in tail for s in stop_texts):
-                break
+        if _stop_requested(
+            ids, prompt_len, stop_texts, tokenizer, stop_token_ids
+        ):
+            break
 
     return ids
 
@@ -306,6 +315,7 @@ def _generate_cached(
     stop_texts,
     tokenizer,
     prompt_len,
+    stop_token_ids,
 ):
     logits, cache = model.forward_cached(ids)
     for _ in range(max_new_tokens):
@@ -314,10 +324,10 @@ def _generate_cached(
         next_id = _sample_next_token(next_logits, temperature, top_k, top_p)
         ids = torch.cat([ids, next_id], dim=1)
 
-        if stop_texts:
-            tail = tokenizer.decode(ids[0, prompt_len:].tolist())
-            if any(s in tail for s in stop_texts):
-                break
+        if _stop_requested(
+            ids, prompt_len, stop_texts, tokenizer, stop_token_ids
+        ):
+            break
         if ids.size(1) == prompt_len + max_new_tokens:
             break
         logits, cache = model.forward_cached(next_id, cache)

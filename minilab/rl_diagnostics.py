@@ -191,6 +191,170 @@ def rollout_records(trainer_name, step, algorithm, batch, rollout, max_records):
     return records
 
 
+def agentic_rollout_records(trainer_name, step, algorithm, rollout, max_records):
+    if max_records <= 0 or not rollout.tool_completions:
+        return []
+    require(len(rollout.tool_completions) == rollout.rewards.size(1), (
+        "agentic tool completion count must match reward generations"
+    ))
+    require(len(rollout.answer_completions) == rollout.rewards.size(1), (
+        "agentic answer completion count must match reward generations"
+    ))
+    require(len(rollout.tool_observations) == rollout.rewards.size(1), (
+        "agentic observation count must match reward generations"
+    ))
+    records = []
+    rewards = rollout.rewards.detach().cpu()
+    answer_adv = rollout.adv.detach().cpu()
+    tool_adv = rollout.tool_adv.detach().cpu()
+    for k, tool_completions in enumerate(rollout.tool_completions):
+        tool_masks = rollout.tool_completion_masks[k]
+        answer_completions = rollout.answer_completions[k]
+        answer_masks = rollout.answer_completion_masks[k]
+        require(tool_completions.size(0) == answer_completions.size(0), (
+            "agentic tool and answer completion batches must match"
+        ))
+        require(len(rollout.tool_observations[k]) == tool_completions.size(0), (
+            "agentic observations must match their completion batch"
+        ))
+        for b in range(tool_completions.size(0)):
+            if len(records) >= max_records:
+                return records
+            tool_length = int(tool_masks[b].sum().item())
+            answer_length = int(answer_masks[b].sum().item())
+            record = {
+                "schema": SCHEMA,
+                "kind": "agentic_trajectory",
+                "trainer": trainer_name,
+                "algorithm": algorithm,
+                "step": int(step),
+                "prompt_index": int(b),
+                "generation_index": int(k),
+                "reward": float(rewards[b, k].item()),
+                "tool_advantage": float(tool_adv[b, k].item()),
+                "advantage": float(answer_adv[b, k].item()),
+                "tool_completion_length": tool_length,
+                "answer_completion_length": answer_length,
+                "completion_length": tool_length + answer_length,
+                "tool_completion_tokens": (
+                    tool_completions[b, :tool_length].detach().cpu().tolist()
+                ),
+                "answer_completion_tokens": (
+                    answer_completions[b, :answer_length].detach().cpu().tolist()
+                ),
+                "completion_tokens": (
+                    answer_completions[b, :answer_length].detach().cpu().tolist()
+                ),
+                "tool_observation": rollout.tool_observations[k][b],
+                "accepted_for_training": True,
+                "drop_reason": "",
+                "policy_version": int(step),
+                "rollout_version": int(step),
+                "trajectory_age": 0,
+            }
+            for name, values in (rollout.reward_components or {}).items():
+                record[f"reward_component_{name}"] = float(values[b, k].item())
+            records.append(record)
+    return records
+
+
+def agentic_trajectory_rollout_records(
+    trainer_name,
+    step,
+    algorithm,
+    rollout,
+    max_records,
+    *,
+    advantage_estimator="group_standardized",
+    loss_normalizer="response_length",
+):
+    if max_records <= 0 or not rollout.first_tool_completions:
+        return []
+    generations = rollout.rewards.size(1)
+    for name in (
+        "first_tool_completions",
+        "second_tool_completions",
+        "answer_completions",
+        "trajectory_observations",
+    ):
+        require(len(getattr(rollout, name)) == generations, (
+            f"agentic trajectory {name} count must match reward generations"
+        ))
+    records = []
+    rewards = rollout.rewards.detach().cpu()
+    answer_adv = rollout.adv.detach().cpu()
+    first_adv = rollout.first_tool_adv.detach().cpu()
+    second_adv = rollout.second_tool_adv.detach().cpu()
+    for k, first_completions in enumerate(rollout.first_tool_completions):
+        first_masks = rollout.first_tool_completion_masks[k]
+        second_completions = rollout.second_tool_completions[k]
+        second_masks = rollout.second_tool_completion_masks[k]
+        answer_completions = rollout.answer_completions[k]
+        answer_masks = rollout.answer_completion_masks[k]
+        batch_size = first_completions.size(0)
+        require(
+            second_completions.size(0) == batch_size
+            and answer_completions.size(0) == batch_size,
+            "agentic trajectory completion batches must match",
+        )
+        require(len(rollout.trajectory_observations[k]) == batch_size, (
+            "agentic trajectory observations must match their completion batch"
+        ))
+        for b in range(batch_size):
+            if len(records) >= max_records:
+                return records
+            first_length = int(first_masks[b].sum().item())
+            second_length = int(second_masks[b].sum().item())
+            answer_length = int(answer_masks[b].sum().item())
+            first_observation, second_observation = (
+                rollout.trajectory_observations[k][b]
+            )
+            record = {
+                "schema": SCHEMA,
+                "kind": "agentic_two_tool_trajectory",
+                "trainer": trainer_name,
+                "algorithm": algorithm,
+                "advantage_estimator": advantage_estimator,
+                "loss_normalizer": loss_normalizer,
+                "step": int(step),
+                "prompt_index": int(b),
+                "generation_index": int(k),
+                "reward": float(rewards[b, k].item()),
+                "first_tool_advantage": float(first_adv[b, k].item()),
+                "second_tool_advantage": float(second_adv[b, k].item()),
+                "advantage": float(answer_adv[b, k].item()),
+                "first_tool_completion_length": first_length,
+                "second_tool_completion_length": second_length,
+                "answer_completion_length": answer_length,
+                "completion_length": (
+                    first_length + second_length + answer_length
+                ),
+                "first_tool_completion_tokens": (
+                    first_completions[b, :first_length].detach().cpu().tolist()
+                ),
+                "second_tool_completion_tokens": (
+                    second_completions[b, :second_length].detach().cpu().tolist()
+                ),
+                "answer_completion_tokens": (
+                    answer_completions[b, :answer_length].detach().cpu().tolist()
+                ),
+                "completion_tokens": (
+                    answer_completions[b, :answer_length].detach().cpu().tolist()
+                ),
+                "first_tool_observation": first_observation,
+                "second_tool_observation": second_observation,
+                "accepted_for_training": True,
+                "drop_reason": "",
+                "policy_version": int(step),
+                "rollout_version": int(step),
+                "trajectory_age": 0,
+            }
+            for name, values in (rollout.reward_components or {}).items():
+                record[f"reward_component_{name}"] = float(values[b, k].item())
+            records.append(record)
+    return records
+
+
 def vpo_rollout_records(trainer_name, step, algorithm, rollout, max_records):
     if max_records <= 0 or not rollout.completions:
         return []
@@ -244,6 +408,8 @@ def gallery_sections(records):
         "wrong_answer_good_format": [],
         "answer_without_required_format": [],
         "verifier_or_timeout_failure": [],
+        "proxy_reward_hack": [],
+        "metamorphic_disagreement": [],
         "stale": [],
         "malformed_or_dropped": [],
     }
@@ -263,6 +429,10 @@ def gallery_sections(records):
             sections["answer_without_required_format"].append(record)
         if record.get("reward_component_timeout_free") == 0.0 or record.get("reward_component_syntax") == 0.0:
             sections["verifier_or_timeout_failure"].append(record)
+        if record.get("reward_component_reward_hack") == 1.0:
+            sections["proxy_reward_hack"].append(record)
+        if record.get("reward_component_proxy_metamorphic_disagreement") == 1.0:
+            sections["metamorphic_disagreement"].append(record)
         if reward > 0:
             sections["successful"].append(record)
             if record.get("completion_length", 0) >= length_cut:

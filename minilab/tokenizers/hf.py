@@ -65,9 +65,94 @@ class HFTokenizer(BaseTokenizer):
         self._ensure_loaded()
         return self._tokenizer(text, add_special_tokens=False)["input_ids"]
 
+    def encode_prompt(self, text):
+        return self.encode_messages([{"role": "user", "content": text}])
+
+    @staticmethod
+    def _chat_template_ids(value):
+        # Transformers 4.x returns a list here, while 5.x may return a
+        # BatchEncoding even without return_tensors. Normalize both public
+        # shapes before enforcing Minilab's tokenizer contract.
+        if hasattr(value, "keys") and "input_ids" in value:
+            value = value["input_ids"]
+        require(
+            type(value) is list
+            and all(type(token_id) is int and token_id >= 0 for token_id in value),
+            "HF chat template must produce a list of integer token ids",
+        )
+        return value
+
+    def encode_messages(self, messages):
+        self._ensure_loaded()
+        messages = self._validated_messages(messages)
+        if self._tokenizer.chat_template is None:
+            return super().encode_messages(messages)
+        ids = self._chat_template_ids(self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        ))
+        return ids
+
+    def encode_supervised(self, messages, response):
+        self._ensure_loaded()
+        messages = self._validated_messages(messages)
+        require(type(response) is str and response, (
+            "supervised response must be a non-empty string"
+        ))
+        if self._tokenizer.chat_template is None:
+            return super().encode_supervised(messages, response)
+
+        prompt_ids = self.encode_messages(messages)
+        full_ids = self._chat_template_ids(self._tokenizer.apply_chat_template(
+            [*messages, {"role": "assistant", "content": response}],
+            tokenize=True,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        ))
+        require(full_ids[:len(prompt_ids)] == prompt_ids, (
+            "HF supervised chat template must preserve the generation-prompt prefix"
+        ))
+        response_ids = full_ids[len(prompt_ids):]
+        require(response_ids, "HF supervised chat template produced no assistant target tokens")
+        return prompt_ids, response_ids
+
+    def encode_agentic_continuation(
+        self,
+        messages,
+        prefix_ids,
+        assistant_ids,
+        observation,
+    ):
+        self._ensure_loaded()
+        messages = self._validated_messages(messages)
+        require(messages[-1] == {"role": "user", "content": observation}, (
+            "agentic continuation history must end with its observation"
+        ))
+        if self._tokenizer.chat_template is None:
+            return super().encode_agentic_continuation(
+                messages,
+                prefix_ids,
+                assistant_ids,
+                observation,
+            )
+        return self.encode_messages(messages)
+
     def decode(self, ids):
         self._ensure_loaded()
         return self._tokenizer.decode(ids, skip_special_tokens=True)
+
+    @property
+    def stop_token_ids(self):
+        self._ensure_loaded()
+        eos_token_id = self._tokenizer.eos_token_id
+        if eos_token_id is None:
+            return ()
+        require(type(eos_token_id) is int and eos_token_id >= 0, (
+            "HF tokenizer eos_token_id must be a non-negative integer"
+        ))
+        return (eos_token_id,)
 
     @property
     def vocab_size(self):

@@ -82,10 +82,33 @@ python scripts/hf_inspect.py --list-presets
 The import step maps Hugging Face weights into Minilab's native GPT
 format so that the resulting checkpoint loads through the same code
 path as a from-scratch checkpoint. After import, every native trainer,
-sampler, and evaluator works without modification. Only Llama-compatible
-weights import cleanly today. SmolLM2 works end to end. Qwen3 and Gemma3
-round-trip through inspection and generation
-but fail the import model-type guard until their weight mappings have
-been validated against the native GPT config. The guard lives in
-`scripts/import_hf.py::_native_config` and is the right place to look
-when extending the track to a new model family.
+sampler, and evaluator works without modification. Llama-compatible SmolLM2
+and dense Qwen3 models import natively today. Qwen3 mapping includes its
+explicit attention head dimension and per-head Q/K normalization and is
+guarded by logit verification. Gemma3 remains inspection/generation-only until
+its native weight mapping is validated.
+
+Qwen3 requires Transformers 4.51 or newer. Import and verify it with:
+
+```bash
+MODEL=qwen3-0.6b DEVICE=cpu bash recipes/hf_to_native/02_import/run.sh
+```
+
+For native alignment tasks, an imported instruction tokenizer owns its upstream
+chat template at both generation and supervised-training boundaries. SFT and
+preference labels cover only assistant response tokens, including the upstream
+turn terminator; ordinary `encode()` calls and completion decoding remain plain
+text. Exact-output Qwen3 runs use non-thinking mode so reasoning prefixes do not
+invalidate code or tool envelopes. Agentic follow-up and supervised examples
+rebuild the full user -> assistant -> environment -> assistant context; native
+tokenizers retain their original token-concatenation path.
+
+When a tokenizer is supplied to ordinary generation, its saved EOS token also
+terminates the response. This is required for raw-code tasks without an
+application-level closing tag; decoded text would otherwise continue into a
+second turn after a correct function.
+
+Use `scripts/sft.py --dataset structured_output` to train the exact raw-Python,
+tool-call, and final-answer contracts. That curriculum rejects examples that
+would be truncated; require a non-uniform strict answer-reward group before
+continuing into group-relative RL.

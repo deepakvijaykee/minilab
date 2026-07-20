@@ -58,6 +58,7 @@ class TrainConfig(BaseConfig):
     save_dir: str = "checkpoints"
     eval_steps: int = 50
     resume_from: str = ""
+    initial_checkpoint: str = ""
     token_superposition_size: int = 1
     token_superposition_steps: int = 0
     rl_metrics_every: int = 0
@@ -99,6 +100,9 @@ class TrainConfig(BaseConfig):
         require(self.token_superposition_steps >= 0, "token_superposition_steps must be >= 0")
         require(self.rl_metrics_every >= 0, "rl_metrics_every must be >= 0")
         require(self.rl_trace_samples >= 0, "rl_trace_samples must be >= 0")
+        require(type(self.initial_checkpoint) is str, (
+            "initial_checkpoint must be a string"
+        ))
         require(self.token_superposition_size == 1 or self.token_superposition_steps > 0, (
             "token_superposition_size > 1 requires token_superposition_steps > 0"
         ))
@@ -121,7 +125,8 @@ def _decay_progress(update, warmup, total):
 
 def optimizer_decay_groups(model, params, weight_decay):
     core = unwrap_model(model)
-    params = list(params)
+    params = [param for param in params if param.requires_grad]
+    require(params, "optimizer requires at least one trainable parameter")
     no_weight_decay_names = set(core.no_weight_decay_parameter_names())
     weight_decay_names = set(core.weight_decay_parameter_names())
     no_weight_decay_ids = {
@@ -374,6 +379,12 @@ class Trainer:
         model = unwrap_model(self.model)
         if self.config.optimizer in {"muon", "soft_muon"}:
             hidden, aux_matrices, biases = model.muon_parameter_groups()
+            hidden = [param for param in hidden if param.requires_grad]
+            aux_matrices = [param for param in aux_matrices if param.requires_grad]
+            biases = [param for param in biases if param.requires_grad]
+            require(hidden or aux_matrices or biases, (
+                "optimizer requires at least one trainable parameter"
+            ))
             soft_muon = self.config.optimizer == "soft_muon"
             return Muon([
                 {

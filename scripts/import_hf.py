@@ -40,14 +40,17 @@ def _rope_base(hf_config):
 def _native_config(hf_config, max_seq_len):
     data = hf_config.to_dict()
     model_type = data.get("model_type")
-    require(model_type == "llama", (
-        f"Only Llama-compatible HF models are currently importable, got model_type={model_type!r}. "
-        "SmolLM2 is supported; Qwen3/Gemma need separate mapping validation."
+    require(model_type in {"llama", "qwen3"}, (
+        f"Only Llama-compatible and dense Qwen3 HF models are currently importable, "
+        f"got model_type={model_type!r}. Gemma needs separate mapping validation."
     ))
     require(data.get("hidden_act") == "silu", "HF import currently requires hidden_act='silu'")
     require(data.get("attention_bias") is False, "HF import currently requires attention_bias=false")
-    require(data.get("mlp_bias") is False, "HF import currently requires mlp_bias=false")
+    require(data.get("mlp_bias", False) is False, "HF import currently requires mlp_bias=false")
     require(data.get("tie_word_embeddings") is True, "HF import currently requires tied input/output embeddings")
+    require(float(data.get("attention_dropout", 0.0)) == 0.0, (
+        "HF import currently requires attention_dropout=0"
+    ))
 
     dim = int(data["hidden_size"])
     heads = int(data["num_attention_heads"])
@@ -60,6 +63,15 @@ def _native_config(hf_config, max_seq_len):
     require(kv_heads > 0, "HF num_key_value_heads must be positive")
     require(dim % heads == 0, "HF hidden_size must be divisible by num_attention_heads")
     require(intermediate > 0, "HF intermediate_size must be positive")
+    head_dim = int(data.get("head_dim", dim // heads))
+    require(head_dim > 0, "HF head_dim must be positive")
+    if model_type == "qwen3":
+        require(not data.get("use_sliding_window", False), (
+            "Dense Qwen3 import does not support sliding-window attention"
+        ))
+        require(data.get("sliding_window") is None, (
+            "Dense Qwen3 import requires sliding_window=null"
+        ))
 
     return GPTConfig(
         vocab_size=int(data["vocab_size"]),
@@ -67,11 +79,16 @@ def _native_config(hf_config, max_seq_len):
         num_layers=int(data["num_hidden_layers"]),
         num_heads=heads,
         num_kv_heads=kv_heads,
+        attention_head_dim=head_dim if model_type == "qwen3" else 0,
         max_seq_len=max_seq_len,
         dropout=0.0,
         ffn_mult=intermediate / dim,
         norm_eps=float(data.get("rms_norm_eps", 1e-6)),
-        attention="gqa" if kv_heads != heads else "mha",
+        attention=(
+            "gqa_qknorm"
+            if model_type == "qwen3"
+            else ("gqa" if kv_heads != heads else "mha")
+        ),
         position="rope",
         norm="rmsnorm",
         ffn="swiglu",
@@ -79,7 +96,7 @@ def _native_config(hf_config, max_seq_len):
     )
 
 
-def _map_llama_state(hf_state, native_model):
+def _map_decoder_state(hf_state, native_model):
     native_state = native_model.state_dict()
     mapped = {
         "tok_emb.weight": hf_state["model.embed_tokens.weight"],
@@ -102,6 +119,11 @@ def _map_llama_state(hf_state, native_model):
             f"{dst}.ffn.w2.weight": hf_state[f"{src}.mlp.up_proj.weight"],
             f"{dst}.ffn.w3.weight": hf_state[f"{src}.mlp.down_proj.weight"],
         })
+        if native_model.config.attention == "gqa_qknorm":
+            mapped.update({
+                f"{dst}.attn.q_norm.weight": hf_state[f"{src}.self_attn.q_norm.weight"],
+                f"{dst}.attn.k_norm.weight": hf_state[f"{src}.self_attn.k_norm.weight"],
+            })
 
     missing = sorted(set(native_state) - set(mapped))
     missing = [key for key in missing if not key.endswith("pos_enc.inv_freq")]
@@ -165,7 +187,7 @@ hf_model = AutoModelForCausalLM.from_pretrained(
     **model_dtype_kwargs(torch.float32),
 )
 native_model = GPT(native_config)
-_map_llama_state(hf_model.state_dict(), native_model)
+_map_decoder_state(hf_model.state_dict(), native_model)
 
 save_dir.mkdir(parents=True, exist_ok=True)
 tokenizer_dir = save_dir / "hf_tokenizer"

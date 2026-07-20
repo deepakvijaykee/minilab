@@ -1,5 +1,9 @@
 from minilab.alignment_common import resolve_reference_path
 from minilab.online_rl import (
+    AgenticTrajectoryTrainer,
+    AgenticTrajectoryTrainConfig,
+    AgenticTurnTrainConfig,
+    AgenticTurnTrainer,
     ASPOTrainer,
     DAPOTrainConfig,
     DAPOTrainer,
@@ -52,6 +56,10 @@ from minilab.preference_alignment import (
 )
 
 __all__ = [
+    "AgenticTrajectoryTrainer",
+    "AgenticTrajectoryTrainConfig",
+    "AgenticTurnTrainConfig",
+    "AgenticTurnTrainer",
     "CPOTrainConfig",
     "CPOTrainer",
     "ASPOTrainer",

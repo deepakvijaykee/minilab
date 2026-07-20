@@ -128,29 +128,43 @@ class MultiHeadAttention(_QKClipMixin, nn.Module):
 @register_attention("gqa")
 class GroupedQueryAttention(_QKClipMixin, nn.Module):
 
-    def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0, attention_backend=DEFAULT_ATTENTION_BACKEND):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        num_kv_heads,
+        dropout=0.0,
+        attention_backend=DEFAULT_ATTENTION_BACKEND,
+        head_dim=None,
+    ):
         super().__init__()
         require(dim > 0, "dim must be > 0")
         require(num_heads > 0, "num_heads must be > 0")
         require(num_kv_heads > 0, "num_kv_heads must be > 0")
-        require(dim % num_heads == 0, "dim must be divisible by num_heads")
+        require(head_dim is not None or dim % num_heads == 0, (
+            "dim must be divisible by num_heads when head_dim is not supplied"
+        ))
+        if head_dim is None:
+            head_dim = dim // num_heads
+        require(type(head_dim) is int and head_dim > 0, "head_dim must be a positive integer")
         require(num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads")
         require(0.0 <= dropout < 1.0, "dropout must be in [0, 1)")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim
         self.kv_group_size = num_heads // num_kv_heads
         self.dropout = dropout
         self.attention_backend = attention_backend
-        self.q_proj = nn.Linear(dim, dim, bias=False)
+        q_dim = num_heads * self.head_dim
+        self.q_proj = nn.Linear(dim, q_dim, bias=False)
         kv_dim = num_kv_heads * self.head_dim
         self.k_proj = nn.Linear(dim, kv_dim, bias=False)
         self.v_proj = nn.Linear(dim, kv_dim, bias=False)
-        self.out = nn.Linear(dim, dim, bias=False)
+        self.out = nn.Linear(q_dim, dim, bias=False)
         self._init_qk_clip(num_heads)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False, past_kv=None, return_kv=False):
-        B, T, C = x.shape
+        B, T, _ = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -187,7 +201,7 @@ class GroupedQueryAttention(_QKClipMixin, nn.Module):
             backend=self.attention_backend,
             causal_offset=causal_offset,
         )
-        out = self.out(out.transpose(1, 2).reshape(B, T, C))
+        out = self.out(out.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim))
         if return_kv:
             return out, cache
         return out
@@ -251,10 +265,26 @@ class MultiHeadQKNormAttention(_QKNormClipMixin, MultiHeadAttention):
 class GroupedQueryQKNormAttention(_QKNormClipMixin, GroupedQueryAttention):
     """Qwen3/Gemma/GLM-style GQA with per-head RMSNorm on Q and K."""
 
-    def __init__(self, dim, num_heads, num_kv_heads, dropout=0.0, attention_backend=DEFAULT_ATTENTION_BACKEND):
-        super().__init__(dim, num_heads, num_kv_heads, dropout, attention_backend=attention_backend)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        num_kv_heads,
+        dropout=0.0,
+        attention_backend=DEFAULT_ATTENTION_BACKEND,
+        head_dim=None,
+        norm_eps=1e-6,
+    ):
+        super().__init__(
+            dim,
+            num_heads,
+            num_kv_heads,
+            dropout,
+            head_dim=head_dim,
+            attention_backend=attention_backend,
+        )
+        self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
 
     def _project_qkv(self, x):
         B, T, _ = x.shape
@@ -269,7 +299,7 @@ class GroupedQueryQKNormAttention(_QKNormClipMixin, GroupedQueryAttention):
         return apply_rotary_emb(q, k, *freqs_cis)
 
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False, past_kv=None, return_kv=False):
-        B, T, C = x.shape
+        B, T, _ = x.shape
         q, k, v = self._project_qkv(x)
         q, k = self._apply_position(q, k, freqs_cis)
         k, v, past_len = _append_kv_cache(k, v, past_kv)
@@ -300,7 +330,7 @@ class GroupedQueryQKNormAttention(_QKNormClipMixin, GroupedQueryAttention):
             backend=self.attention_backend,
             causal_offset=causal_offset,
         )
-        out = self.out(out.transpose(1, 2).reshape(B, T, C))
+        out = self.out(out.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim))
         if return_kv:
             return out, cache
         return out

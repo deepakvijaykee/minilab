@@ -88,6 +88,9 @@ class BaseModel(nn.Module):
     def supports_hidden_continuation(self):
         return False
 
+    def reference_config(self):
+        return self.config.to_dict()
+
     def token_superposition_loss(self, idx, targets, bag_size):
         raise ValueError(f"{type(self).__name__} does not support token-superposition training")
 
@@ -189,6 +192,89 @@ def validate_token_ids(ids, vocab_size, max_seq_len, context):
 
 
 class BaseTokenizer:
+
+    @staticmethod
+    def _validated_messages(messages):
+        require(type(messages) is list and messages, (
+            "tokenizer conversation requires a non-empty message list"
+        ))
+        normalized = []
+        for message in messages:
+            require(type(message) is dict and set(message) == {"role", "content"}, (
+                "conversation messages must contain exactly role and content"
+            ))
+            role = message["role"]
+            content = message["content"]
+            require(role in {"system", "user", "assistant"}, (
+                f"unsupported conversation role: {role!r}"
+            ))
+            require(type(content) is str and content, (
+                "conversation message content must be a non-empty string"
+            ))
+            normalized.append({"role": role, "content": content})
+        return normalized
+
+    def encode_messages(self, messages):
+        """Encode a conversation context ending at an assistant generation boundary."""
+        messages = self._validated_messages(messages)
+        return self.encode("".join(message["content"] for message in messages))
+
+    def encode_prompt(self, text):
+        """Encode a user prompt for generation.
+
+        Native tokenizers have no conversation envelope, so their prompt
+        encoding is identical to ordinary text encoding. Tokenizers backed by
+        an instruction model can override this boundary while keeping the
+        conversation format owned by the tokenizer.
+        """
+        return self.encode_messages([{"role": "user", "content": text}])
+
+    def encode_supervised(self, messages, response):
+        """Return context and assistant-target IDs for supervised alignment."""
+        messages = self._validated_messages(messages)
+        require(type(response) is str and response, (
+            "supervised response must be a non-empty string"
+        ))
+        return self.encode_messages(messages), self.encode(response)
+
+    @property
+    def stop_token_ids(self):
+        """Token IDs that terminate ordinary autoregressive generation."""
+        return ()
+
+    def encode_agentic_followup(
+        self,
+        user_prompt,
+        assistant_response,
+        observation,
+        prompt_ids,
+        assistant_ids,
+    ):
+        """Encode the full context for a model -> environment -> model turn."""
+        return self.encode_agentic_continuation(
+            [
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": assistant_response},
+                {"role": "user", "content": observation},
+            ],
+            prompt_ids,
+            assistant_ids,
+            observation,
+        )
+
+    def encode_agentic_continuation(
+        self,
+        messages,
+        prefix_ids,
+        assistant_ids,
+        observation,
+    ):
+        """Encode one more environment observation after an assistant turn."""
+        messages = self._validated_messages(messages)
+        require(messages[-1] == {"role": "user", "content": observation}, (
+            "agentic continuation history must end with its observation"
+        ))
+        return list(prefix_ids) + list(assistant_ids) + self.encode(observation)
 
     def save(self, path):
         path = Path(path)
