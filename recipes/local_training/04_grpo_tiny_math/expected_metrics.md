@@ -3,19 +3,18 @@
 Policy loss oscillates rather than descending smoothly, because GRPO's
 advantage is group-relative: it is the within-group z-score of the
 verifier rewards. With `num_generations=2`, the advantage collapses to
-zero whenever both completions in the group get the same verifier
+zero whenever both rollouts in the group get the same verifier
 score, which at this scale happens on most prompts. The non-trivial
 loss steps are the prompts where the two rollouts genuinely disagreed,
-and those are the only steps where the policy is actually learning
-anything from the verifier signal.
+and those are the only steps where the policy learns anything from the
+verifier signal.
 
 `Frozen reference:` prints at startup for every algorithm except DAPO.
 DAPO removes the KL penalty entirely, and with it the reference model,
 and relies on asymmetric `clip_ratio_low` and `clip_ratio_high` to
 keep policy updates near the rollout distribution. RLOO sits between
 the two: it drops the clip entirely and uses an unclipped REINFORCE
-estimator with a leave-one-out baseline that is exact rather than
-clipped.
+estimator with an unbiased leave-one-out baseline.
 
 The eval block at the end of the run prints up to five
 `Q/A/(predicted, expected, OK|WRONG)` lines and then a summary line of
@@ -25,9 +24,9 @@ evaluates on the full split, which is slower but more representative.
 
 Single-digit accuracy after a hundred steps with two generations per
 prompt is what the rollout budget predicts. The group-relative signal
-only exists on prompts where the two generations disagree, and the
-right way to multiply that signal is to lift `NUM_GENERATIONS` to four
-or eight rather than to take more steps at group size two. Each step
+only exists on prompts where the two rollouts disagree, and the way to
+increase it is to lift `NUM_GENERATIONS` to four or eight rather than to
+take more steps at group size two. Each step
 becomes more expensive, but each step also carries far more gradient
 information per unit of compute.
 

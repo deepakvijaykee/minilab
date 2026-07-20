@@ -1,6 +1,6 @@
 # When Does Verifier-Guided RL Help a Small Tool-Using Model?
 
-## A controlled study of reachability, retention, matched efficacy, and objective geometry
+## A controlled study of reachability, retention, matched efficacy, and objective normalization
 
 ## Abstract
 
@@ -25,15 +25,15 @@ same intervention damaged prior behavior until canonical-biased replay turned
 the handoff into a constrained curriculum.
 
 Once reachability and retention were both in place, verifier-guided RL produced
-repeatable held-out gains. At the first checkpoint passing a frozen signal
-selector, a 20-step learned continuation improved over matched no-learning
+repeatable held-out gains. At the first checkpoint passing a frozen selector, a 20-step
+learned continuation improved over matched no-learning
 controls in all five seeds, by 20.31 points on average (95% CI
 [3.07, 37.56]). Its weaker predecessor also learned under the longer rollout
-budget, revealing that the apparent competence boundary was really a boundary
-of *finite-budget observability*. A fresh 2x2 objective study reproduced the
+budget, revealing that the apparent competence boundary was really a limit of
+the *finite sampling budget*. A fresh 2x2 objective study reproduced the
 learning effect in every arm and seed. The objective factors changed completion
 length more clearly than reward, separating policy efficacy from response
-geometry.
+length.
 
 The resulting picture is a staged learning system:
 
@@ -43,7 +43,7 @@ The resulting picture is a staged learning system:
 ## Research thesis
 
 The core object is the joint distribution induced by the policy and the
-environment, not the training algorithm in isolation. For prompt \(x\), the
+environment, not the training algorithm in isolation. For prompt $x$, the
 policy samples an action, the environment returns an observation, and the next
 action is conditioned on that observation. A terminal verifier sees only the
 completed trajectory. Three distinct failures can all appear as "RL does not
@@ -81,7 +81,7 @@ improvement from becoming interchangeable stories.
 *Figure 1. Complete decision record. "Pass" means the declared gate for that
 stage was met; "Fail" means it was not; "Unclear" marks a diagnostic or an
 interval that left the downstream question unresolved. A dash means that the
-downstream question was intentionally not tested. Infrastructure smokes appear
+downstream question was intentionally not tested. Infrastructure sanity runs appear
 because they establish that the machinery executed, but they are not treated as
 learning evidence.*
 
@@ -106,8 +106,8 @@ learning evidence.*
   reported to locate the systems result and its resource regime.
 
 An "SFT step" in the competence map means one optimizer step along the fixed
-canonical-replay training trajectory. It is an operational index of this
-specific curriculum, not a portable unit of model capability.
+canonical-replay training trajectory. It is a step count specific to this
+curriculum, not a portable unit of model capability.
 
 ### The exact two-tool task
 
@@ -140,20 +140,20 @@ were retained for diagnosis, but none was substituted for the strict endpoint.
 
 ### Why mixed groups are a prerequisite for the tested estimators
 
-For a prompt with group rewards \(r_1,\ldots,r_K\), the centered advantage is
+For a prompt with group rewards $r_1,\ldots,r_K$, the centered advantage is
 
-\[
+```math
 A_i^{\mathrm{centered}} = r_i - \bar r,
 \qquad
 \bar r = \frac{1}{K}\sum_{j=1}^{K} r_j.
-\]
+```
 
 The standardized form is
 
-\[
+```math
 A_i^{\mathrm{standardized}} =
 \frac{r_i-\bar r}{s_r + \epsilon}.
-\]
+```
 
 If every reward is zero, or every reward is one, then every centered advantage
 is zero. A **mixed group** contains at least one success and at least one
@@ -163,15 +163,15 @@ It is not a sufficient condition for useful learning: finite sampling can miss
 rare successes, and a nonzero estimator can still overfit or damage other
 skills.
 
-For fixed group size \(K=4\), the leave-one-out REINFORCE baseline does not
-define an independent directional experiment:
+For fixed group size $K=4$, the leave-one-out REINFORCE baseline is not an
+independent experimental arm:
 
-\[
+```math
 A_i^{\mathrm{LOO}}
 = r_i - \frac{1}{K-1}\sum_{j\ne i}r_j
 = \frac{K}{K-1}(r_i-\bar r)
 = \frac{4}{3}A_i^{\mathrm{centered}}.
-\]
+```
 
 Without compensating for this constant, a separate RLOO arm would primarily
 change effective gradient scale. It was therefore analyzed algebraically
@@ -185,16 +185,19 @@ number of steps, save/reload path, and evaluation protocol, but learning rate
 zero. The primary estimand was the seed-level difference in held-out strict
 reward:
 
-\[
+```math
 \Delta_s = \hat R_{s,\mathrm{learned}}-
            \hat R_{s,\mathrm{control}}.
-\]
+```
 
 This control absorbs sampling, checkpoint reload, evaluation, and continuation
 effects that a simple pre/post comparison cannot distinguish from learning.
-The reported 95% intervals are Student-\(t\) intervals over paired seed-level
-effects. With three or five seeds they are descriptive uncertainty summaries,
-not population-scale guarantees.
+The efficacy effects are summarized by Student-$t$ intervals over paired
+seed-level differences. With three or five seeds these are descriptive
+uncertainty summaries, not population-scale guarantees. The retention
+non-inferiority bounds in Section 6 are computed on the larger record-level
+audit rather than on the seed-level effects, which is why they are tighter
+than a three-seed interval over the same quantity would be.
 
 The three-seed studies used training seeds 17, 42, and 73. The competence and
 objective studies added seeds 101 and 137. Evaluation seeds and prompt blocks
@@ -231,7 +234,7 @@ whether to debug the implementation or change the policy.
 The initial engineering work established deterministic task generation,
 hidden and metamorphic verifier checks, native checkpoint conversion, LoRA
 wiring, multi-turn action attribution, checkpoint metadata, and end-to-end L4
-execution. A 7.37M-parameter smoke policy completed two separate 10-step CUDA
+execution. A 7.37M-parameter sanity-check policy completed two separate 10-step CUDA
 runs, but every completion degenerated to repeated `s` tokens. Rewards, reward
 variance, and advantages were all zero.
 
@@ -284,11 +287,11 @@ line joins the two measurements for one training seed.*
 
 Once reward varied, the next question was whether optimization improved the
 policy or merely improved its interaction with a small adaptive training
-stream. The relevant comparison was learned versus zero-learning continuation
+stream. The relevant comparison was learned versus no-learning continuation
 on new prompts, not the slope of training reward.
 
 The next experiment used a harder held-out suite and compared SFT-only, learned
-RL, and learning-rate-zero continuations across three seeds.
+RL, and no-learning continuations across three seeds.
 
 | Seed | SFT-only | Learned RL | No-learning control | Learned - control |
 |---:|---:|---:|---:|---:|
@@ -315,7 +318,7 @@ better-weighted examples.
 | Intervention | Key result across three seeds | Decision |
 |---|---|---|
 | Broad hard-task curriculum over 12 training code families | Held-out challenge code rose from 12.5% to 25.0% in every seed, below the declared 25-point gain; chained reward stayed 0% | Do not run RL |
-| Chain-weighted presentation SFT versus matched basic SFT | Exact intermediate arguments stayed 0% in every seed; some standard metrics regressed | Reject the curriculum |
+| Chain-weighted presentation SFT versus matched basic SFT | Exact intermediate arguments stayed 0% in every seed; some canonical metrics regressed | Reject the curriculum |
 | Seen/adjacent/fixed diagnostic | Exact arguments stayed 0% on sampled training rows, neighboring rows, and a fixed set in every seed | Replace the supervision unit |
 
 The seen-row failure is especially informative. It rules out a purely
@@ -345,14 +348,14 @@ strict two-tool reward changed as follows:
 
 First- and second-call component metrics rose with terminal reward, supporting
 the intended mechanism: the model learned to condition the second call on the
-environment observation. But standard code, single-tool, and answer-format
+environment observation. But canonical code, single-tool, and answer-format
 behavior regressed in every seed family. Reachability had been established;
 retention had not.
 
 ### 6. Replay was a constraint, not merely extra data
 
 An equal-family replay mixture kept two-tool reward high (78.125%, 71.875%, and
-78.125% across the three seeds) and repaired most small standard checks. It
+78.125% across the three seeds) and repaired most small retention checks. It
 still failed the larger frozen precision audit:
 
 - seed-level canonical reward effects were -10.417, -2.083, and +1.042 points;
@@ -365,7 +368,7 @@ in total across the paired candidates and controls. The checkpoint family was
 rejected. This is a case where a small preservation suite would have promoted
 the wrong policy.
 
-The next curriculum deliberately biased replay toward the canonical skills at
+The next curriculum biased replay toward the canonical skills at
 risk. Its 1,200 supervised records contained 400 raw examples, 500 canonical
 examples (250 tool and 250 answer), and 300 two-tool stages (100 for each
 trajectory stage). After 100 optimizer steps:
@@ -404,20 +407,20 @@ Each branch trained on 16 cases with four generations and was evaluated on
 eight untouched cases with four generations. Learned-minus-control strict
 reward effects were 0, +6.25, and +9.375 points. The mean was +5.208 points,
 with paired 95% CI [-6.65, +17.07]. Two of three seeds were positive and all
-standard retention checks passed.
+retention checks passed.
 
 The interval left three live models of the run: a useful effect obscured by
 seed variance, an update too small to matter, or a locally harmful update. A
 longer continuation of the same arms would have entangled these explanations
 with adaptation to the same stream. The next experiment instead increased
 resolution with a fresh competence map, five seeds, new prompts, and an explicit
-finite-budget selector.
+frozen selector.
 
 ### 8. The competence map measured information available under a fixed budget
 
 Five independent canonical-replay SFT trajectories were evaluated at optimizer
 steps 0, 25, 50, 75, and 100. Before observing outcomes, a checkpoint was
-declared signal-bearing only if it met all four criteria:
+declared informative only if it met all four criteria:
 
 - mean held-out mixed-group rate at least 20%;
 - mean short no-learning-probe mixed-group rate at least 20%;
@@ -436,11 +439,11 @@ probe used five no-learning steps over 16 prompts. The map was:
 | 100 | 68.750% | 97.5% | 80.0% | 76.0% | Pass |
 
 Step 50 and its step-25 predecessor were then compared on a fresh 20-step
-training and evaluation block: 16 prompts x four samples per arm and seed.
+training and evaluation block: 16 prompts with four samples per arm and seed.
 
 | Source checkpoint | Seed effects, learned - control | Mean effect | Paired 95% CI | Retention |
 |---|---|---:|---:|---|
-| SFT step 25 | +6.25, +4.6875, +10.9375, +3.125, +6.25 pp | +6.250 pp | [+2.620, +9.880] | One seed regressed single-tool standards |
+| SFT step 25 | +6.25, +4.6875, +10.9375, +3.125, +6.25 pp | +6.250 pp | [+2.620, +9.880] | One seed regressed single-tool retention |
 | SFT step 50 | +14.0625, +28.125, +6.25, +40.625, +12.5 pp | +20.313 pp | [+3.069, +37.556] | All five seeds preserved |
 
 Both checkpoint levels learned in all five seeds. The difference-in-differences
@@ -460,10 +463,10 @@ threshold.
 checkpoint passing the frozen selector. (B) The earlier three-seed, 10-step
 estimate remained inconclusive. (C) On a fresh 20-step block, both step 25 and
 step 50 improved over matched controls, but only step 50 preserved all monitored
-standard behavior. Points are seed effects; diamonds and bars are means and
+canonical behavior. Points are seed effects; diamonds and bars are means and
 two-sided 95% Student-t intervals.*
 
-### 9. Objective factorization separated efficacy from response geometry
+### 9. Objective factorization separated efficacy from response length
 
 The five accepted step-50 sources entered a fresh 2x2 experiment. It crossed:
 
@@ -472,7 +475,7 @@ The five accepted step-50 sources entered a fresh 2x2 experiment. It crossed:
 
 Each learned arm used the same 20-step budget and was compared with the same
 matched no-learning control. All learned arms improved held-out reward in all
-five seeds and preserved the standard suite:
+five seeds and preserved the retention suite:
 
 | Advantage | Token-loss normalization | Mean reward effect | Paired 95% CI | Positive seeds |
 |---|---|---:|---:|---:|
@@ -505,38 +508,39 @@ diamonds and bars are means and two-sided 95% Student-t intervals.*
 
 ### Supervision changes occupancy; RL changes probability within it
 
-For an on-policy objective, the task-directed update has the schematic form
+For an on-policy objective, the task-directed component of the gradient is
 
-\[
+```math
 g(\theta) =
 \mathbb{E}_{x,\tau\sim\pi_\theta}
 \left[A(x,\tau)\nabla_\theta\log\pi_\theta(\tau\mid x)\right].
-\]
+```
 
-The verifier determines \(A\), but the current policy determines which
+The verifier determines $A$, but the current policy determines which
 trajectories ever enter the expectation. When the 0.6B policy sampled no exact
 successes, centered task advantages vanished. Observation-conditioned SFT
-changed \(\pi_\theta(\tau\mid x)\): it moved successful trajectories into the
+changed $\pi_\theta(\tau\mid x)$: it moved successful trajectories into the
 sampled distribution. RL could then change their relative probability.
 
-This gives SFT and RL complementary roles. SFT is a support-acquisition
-operator; RL is an on-policy allocation operator. Their order is governed by
-the source policy, not by a universal recipe. A large pretrained model can
-begin in the signal-bearing regime, the setting exploited by RL-zero systems.
+This gives SFT and RL complementary roles. SFT expands the policy's
+support, moving successful trajectories into reach. RL then reallocates
+probability mass within that support. Their order is governed by the source
+policy, not by a universal recipe. A large pretrained model can begin in the
+informative regime, the setting exploited by RL-zero systems.
 The small exact-protocol model began outside it.
 
-### The decisive curriculum variable was causal state coverage
+### The decisive curriculum variable was state coverage
 
 A two-tool trajectory factorizes as
 
-\[
+```math
 \pi(a_1\mid x)\;P(o_1\mid x,a_1)\;
 \pi(a_2\mid x,a_1,o_1)\;P(o_2\mid \cdots)\;
 \pi(a_3\mid x,a_1,o_1,a_2,o_2).
-\]
+```
 
-Presentation-only data showed tokens resembling \(a_2\), but not under the
-conditioning state \((x,a_1,o_1)\) that determines them. The model failed even
+Presentation-only data showed tokens resembling $a_2$, but not under the
+conditioning state $(x,a_1,o_1)$ that determines them. The model failed even
 on sampled training rows, so adding nearby examples or increasing their weight
 could not address the mismatch. Genuine trajectories changed the supervised
 conditional itself. The 70.83-point reachability gain is best understood as a
@@ -549,45 +553,47 @@ under teacher states and unreliable under environment states.
 
 ### Competence controls information per rollout
 
-Let \(p_x\) be the policy's success probability on prompt \(x\). With group size
-\(K\), a binary-reward group is informative for a centered estimator with
+Let $p_x$ be the policy's success probability on prompt $x$. With group size
+$K$, a binary-reward group is informative for a centered estimator with
 probability
 
-\[
+```math
 q_K(p_x) = 1-p_x^K-(1-p_x)^K.
-\]
+```
 
-For a rollout budget of \(B\) prompt groups, the expected number of informative
-groups is approximately \(B\,\mathbb{E}_x[q_K(p_x)]\). This exposes three
-levers that are often conflated:
+For a rollout budget of $B$ prompt groups, the expected number of informative
+groups is $B\,\mathbb{E}_x[q_K(p_x)]$. This exposes three
+factors that are often conflated:
 
-- SFT or distillation changes \(p_x\);
-- group size changes \(q_K\) at fixed \(p_x\);
+- SFT or distillation changes $p_x$;
+- group size changes $q_K$ at fixed $p_x$;
 - rollout budget changes how often rare informative groups are encountered.
 
 The step-25 checkpoint makes the interaction visible. Its short probe found no
 mixed group, while the 20-step experiment found enough signal for positive
 effects in all five seeds. Step 50 moved substantially more prompts into the
-intermediate-competence band and produced a larger, fully retained effect. The
-"boundary" is therefore an operating point in competence x group size x budget
-space.
+intermediate-competence band. Its effect was larger in point estimate and
+fully retained, though the step-25/step-50 difference was not itself
+statistically resolved. The
+"boundary" is therefore an operating point in the joint space of
+competence, group size, and rollout budget.
 
 ### Replay is a behavioral constraint on the handoff
 
 The curriculum problem can be written as a constrained objective:
 
-\[
+```math
 \max_\theta R_{\text{two-tool}}(\theta)
 \quad\text{subject to}\quad
 R_j(\theta) \ge R_j(\theta_0)-\delta_j
 \quad\text{for each retained skill }j.
-\]
+```
 
 Trajectory-only SFT optimized the target and violated the constraints.
 Equal-family replay assigned symmetric data mass even though the empirical
 forgetting costs were asymmetric. Canonical-biased replay increased pressure
 on the active constraints and preserved the target gain. Replay weight is thus
-a control variable tied to measured behavior, not a bookkeeping choice about
+a control variable tied to measured behavior, not an incidental choice about
 dataset balance.
 
 ### Efficacy is a counterfactual; training reward is a trajectory statistic
@@ -604,14 +610,14 @@ then reproduced positive learned-minus-control effects on fresh blocks. The
 control is what converts an optimization trace into a statement about policy
 change.
 
-### Objective choice shapes the geometry of the update
+### Objective normalization reweights samples and tokens
 
 Reward standardization and response-length normalization change which samples
 and tokens receive weight. Dividing by within-group dispersion emphasizes
 low-variance groups; dividing by each realized response length changes the
 per-token scale as a function of the policy's own output length. Removing these
-normalizers changes the geometry of the update even when the reward function is
-unchanged.
+normalizers changes which samples and tokens dominate the gradient even when
+the reward function is unchanged.
 
 All four factorial arms learned, so the efficacy result was robust to the
 tested objective choices. The primary objective contrast changed response
@@ -651,22 +657,23 @@ trajectories to large-scale RL without preliminary SFT. Its full R1 pipeline
 also combines cold-start data and multi-stage training. The present competence
 map supplies a small-scale view of the same dependency: the role of supervision
 is to move the policy into a region where a finite rollout budget contains
-information, not to satisfy a ceremonial stage in a recipe.
+information, not to satisfy a nominal stage in a recipe.
 
 [Understanding R1-Zero-Like Training](https://arxiv.org/abs/2503.20783) likewise
 places substantial explanatory weight on the base policy and identifies a
 response-length bias induced by GRPO normalization. That motivates treating
 reward-dispersion and token-count denominators as explicit experimental factors.
 The factorial result here adds a useful separation: estimator choice can alter
-response geometry even when every objective produces a positive policy effect
+response length even when every objective produces a positive policy effect
 and their reward ordering remains unresolved.
 
 Capability-boundary work asks a deeper question than held-out pass@1. [Does RL
 Really Incentivize Reasoning Capacity Beyond the Base Model?](https://arxiv.org/abs/2504.13837)
-uses large-\(k\) evaluation to ask whether RL creates new successful modes or
+uses large-$k$ evaluation to ask whether RL creates new successful modes or
 compresses probability onto modes already present in the source policy. The
-Minilab experiments currently establish the latter observable, higher pass@1
-under short sampling. A large-\(k\) study is the natural bridge from policy
+Minilab experiments currently establish only the observable, higher pass@1
+under short sampling, which does not by itself distinguish compression from
+support expansion. A large-$k$ study is the natural bridge from policy
 improvement to support expansion.
 
 The trajectory-SFT result connects directly to distillation research.
@@ -697,7 +704,7 @@ Two implementation corrections changed the measurement itself:
 1. The first multi-stage RL implementation retained twelve computation graphs
    simultaneously and exceeded the L4's 21.62 GB memory. Streaming backward
    released each stage graph after contributing to the same accumulated
-   optimizer update. The corrected smoke used 4.49 GB and final runs used
+   optimizer update. The corrected sanity run used 4.49 GB and final runs used
    4.74-4.78 GB. The scientific invariant, one update from the same staged
    objective, was preserved.
 2. Evaluator semantics were treated as part of the measurement. EOS handling
@@ -730,7 +737,7 @@ Three- and five-seed paired intervals make seed variation visible, while the
 shared prompt generator keeps task-family variation narrow. The initial
 10-step and later 20-step experiments also change checkpoint, prompt block,
 seed count, and budget together. A common-grid follow-up is needed to estimate
-competence x rollout-budget interaction directly. The objective factorial
+competence-by-rollout-budget interaction directly. The objective factorial
 similarly needs more resolution to rank small reward effects that are currently
 subordinate to the replicated learned-versus-control effect.
 
@@ -740,7 +747,7 @@ The retention suite measures canonical code, single-tool behavior, and exact
 formatting. It provides a concrete constraint for this task family, while broad
 language, safety, and cross-domain retention remain separate axes. On the target
 side, pass@1 and pass@4 measure probability concentration under short sampling.
-Large-\(k\) coverage and trajectory novelty would distinguish search compression
+Large-$k$ coverage and trajectory novelty would distinguish search compression
 from expansion of the source policy's successful support.
 
 ### Feedback mechanism
@@ -748,7 +755,7 @@ from expansion of the source policy's successful support.
 The study directly compares supervised state coverage and sparse verifier
 feedback. Teacher-based on-policy distillation is the missing third mechanism.
 Adding it under matched token, rollout, and teacher-compute budgets would show
-whether dense student-state feedback reaches the signal-bearing regime more
+whether dense student-state feedback reaches the informative regime more
 efficiently, and whether terminal RL still adds value after that transition.
 
 ## Next experiments, ordered by information value
@@ -762,7 +769,7 @@ efficiently, and whether terminal RL still adds value after that transition.
    step-wise on-policy distillation, sparse RL, and hybrid distillation plus RL.
    Measure state coverage, mixed-group rate, terminal reward, and retention.
 3. **Test support expansion.** Evaluate source and trained policies at much
-   larger \(k\), inspect novel successful trajectories, and separate search
+   larger $k$, inspect novel successful trajectories, and separate search
    compression from capability expansion.
 4. **Intervene on group informativeness.** Cross group size with prompt
    selection or dynamic resampling, measuring zero-variance groups and learning

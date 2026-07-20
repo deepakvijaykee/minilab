@@ -5,7 +5,7 @@ omits the reference line because it has no reference model to load, and
 that absence is the visible signature of having dropped the reference KL
 in favor of asymmetric ratio clipping.
 
-The eval block mirrors recipe 04 in `local_training/`. It prints up
+The eval block mirrors the local-training GRPO recipe. It prints up
 to five `Q/A/(predicted, expected, OK|WRONG)` lines followed by a
 summary line of the form
 `GSM8K test subset (20 of full split) accuracy: <correct>/<total> = <pct>%`.
@@ -23,10 +23,10 @@ and the accuracy after twenty-five steps carries no signal beyond
 that.
 
 Empty completions across all rollouts point at the policy emitting
-EOS immediately. Two explanations are usually in play: either the
+EOS immediately. Two causes are typical: either the
 SimPO checkpoint collapsed the response distribution onto an empty
 generation, or `max_new_tokens` is too small for the prompt template
 the model was instruction-tuned against. The fix is to raise
-`MAX_NEW_TOKENS` and to check that recipe 04 actually shifted the
+`MAX_NEW_TOKENS` and to check that preference tuning shifted the
 policy. Either way the cause sits upstream of the RL loop, in the
 policy the rollouts are sampling from.

@@ -4,7 +4,7 @@ This recipe runs `scripts/evaluate.py` over the four autoregressive
 checkpoints produced by recipes 01 through 04. Missing checkpoints are
 skipped with a notice rather than failing the pass, so the recipe is
 safe to invoke after any partial run, which is useful for inspecting
-where the pipeline is right now without restarting the full chain.
+where the pipeline stands without restarting from the beginning.
 
 ```bash
 bash recipes/local_training/05_eval_all/run.sh

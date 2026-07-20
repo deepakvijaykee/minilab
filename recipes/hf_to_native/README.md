@@ -1,13 +1,11 @@
 # Hugging Face to native recipes
 
-This track is intentionally narrow. It brings curated sub-1B Hugging
-Face causal language models through the same Minilab trainers that the
-local-training track uses, so that the alignment behavior of a real
-pretrained baseline can be observed under the same code path as the
-tiny from-scratch experiments. The track is not a general Hugging Face
-loader, and it does not aspire to be one. The interesting object is
-the comparison between local pretrains and curated baselines under
-identical alignment code.
+These recipes bring curated sub-1B Hugging Face causal language models
+through the same Minilab trainers as the local-training recipes, so the
+alignment behavior of a real pretrained baseline can be observed under
+the same code path as the tiny from-scratch experiments. This is not a
+general Hugging Face loader: its one purpose is the comparison between
+local pretrains and curated baselines under identical alignment code.
 
 Install the optional dependencies:
 
@@ -88,7 +86,7 @@ explicit attention head dimension and per-head Q/K normalization and is
 guarded by logit verification. Gemma3 remains inspection/generation-only until
 its native weight mapping is validated. The model-type guard is
 `_native_config` in `scripts/import_hf.py`, which is where a new family
-gets wired in once its mapping is verified.
+is added once its mapping is verified.
 
 Qwen3 requires Transformers 4.51 or newer. Import and verify it with:
 
@@ -96,13 +94,12 @@ Qwen3 requires Transformers 4.51 or newer. Import and verify it with:
 MODEL=qwen3-0.6b DEVICE=cpu bash recipes/hf_to_native/02_import/run.sh
 ```
 
-Native alignment on an imported instruction model turns on one fact: the
+Native alignment on an imported instruction model depends on one fact: the
 tokenizer carries its upstream chat template, and honoring that template
-is what keeps supervision aligned with the model's own turn structure. At
-both the generation and the supervised-training boundary the imported
-tokenizer applies that template, so SFT and preference losses fall only on
-the assistant response tokens, including the upstream turn terminator that
-closes the turn. Everything outside that boundary stays plain text:
+keeps supervision aligned with the model's own turn structure. At both the
+generation and the supervised-training boundary the imported tokenizer
+applies that template, so SFT and preference losses fall only on the
+assistant response tokens, including the upstream turn terminator. Everything outside that boundary stays plain text:
 ordinary `encode()` calls and completion decoding are unaffected.
 Exact-output Qwen3 runs use non-thinking mode, so the model does not emit
 a reasoning prefix that would break a strict code or tool envelope.
@@ -118,6 +115,6 @@ correct function straight into a second turn.
 Use `scripts/sft.py --dataset structured_output` to train the exact
 raw-Python, tool-call, and final-answer contracts. That curriculum drops
 any example that would be truncated rather than teach a broken envelope.
-The gate before group-relative RL is a non-uniform strict answer-reward
-group: until the verifier sees both successes and failures on the same
-prompt, there is no signal for RL to move.
+The gate before group-relative RL is a group with mixed rewards: until
+the verifier sees both successes and failures on the same prompt, the
+group-relative advantage is zero and RL has no gradient to follow.

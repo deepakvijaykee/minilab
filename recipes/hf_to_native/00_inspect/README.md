@@ -17,7 +17,7 @@ substituted by setting `MODEL=`:
 MODEL=qwen3-0.6b bash recipes/hf_to_native/00_inspect/run.sh
 ```
 
-Setting `LOAD=1` pulls the weights into memory and reports the actual
+Setting `LOAD=1` loads the weights into memory and reports the actual
 parameter-memory footprint instead of just the announced parameter
 count. Without it the script reads `config.json` alone, which already
 tells you whether the preset and its tokenizer resolve.

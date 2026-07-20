@@ -13,5 +13,5 @@ anything but Llama-compatible or dense Qwen3, the script raises a
 `require()` from `_native_config` before it reaches the print block, so a
 bad mapping never yields a checkpoint at all. That order matters because
 logit drift from a wrong weight mapping does not always produce obviously
-broken text in the sampler, so a refused import catches what an eyeball
-check of the samples would miss.
+broken text in the sampler, so a refused import catches what visual
+inspection of the samples would miss.

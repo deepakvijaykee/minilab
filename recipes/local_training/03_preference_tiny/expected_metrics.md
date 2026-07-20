@@ -1,21 +1,22 @@
 # Expected signals
 
-DPO's loss is bounded in scale by beta. The sigmoid argument is
-`beta * (log pi_theta - log pi_ref)` evaluated as a difference between
-the chosen and rejected continuations, so with `beta=0.1` the implicit
-trust region around the SFT policy is tight and the loss moves on a
-small numerical scale even when the underlying log-probability margins
-have shifted substantially. The step-to-step jitter that this produces
-reflects that scale mismatch rather than optimization instability, and
-chasing it with a smaller learning rate generally hurts more than it
-helps.
+Beta sets the numerical scale of DPO's loss. The sigmoid argument is
+`beta * (log pi_theta - log pi_ref)`, evaluated as the difference
+between the chosen and rejected continuations, so at `beta=0.1` the loss
+moves on a small numerical scale even when the underlying log-probability
+margins have shifted substantially. The step-to-step jitter this produces
+reflects that small scale, not optimization instability, and chasing it
+with a smaller learning rate usually hurts more than it helps. Beta is
+also the strength of the KL pull toward the reference: a larger beta
+holds the policy closer to SFT, a smaller one lets it drift further.
 
 The reference-using algorithms (DPO, IPO, KTO) print both `Trainable:`
-and `Frozen reference:` at startup, and their activation memory is
-roughly double the reference-free variants because chosen and rejected
-each forward through both the policy and the reference. SimPO, ORPO,
-CPO, and RePO drop the reference forward and replace it with a length-
-or margin-based regularizer. The savings show up directly in
+and `Frozen reference:` at startup. They hold a second frozen copy of the
+model, so their resident weights are roughly double the reference-free
+variants. The reference is scored under a no-gradient pass, so the added
+cost is weights, not activations. SimPO, ORPO, CPO, and RePO drop the
+reference forward and replace it with a length- or margin-based
+regularizer. The savings show up directly in
 `estimate_vram.py`, which is the reason the reference-free variants
 are the default choice on memory-constrained machines.
 
@@ -27,9 +28,9 @@ Preference tuning shifts which coherent answer the policy prefers among
 the answers the base already assigns nontrivial mass to. How coherent
 any of those answers is in absolute terms is fixed by the base.
 
-These runs validate the loss path and the reference-model bookkeeping.
+These runs validate the loss path and the reference-model handling.
 What they do not do is move preference behavior far, and the reason is
-built into the scale. HH-RLHF preferences at this scale mostly
-track stylistic surface features that a seven million parameter model
-can fit, and the beta-scaled trust region keeps the policy close to
-SFT regardless of how many steps the trainer takes.
+built into the scale. HH-RLHF preferences at this scale mostly reflect
+stylistic surface features that a 7.5M-parameter model can fit, and the
+updates stay small enough that the policy remains close to SFT no matter
+how many steps the trainer takes.

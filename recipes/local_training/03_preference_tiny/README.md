@@ -5,7 +5,7 @@ produced by recipe 02. The default algorithm is DPO on Anthropic
 HH-RLHF, which is the cleanest entry point for reading what preference
 tuning is doing at this scale: the trainer is increasing the
 log-probability margin between chosen and rejected responses, with a
-KL-style trust region around the SFT policy controlled by beta.
+KL trust region around the SFT policy controlled by beta.
 
 ```bash
 bash recipes/local_training/03_preference_tiny/run.sh
@@ -19,9 +19,9 @@ directory is keyed by algorithm name, so DPO writes to
 holds for every other variant.
 
 DPO, IPO, and KTO need a frozen copy of the SFT model held in memory
-as the reference distribution, which roughly doubles activation
-memory because chosen and rejected each forward through both the
-trainable policy and the frozen reference. SimPO, ORPO, CPO, and RePO
+as the reference, which roughly doubles the resident model weights. The
+reference forward carries no gradients, so the added cost is weights, not
+activations. SimPO, ORPO, CPO, and RePO
 drop the explicit reference forward and replace it with a length- or
 margin-based regularizer, which is meaningfully cheaper to run at this
 scale.
