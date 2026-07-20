@@ -14,12 +14,13 @@ corpus runs out of distinct frequent pairs to merge, which is benign. A
 4k vocabulary on 5000 TinyStories rows usually saturates close to the
 request. A 16k vocabulary on the same corpus generally will not, because
 there are simply not enough merge candidates in such a small slice of
-text. The right response is to train on more rows rather than to read
-the smaller realized size as a defect.
+text. If you need the full 16k, the fix is more rows, not a different
+setting: the realized size just reflects how much distinct structure the
+corpus actually contains.
 
 The third line reads `"Once upon a time there was a little girl named
 Lily." -> <N> tokens, roundtrip OK`. This is the encode and decode
 consistency check on a fixed sample sentence. WordPiece prints
-`decodes as "..."` instead of `roundtrip OK`, because its detokenizer is
-not a strict inverse of the encoder by construction. That is a property
-of the WordPiece scheme rather than a bug in the implementation.
+`decodes as "..."` instead of `roundtrip OK` because its detokenizer is
+not a strict inverse of the encoder by construction, so an exact
+round-trip is not something the scheme promises in the first place.

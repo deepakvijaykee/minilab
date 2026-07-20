@@ -86,7 +86,9 @@ sampler, and evaluator works without modification. Llama-compatible SmolLM2
 and dense Qwen3 models import natively today. Qwen3 mapping includes its
 explicit attention head dimension and per-head Q/K normalization and is
 guarded by logit verification. Gemma3 remains inspection/generation-only until
-its native weight mapping is validated.
+its native weight mapping is validated. The model-type guard is
+`_native_config` in `scripts/import_hf.py`, which is where a new family
+gets wired in once its mapping is verified.
 
 Qwen3 requires Transformers 4.51 or newer. Import and verify it with:
 
@@ -94,21 +96,28 @@ Qwen3 requires Transformers 4.51 or newer. Import and verify it with:
 MODEL=qwen3-0.6b DEVICE=cpu bash recipes/hf_to_native/02_import/run.sh
 ```
 
-For native alignment tasks, an imported instruction tokenizer owns its upstream
-chat template at both generation and supervised-training boundaries. SFT and
-preference labels cover only assistant response tokens, including the upstream
-turn terminator; ordinary `encode()` calls and completion decoding remain plain
-text. Exact-output Qwen3 runs use non-thinking mode so reasoning prefixes do not
-invalidate code or tool envelopes. Agentic follow-up and supervised examples
-rebuild the full user -> assistant -> environment -> assistant context; native
-tokenizers retain their original token-concatenation path.
+Native alignment on an imported instruction model turns on one fact: the
+tokenizer carries its upstream chat template, and honoring that template
+is what keeps supervision aligned with the model's own turn structure. At
+both the generation and the supervised-training boundary the imported
+tokenizer applies that template, so SFT and preference losses fall only on
+the assistant response tokens, including the upstream turn terminator that
+closes the turn. Everything outside that boundary stays plain text:
+ordinary `encode()` calls and completion decoding are unaffected.
+Exact-output Qwen3 runs use non-thinking mode, so the model does not emit
+a reasoning prefix that would break a strict code or tool envelope.
+Agentic and supervised examples rebuild the full user -> assistant ->
+environment -> assistant context, while the native tokenizer keeps its
+original token-concatenation path underneath.
 
-When a tokenizer is supplied to ordinary generation, its saved EOS token also
-terminates the response. This is required for raw-code tasks without an
-application-level closing tag; decoded text would otherwise continue into a
-second turn after a correct function.
+When a tokenizer is passed to ordinary generation, its saved EOS token
+terminates the response as well. Raw-code tasks need this: without an
+application-level closing tag, the decoder would otherwise run past a
+correct function straight into a second turn.
 
-Use `scripts/sft.py --dataset structured_output` to train the exact raw-Python,
-tool-call, and final-answer contracts. That curriculum rejects examples that
-would be truncated; require a non-uniform strict answer-reward group before
-continuing into group-relative RL.
+Use `scripts/sft.py --dataset structured_output` to train the exact
+raw-Python, tool-call, and final-answer contracts. That curriculum drops
+any example that would be truncated rather than teach a broken envelope.
+The gate before group-relative RL is a non-uniform strict answer-reward
+group: until the verifier sees both successes and failures on the same
+prompt, there is no signal for RL to move.

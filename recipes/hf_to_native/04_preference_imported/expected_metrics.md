@@ -10,8 +10,8 @@ For `dpo`, `ipo`, or `kto`, the script prints `Trainable:` and
 `Frozen reference:` at startup, and activation memory roughly
 doubles, because chosen and rejected each forward through both the
 policy and the reference. On a 135M imported model that doubling is
-the difference between fitting on 8GB of VRAM and not, which is why
-the default switching to SimPO is deliberate rather than incidental.
+the difference between fitting on 8GB of VRAM and not, which is the
+whole reason SimPO is the default here.
 
 Fifty steps over 200 pairs is below what would be needed to shift
 preference behavior in any quantitatively meaningful way on a 135M

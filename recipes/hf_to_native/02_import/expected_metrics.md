@@ -17,9 +17,10 @@ that downstream native code can call the same tokenization API
 regardless of where the checkpoint came from.
 
 `run_meta.json` records the tokenizer signature and the source
-metadata for the HF model the checkpoint was imported from. The
-trainer reads the signature on every subsequent run and refuses to
-load a checkpoint under a mismatched tokenizer. Without that check
+metadata for the HF model the checkpoint was imported from, under a
+`source` block carrying `repo`, `alias`, and `model_type`. The trainer
+reads the signature on every subsequent run and refuses to load a
+checkpoint under a mismatched tokenizer. Without that check
 it would be possible to silently load a checkpoint under the wrong
 tokenization and produce loss curves that look superficially
 plausible but are quietly nonsensical.

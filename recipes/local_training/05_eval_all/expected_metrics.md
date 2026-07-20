@@ -40,6 +40,6 @@ model cannot retrieve those reliably without learning the underlying
 task.
 
 `Skipping <label>: missing <path>` lines are the audit trail of which
-stages have run so far. They are not errors. They are how the recipe
-evaluates a partial pipeline cleanly, leaving the stages that have not
-run for later.
+stages have run so far, not failures. They are how the recipe evaluates
+a partial pipeline cleanly and leaves the stages that have not run for a
+later pass.

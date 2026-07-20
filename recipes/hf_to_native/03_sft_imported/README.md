@@ -46,9 +46,10 @@ Only adapter parameters are optimizer-owned. Resume restores the saved adapter
 structure, so `--lora-rank` and `--lora-alpha` are checkpoint-creation options
 and must not be repeated with `--resume-from`.
 
-Imported instruction tokenizers serialize the complete supervised conversation
-with their saved chat template. The prompt prefix is masked from the loss and
-the assistant response, including its turn terminator, is labeled. Use
-`--dataset structured_output` for the deterministic exact-envelope curriculum;
-unlike open-ended Alpaca loading, that curriculum rejects any example that
-would require sequence truncation.
+An imported instruction tokenizer serializes the whole supervised
+conversation through its saved chat template, masking the prompt prefix
+from the loss and labeling the assistant response down to its turn
+terminator. For the deterministic exact-envelope curriculum, pass
+`--dataset structured_output`. Where open-ended Alpaca loading would
+truncate a long example, that curriculum drops it instead of teaching a
+broken envelope.

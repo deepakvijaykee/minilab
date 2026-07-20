@@ -9,6 +9,6 @@ Saved checkpoints/local_training/tokenizer.json (vocab=4096)
 
 The exact character count and token count vary with the dataset slice
 and the tokenizer family. The shape of the three lines is what matters
-for sanity. WordPiece is the one exception worth flagging again: it
-prints `decodes as "..."` in place of `roundtrip OK` because its
-detokenizer is not a strict inverse of the encoder.
+for sanity. WordPiece is the only family whose third line
+differs: it prints `decodes as "..."` in place of `roundtrip OK`, since
+its detokenizer is not built to invert the encoder exactly.

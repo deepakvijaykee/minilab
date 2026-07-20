@@ -53,5 +53,5 @@ whenever all completions in the group tie. At two generations most
 prompts tie, so most gradients are zero on most steps. Lifting the
 group size to four or eight multiplies the density of non-zero
 gradients per step, which is a different kind of improvement than
-adding more steps at group size two and is the right knob to turn
-first when the run looks dead in the water.
+adding more steps at group size two and is the first knob to reach
+for when the run looks dead in the water.
