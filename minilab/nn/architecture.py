@@ -1,7 +1,9 @@
 MOE_FFNS = {
     "moe", "switch_moe", "mixtral_moe", "expert_choice_moe",
-    "deepseek_moe", "qwen3_next_moe", "aux_free_moe", "base_moe", "gemma4_moe",
+    "deepseek_moe", "qwen3_next_moe", "aux_free_moe", "quantile_moe", "base_moe", "gemma4_moe",
 }
+
+BIAS_BALANCED_MOE_FFNS = {"aux_free_moe", "quantile_moe"}
 
 TOP_ONE_MOE_FFNS = {"switch_moe", "base_moe"}
 

@@ -23,7 +23,7 @@ from common import (
 )
 from minilab.checks import require
 from minilab.nn.attention_common import DEFAULT_ATTENTION_BACKEND, attention_backend_choices
-from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER
+from minilab.nn.optimizers import DEFAULT_KL_SHAMPOO_BETAS, DEFAULT_KL_SHAMPOO_LR, DEFAULT_SOFT_MUON_POWER
 from minilab.presets import get_lm_model_preset, lm_model_preset_choices
 from minilab.tokenizers import load_tokenizer
 from minilab.trainer import (
@@ -47,8 +47,11 @@ from minilab.models.transformer_utils import (
     DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
     DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
     DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_SITU_GATE_CAP,
+    DEFAULT_SITU_UP_CAP,
     DEFAULT_SPARSE_BLOCK_SIZE,
     DEFAULT_SPARSE_INDEX_DIM,
+    DEFAULT_SPARSE_INDEX_SHARE_INTERVAL,
     DEFAULT_SPARSE_INDEX_WARMUP_STEPS,
     DEFAULT_SPARSE_KL_LOSS_WEIGHT,
     DEFAULT_SPARSE_LOCAL_BLOCKS,
@@ -75,7 +78,8 @@ _MODEL_BUILD_FLAGS = (
     "rope_original_max_seq_len", "rope_partial_rotary_factor", "yarn_beta_fast",
     "yarn_beta_slow", "local_attention_window", "qwen3_next_full_attention_interval",
     "sparse_block_size", "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
-    "sparse_kl_loss_weight", "sparse_index_warmup_steps",
+    "sparse_kl_loss_weight", "sparse_index_warmup_steps", "sparse_index_share_interval",
+    "situ_gate_cap", "situ_up_cap",
     "lighthouse_num_levels", "lighthouse_pooling_factor", "lighthouse_top_k",
     "attention_k_eq_v", "per_layer_embedding_dim", "final_logit_softcap",
     "connection", "ffn", "num_experts", "top_k_experts", "post_norm",
@@ -119,6 +123,9 @@ p.add_argument("--sparse-local-blocks", type=int, default=None)
 p.add_argument("--sparse-index-dim", type=int, default=None, help="0 uses the attention head dimension")
 p.add_argument("--sparse-kl-loss-weight", type=float, default=None)
 p.add_argument("--sparse-index-warmup-steps", type=int, default=None)
+p.add_argument("--sparse-index-share-interval", type=int, default=None, help="reuse each indexer across this many sparse layers")
+p.add_argument("--situ-gate-cap", type=float, default=None)
+p.add_argument("--situ-up-cap", type=float, default=None)
 p.add_argument("--lighthouse-num-levels", type=int, default=None)
 p.add_argument("--lighthouse-pooling-factor", type=int, default=None)
 p.add_argument("--lighthouse-top-k", type=int, default=None)
@@ -146,8 +153,12 @@ p.add_argument("--save-every", type=int, default=0, help="periodic save interval
 p.add_argument("--batch-size", type=int, default=32)
 p.add_argument("--lr", type=float, default=3e-4)
 p.add_argument("--muon-lr", type=float, default=None, help="defaults to 0.02 for Muon-family optimizers")
+p.add_argument("--muon-per-head", action="store_true", default=None, help="per-head Newton-Schulz for attention projections")
 p.add_argument("--soft-muon-power", type=float, default=None, help="fixed p=0.4 profile for --optimizer soft_muon")
-p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon"], default="adamw")
+p.add_argument("--kl-shampoo-lr", type=float, default=None, help="defaults to 0.02 for --optimizer kl_shampoo")
+p.add_argument("--kl-shampoo-beta1", type=float, default=None, help="momentum beta, defaults to 0.95")
+p.add_argument("--kl-shampoo-beta2", type=float, default=None, help="preconditioner EMA beta, defaults to beta1**2")
+p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon", "kl_shampoo"], default="adamw")
 p.add_argument("--lr-schedule", choices=["cosine", "linear", "constant", "wsd"], default="cosine")
 p.add_argument("--qk-clip-threshold", type=float, default=None)
 p.add_argument("--qk-clip-balance", type=float, default=None)
@@ -177,8 +188,15 @@ if args.qk_clip_balance is not None:
     )
 if args.optimizer not in {"muon", "soft_muon"}:
     require(args.muon_lr is None, "--muon-lr only applies to --optimizer muon or soft_muon")
+if args.optimizer != "muon":
+    require(args.muon_per_head is None, "--muon-per-head only applies to --optimizer muon")
 if args.optimizer != "soft_muon":
     require(args.soft_muon_power is None, "--soft-muon-power only applies to --optimizer soft_muon")
+if args.optimizer != "kl_shampoo":
+    require(
+        args.kl_shampoo_lr is None and args.kl_shampoo_beta1 is None and args.kl_shampoo_beta2 is None,
+        "--kl-shampoo-lr and --kl-shampoo-beta* only apply to --optimizer kl_shampoo",
+    )
 if args.soft_muon_power is not None:
     require(
         args.soft_muon_power == DEFAULT_SOFT_MUON_POWER,
@@ -214,6 +232,9 @@ sparse_local_blocks = resolve_default(args.sparse_local_blocks, DEFAULT_SPARSE_L
 sparse_index_dim = resolve_default(args.sparse_index_dim, DEFAULT_SPARSE_INDEX_DIM)
 sparse_kl_loss_weight = resolve_default(args.sparse_kl_loss_weight, DEFAULT_SPARSE_KL_LOSS_WEIGHT)
 sparse_index_warmup_steps = resolve_default(args.sparse_index_warmup_steps, DEFAULT_SPARSE_INDEX_WARMUP_STEPS)
+sparse_index_share_interval = resolve_default(args.sparse_index_share_interval, DEFAULT_SPARSE_INDEX_SHARE_INTERVAL)
+situ_gate_cap = resolve_default(args.situ_gate_cap, DEFAULT_SITU_GATE_CAP)
+situ_up_cap = resolve_default(args.situ_up_cap, DEFAULT_SITU_UP_CAP)
 lighthouse_num_levels = resolve_default(args.lighthouse_num_levels, DEFAULT_LIGHTHOUSE_NUM_LEVELS)
 lighthouse_pooling_factor = resolve_default(args.lighthouse_pooling_factor, DEFAULT_LIGHTHOUSE_POOLING_FACTOR)
 lighthouse_top_k = resolve_default(args.lighthouse_top_k, DEFAULT_LIGHTHOUSE_TOP_K)
@@ -240,7 +261,11 @@ qk_clip_balance = resolve_default(args.qk_clip_balance, 0.5)
 token_superposition_size = resolve_default(args.token_superposition_size, 1)
 token_superposition_steps = resolve_default(args.token_superposition_steps, 0)
 muon_lr = resolve_default(args.muon_lr, 0.02)
+muon_per_head = resolve_default(args.muon_per_head, False)
 soft_muon_power = resolve_default(args.soft_muon_power, DEFAULT_SOFT_MUON_POWER)
+kl_shampoo_lr = resolve_default(args.kl_shampoo_lr, DEFAULT_KL_SHAMPOO_LR)
+kl_shampoo_beta1 = resolve_default(args.kl_shampoo_beta1, DEFAULT_KL_SHAMPOO_BETAS[0])
+kl_shampoo_beta2 = resolve_default(args.kl_shampoo_beta2, DEFAULT_KL_SHAMPOO_BETAS[1])
 
 if args.num_kv_heads is not None:
     require(attention_uses_gqa(attention), "--num-kv-heads only applies to GQA attention variants")
@@ -270,10 +295,16 @@ if (
     or args.sparse_index_dim is not None
     or args.sparse_kl_loss_weight is not None
     or args.sparse_index_warmup_steps is not None
+    or args.sparse_index_share_interval is not None
 ):
     require(
         attention == "learned_block_gqa",
         "--sparse-* flags only apply to --attention learned_block_gqa",
+    )
+if args.situ_gate_cap is not None or args.situ_up_cap is not None:
+    require(
+        ffn == "situ_glu",
+        "--situ-gate-cap and --situ-up-cap only apply to --ffn situ_glu",
     )
 if (
     args.lighthouse_num_levels is not None
@@ -389,6 +420,9 @@ else:
         sparse_index_dim=sparse_index_dim,
         sparse_kl_loss_weight=sparse_kl_loss_weight,
         sparse_index_warmup_steps=sparse_index_warmup_steps,
+        sparse_index_share_interval=sparse_index_share_interval,
+        situ_gate_cap=situ_gate_cap,
+        situ_up_cap=situ_up_cap,
         lighthouse_num_levels=lighthouse_num_levels,
         lighthouse_pooling_factor=lighthouse_pooling_factor,
         lighthouse_top_k=lighthouse_top_k,
@@ -415,7 +449,9 @@ print(f"{type(model).__name__}: {model.num_parameters():,} params")
 
 tc = TrainConfig(
     max_steps=args.max_steps, warmup_steps=args.warmup_steps, batch_size=args.batch_size, lr=args.lr,
-    muon_lr=muon_lr, soft_muon_power=soft_muon_power, optimizer=args.optimizer, lr_schedule=args.lr_schedule,
+    muon_lr=muon_lr, muon_per_head=muon_per_head, soft_muon_power=soft_muon_power,
+    kl_shampoo_lr=kl_shampoo_lr, kl_shampoo_beta1=kl_shampoo_beta1, kl_shampoo_beta2=kl_shampoo_beta2,
+    optimizer=args.optimizer, lr_schedule=args.lr_schedule,
     qk_clip_threshold=qk_clip_threshold, qk_clip_balance=qk_clip_balance,
     log_every=100, eval_every=500, save_every=resolve_save_every(args.save_every, args.max_steps),
     save_dir=args.save_dir,

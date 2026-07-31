@@ -212,7 +212,7 @@ def main():
     p.add_argument("--num-generations", type=int, default=4)
     p.add_argument("--vpo-num-candidates", type=int, default=3)
     p.add_argument("--max-new-tokens", type=int, default=128)
-    p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon", "sgd"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "lion", "muon", "soft_muon", "kl_shampoo", "sgd"], default="adamw")
     p.add_argument("--grad-checkpoint", action="store_true")
     p.add_argument("--param-dtype-bytes", type=int, default=4, help="model weights are fp32 by default under autocast")
     p.add_argument("--grad-dtype-bytes", type=int, default=4)

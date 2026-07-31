@@ -1,4 +1,6 @@
-"""Muon-family optimizers for hidden matrix params and Lion."""
+"""Muon-family optimizers for hidden matrix params, KL-Shampoo, and Lion."""
+
+import math
 
 import torch
 from torch.optim import Optimizer
@@ -6,6 +8,9 @@ from torch.optim import Optimizer
 from minilab.checks import require, require_finite_number, require_integer
 
 
+DEFAULT_KL_SHAMPOO_LR = 0.02
+DEFAULT_KL_SHAMPOO_BETAS = (0.95, 0.9025)
+DEFAULT_KL_SHAMPOO_EPS = 1e-8
 DEFAULT_SOFT_MUON_POWER = 0.4
 DEFAULT_SOFT_MUON_NS_ITERS = 12
 DEFAULT_SOFT_MUON_NS_COEFFICIENTS = (2.0, -1.5, 0.5)
@@ -46,6 +51,7 @@ class Muon(Optimizer):
         soft_muon_coefficients=DEFAULT_SOFT_MUON_P04_COEFFICIENTS,
         soft_muon_tail_coefficient=DEFAULT_SOFT_MUON_P04_TAIL_COEFFICIENT,
         soft_muon_eps=DEFAULT_SOFT_MUON_EPS,
+        per_head_dim=0,
     ):
         _validate_muon_hparams(
             lr,
@@ -62,6 +68,7 @@ class Muon(Optimizer):
             soft_muon_coefficients,
             soft_muon_tail_coefficient,
             soft_muon_eps,
+            per_head_dim,
         )
         defaults = dict(
             lr=lr,
@@ -71,6 +78,7 @@ class Muon(Optimizer):
             betas=betas,
             eps=eps,
             use_muon=True,
+            per_head_dim=per_head_dim,
             soft_muon=soft_muon,
             soft_muon_power=soft_muon_power,
             soft_muon_mix=soft_muon_mix,
@@ -94,7 +102,7 @@ class Muon(Optimizer):
             if group["use_muon"]:
                 self._step_muon_group(group)
             else:
-                self._step_adamw_group(group)
+                _adamw_group_step(self.state, group)
         return loss
 
     def load_state_dict(self, state_dict):
@@ -128,6 +136,8 @@ class Muon(Optimizer):
                     soft_tail_coefficient=group["soft_muon_tail_coefficient"],
                     eps=group["soft_muon_eps"],
                 )
+            elif group["per_head_dim"] > 0 and ns_iters > 0:
+                update = _per_head_orthogonalized_update(update, ns_iters, group["per_head_dim"])
             elif p.dim() >= 2 and ns_iters > 0:
                 update = _orthogonalized_update(update, ns_iters)
             if wd > 0:
@@ -136,29 +146,104 @@ class Muon(Optimizer):
                 update = update.to(dtype=p.dtype)
             p.add_(update, alpha=-lr)
 
-    def _step_adamw_group(self, group):
-        lr, (b1, b2), wd, eps = group["lr"], group["betas"], group["weight_decay"], group["eps"]
+
+class KLShampoo(Optimizer):
+    """Online KL-Shampoo (Tilde): zero-staleness Kronecker-factored whitening.
+
+    Matrix parameters keep left/right preconditioner EMAs S_a, S_b whose
+    Kronecker product tracks the full gradient second moment via the KL-optimal
+    factor updates A = G P_b, B = P_a G. A fresh inverse square root is taken
+    every step (exact eigendecomposition at minilab scale; the paper's Scaled
+    CANS iteration is the large-scale hardware path) and the Nesterov momentum
+    is whitened as P_a N P_b with the shape-aware muP scale
+    sqrt(m/n) / (sqrt(m) + sqrt(n)) and the Nesterov variance correction.
+    The betas default follows the online-learning regime beta2 = beta1**2
+    rather than Adam's beta2 > beta1. Groups with use_kl_shampoo=False take the
+    AdamW path, mirroring Muon's grouping contract.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        betas=DEFAULT_KL_SHAMPOO_BETAS,
+        eps=DEFAULT_KL_SHAMPOO_EPS,
+        weight_decay=0.0,
+    ):
+        _validate_kl_shampoo_hparams(lr, betas, eps, weight_decay)
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, use_kl_shampoo=True)
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            _validate_kl_shampoo_group(group)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            if group["use_kl_shampoo"]:
+                self._step_kl_shampoo_group(group)
+            else:
+                _adamw_group_step(self.state, group)
+        return loss
+
+    def load_state_dict(self, state_dict):
+        result = super().load_state_dict(state_dict)
+        # The base optimizer casts floating-point state to each param's dtype on
+        # load; KL-Shampoo keeps momentum and Kronecker factors in float32.
+        for state in self.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value) and value.is_floating_point():
+                    state[key] = value.float()
+        for group in self.param_groups:
+            _validate_kl_shampoo_group(group)
+        return result
+
+    def _step_kl_shampoo_group(self, group):
+        lr, (b1, b2), eps, wd = group["lr"], group["betas"], group["eps"], group["weight_decay"]
         for p in group["params"]:
             if p.grad is None:
                 continue
             g = p.grad
+            if g.dim() > 2:
+                g = g.view(g.size(0), -1)
+            g = g.float()
+            m, n = g.shape
             state = self.state[p]
-            if "step" not in state:
-                state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(g)
-                state["exp_avg_sq"] = torch.zeros_like(g)
-            state["step"] += 1
-            exp_avg = state["exp_avg"]
-            exp_avg_sq = state["exp_avg_sq"]
+            if "momentum" not in state:
+                state["momentum"] = torch.zeros_like(g)
+                # Warm start: scale so the Kronecker product matches the first
+                # gradient's second moment. A tiny-eps ridge would leave the
+                # directions outside the first gradient's span with ~eps
+                # curvature, which the exact inverse square root amplifies by
+                # eps**-0.5 and the first EMA update then injects into the
+                # opposite factor; regularize toward the mean observed
+                # eigenvalue instead, which is all the truncated CANS iteration
+                # resolves at scale.
+                fro2 = g.pow(2).sum().clamp_min(torch.finfo(g.dtype).tiny)
+                state["left_moment"] = torch.sqrt(m / (n * fro2)) * (g @ g.T)
+                state["left_moment"].diagonal().add_(eps + state["left_moment"].trace() / m)
+                state["right_moment"] = torch.sqrt(n / (m * fro2)) * (g.T @ g)
+                state["right_moment"].diagonal().add_(eps + state["right_moment"].trace() / n)
+            else:
+                whitened_rows = g @ state["right_preconditioner"]
+                state["left_moment"].mul_(b2).add_(whitened_rows @ whitened_rows.T, alpha=(1 - b2) / n)
+                whitened_cols = state["left_preconditioner"] @ g
+                state["right_moment"].mul_(b2).add_(whitened_cols.T @ whitened_cols, alpha=(1 - b2) / m)
+            state["left_preconditioner"] = _matrix_inverse_sqrt(state["left_moment"], eps)
+            state["right_preconditioner"] = _matrix_inverse_sqrt(state["right_moment"], eps)
 
+            buf = state["momentum"]
+            buf.lerp_(g, 1 - b1)
+            nesterov = g.lerp(buf, b1)
+            update = state["left_preconditioner"] @ nesterov @ state["right_preconditioner"]
+            nesterov_variance = ((1 - b1) / (1 + b1)) * (1 + 2 * b1 - 2 * b1 ** 3)
+            scale = (nesterov_variance ** -0.5) * (math.sqrt(m / n) / (math.sqrt(m) + math.sqrt(n)))
             if wd > 0:
                 p.mul_(1 - lr * wd)
-            exp_avg.mul_(b1).add_(g, alpha=1 - b1)
-            exp_avg_sq.mul_(b2).addcmul_(g, g, value=1 - b2)
-            bias_correction1 = 1 - b1 ** state["step"]
-            bias_correction2 = 1 - b2 ** state["step"]
-            denom = exp_avg_sq.sqrt().div_(bias_correction2 ** 0.5).add_(eps)
-            p.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)
+            p.add_(update.view_as(p).to(dtype=p.dtype), alpha=-lr * scale)
 
 
 class Lion(Optimizer):
@@ -208,13 +293,17 @@ def _validate_muon_hparams(
     soft_muon_coefficients=DEFAULT_SOFT_MUON_P04_COEFFICIENTS,
     soft_muon_tail_coefficient=DEFAULT_SOFT_MUON_P04_TAIL_COEFFICIENT,
     soft_muon_eps=DEFAULT_SOFT_MUON_EPS,
+    per_head_dim=0,
 ):
     require_finite_number(momentum, "Muon momentum")
     require_integer(ns_iters, "Muon ns_iters")
     require_finite_number(eps, "Muon eps")
+    require_integer(per_head_dim, "Muon per_head_dim")
     require(0 <= momentum < 1, "Muon momentum must be in [0, 1)")
     require(ns_iters >= 0, "Muon ns_iters must be >= 0")
     require(eps > 0, "Muon eps must be > 0")
+    require(per_head_dim >= 0, "Muon per_head_dim must be >= 0")
+    require(per_head_dim == 0 or not soft_muon, "per-head Muon does not support soft_muon")
     _validate_soft_muon_hparams(
         soft_muon,
         soft_muon_power,
@@ -230,6 +319,7 @@ def _validate_muon_hparams(
 
 def _upgrade_muon_group_defaults(group, defaults):
     for key in (
+        "per_head_dim",
         "soft_muon",
         "soft_muon_power",
         "soft_muon_mix",
@@ -245,6 +335,7 @@ def _upgrade_muon_group_defaults(group, defaults):
 
 def _validate_muon_group(group):
     _upgrade_muon_group_defaults(group, {
+        "per_head_dim": 0,
         "soft_muon": False,
         "soft_muon_power": DEFAULT_SOFT_MUON_POWER,
         "soft_muon_mix": 1.0,
@@ -274,9 +365,66 @@ def _validate_muon_group(group):
             group["soft_muon_coefficients"],
             group["soft_muon_tail_coefficient"],
             group["soft_muon_eps"],
+            group["per_head_dim"],
         )
+        if group["per_head_dim"] > 0:
+            for param in group["params"]:
+                require(param.dim() == 2 and param.size(0) % group["per_head_dim"] == 0, (
+                    "per-head Muon parameters must be matrices with rows divisible by per_head_dim"
+                ))
     else:
         _validate_adamw_hparams(group["lr"], group["betas"], group["weight_decay"], group["eps"])
+
+
+def _adamw_group_step(state_by_param, group):
+    lr, (b1, b2), wd, eps = group["lr"], group["betas"], group["weight_decay"], group["eps"]
+    for p in group["params"]:
+        if p.grad is None:
+            continue
+        g = p.grad
+        state = state_by_param[p]
+        if "step" not in state:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(g)
+            state["exp_avg_sq"] = torch.zeros_like(g)
+        state["step"] += 1
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+
+        if wd > 0:
+            p.mul_(1 - lr * wd)
+        exp_avg.mul_(b1).add_(g, alpha=1 - b1)
+        exp_avg_sq.mul_(b2).addcmul_(g, g, value=1 - b2)
+        bias_correction1 = 1 - b1 ** state["step"]
+        bias_correction2 = 1 - b2 ** state["step"]
+        denom = exp_avg_sq.sqrt().div_(bias_correction2 ** 0.5).add_(eps)
+        p.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)
+
+
+def _validate_kl_shampoo_hparams(lr, betas, eps, weight_decay):
+    require_finite_number(eps, "KL-Shampoo eps")
+    require(eps > 0, "KL-Shampoo eps must be > 0")
+    _validate_lr_betas_weight_decay(lr, betas, weight_decay)
+
+
+def _validate_kl_shampoo_group(group):
+    require(
+        group["use_kl_shampoo"] is True or group["use_kl_shampoo"] is False,
+        "KL-Shampoo param group use_kl_shampoo must be a bool",
+    )
+    if group["use_kl_shampoo"]:
+        _validate_kl_shampoo_hparams(group["lr"], group["betas"], group["eps"], group["weight_decay"])
+        for param in group["params"]:
+            require(param.dim() >= 2, "KL-Shampoo requires matrix-shaped parameters")
+    else:
+        _validate_adamw_hparams(group["lr"], group["betas"], group["weight_decay"], group["eps"])
+
+
+def _matrix_inverse_sqrt(moment, eps):
+    symmetric = (moment + moment.T) * 0.5
+    eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
+    inverse_sqrt = eigenvalues.clamp_min(eps).rsqrt()
+    return (eigenvectors * inverse_sqrt) @ eigenvectors.T
 
 
 def _validate_soft_muon_hparams(
@@ -449,3 +597,12 @@ def _orthogonalized_update(update, ns_iters):
     update = _newton_schulz(update, ns_iters)
     update *= max(1.0, update.size(0) / update.size(1)) ** 0.5
     return update.view(original_shape)
+
+
+def _per_head_orthogonalized_update(update, ns_iters, head_dim):
+    """Per-Head Muon (Kimi K3): orthogonalize each head's row block separately
+    so heads with larger momentum scales cannot dominate the shared update."""
+    require(update.dim() == 2, "per-head Muon expects matrix-shaped updates")
+    heads = update.view(update.size(0) // head_dim, head_dim, update.size(1))
+    orthogonalized = torch.stack([_orthogonalized_update(head, ns_iters) for head in heads])
+    return orthogonalized.view_as(update)

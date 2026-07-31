@@ -3,12 +3,14 @@ import torch
 from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.nn.attention_common import DEFAULT_ATTENTION_BACKEND, attention_backend_choices
 from minilab.nn.architecture import (
+    BIAS_BALANCED_MOE_FFNS,
     GQA_ATTENTIONS,
     MOE_FFNS,
     QK_CLIP_ATTENTIONS,
     TOP_ONE_MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
+from minilab.nn.ffn import DEFAULT_SITU_GATE_CAP, DEFAULT_SITU_UP_CAP
 
 
 _LOCAL_WINDOW_ATTENTIONS = {"sliding_window", "sliding_window_gqa_qknorm"}
@@ -44,6 +46,7 @@ DEFAULT_SPARSE_LOCAL_BLOCKS = 0
 DEFAULT_SPARSE_INDEX_DIM = 0
 DEFAULT_SPARSE_KL_LOSS_WEIGHT = 0.0
 DEFAULT_SPARSE_INDEX_WARMUP_STEPS = 0
+DEFAULT_SPARSE_INDEX_SHARE_INTERVAL = 1
 DEFAULT_LIGHTHOUSE_NUM_LEVELS = 3
 DEFAULT_LIGHTHOUSE_POOLING_FACTOR = 2
 DEFAULT_LIGHTHOUSE_TOP_K = 32
@@ -129,6 +132,10 @@ def validate_moe_fields(config):
         require(1 <= config.top_k_experts <= config.num_experts, "top_k_experts must be in [1, num_experts]")
         if config.ffn in TOP_ONE_MOE_FFNS:
             require(config.top_k_experts == 1, f"{config.ffn} requires top_k_experts=1")
+        if config.ffn == "quantile_moe":
+            require(config.top_k_experts < config.num_experts, (
+                "Quantile Balancing requires top_k_experts < num_experts"
+            ))
     else:
         require(
             config.num_experts == DEFAULT_NUM_EXPERTS and config.top_k_experts == DEFAULT_TOP_K_EXPERTS,
@@ -164,7 +171,7 @@ def transformer_supports_qk_clip(blocks):
 
 
 def commit_transformer_block_updates(blocks, ffn_name, qk_clip_threshold, qk_clip_balance):
-    if ffn_name == "aux_free_moe":
+    if ffn_name in BIAS_BALANCED_MOE_FFNS:
         for block in blocks:
             block.ffn.commit_routing_bias_update()
     if qk_clip_threshold <= 0:

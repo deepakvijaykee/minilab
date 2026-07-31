@@ -41,6 +41,10 @@ class BaseModel(nn.Module):
         """Modules whose matrix parameters should stay on Muon's AdamW path."""
         return ()
 
+    def per_head_muon_parameters(self):
+        """(param, head_dim) pairs eligible for per-head Muon orthogonalization."""
+        return ()
+
     def no_weight_decay_parameter_names(self):
         return ()
 

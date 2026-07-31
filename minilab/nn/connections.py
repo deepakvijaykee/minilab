@@ -17,6 +17,48 @@ class Residual(nn.Module):
         return x + sublayer(x)
 
 
+@register_connection("attnres")
+class AttentionResidual(nn.Module):
+    """Full Attention Residuals from Kimi K3.
+
+    The stream state is (B, T, S, C): the token embedding followed by every
+    preceding sublayer output. Each sublayer reads a softmax mixture of all
+    sources using a learnable pseudo-query against RMS-normalized keys,
+    phi(q, k) = exp(q . RMSNorm(k)), and appends its output as a new source
+    instead of accumulating into a single residual stream.
+    """
+
+    expansion = 1
+
+    def __init__(self, dim):
+        super().__init__()
+        require(dim > 0, "AttentionResidual dim must be > 0")
+        self.query = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x, sublayer):
+        out = sublayer(attnres_mixture(x, self.query))
+        return torch.cat([x, out.unsqueeze(2)], dim=2)
+
+
+class AttnResAggregate(nn.Module):
+    """Final AttnRes readout: one more pseudo-query attention over all sources."""
+
+    def __init__(self, dim):
+        super().__init__()
+        require(dim > 0, "AttnResAggregate dim must be > 0")
+        self.query = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        return attnres_mixture(x, self.query)
+
+
+def attnres_mixture(sources, query, eps=1e-6):
+    require(sources.dim() == 4, "AttnRes sources must have shape (batch, seq, sources, dim)")
+    keys = sources * torch.rsqrt(sources.float().pow(2).mean(-1, keepdim=True) + eps).to(sources.dtype)
+    weights = torch.softmax(torch.einsum("btsc,c->bts", keys, query.to(keys.dtype)), dim=-1)
+    return torch.einsum("bts,btsc->btc", weights, sources)
+
+
 @register_connection("hc")
 class HyperConnection(nn.Module):
     """Dynamic Hyper-Connections for an expanded residual stream.

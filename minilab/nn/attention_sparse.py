@@ -20,6 +20,36 @@ from minilab.registry import register_attention
 MSA_SPARSE_INDEX_PAD = -1
 
 
+class SharedSparseIndexState:
+    """Per-forward exchange of learned sparse index decisions across layers.
+
+    IndexShare-style sharing (GLM-5.2 / IndexCache): owner layers publish their
+    index scores and token support each forward, and the shared layers that
+    follow them reuse those decisions instead of running their own indexer. The
+    model clears this state at the start of every forward so a shared layer can
+    never silently consume indices from a previous batch.
+    """
+
+    def __init__(self):
+        self._entries = {}
+
+    def clear(self):
+        self._entries = {}
+
+    def publish(self, key, index_scores, token_support):
+        self._entries[key] = (index_scores, token_support)
+
+    def read(self, key, batch_size, seq_len):
+        require(key in self._entries, (
+            "shared sparse index attention requires its owner layer to run earlier in the same forward"
+        ))
+        index_scores, token_support = self._entries[key]
+        require(index_scores.size(0) == batch_size and index_scores.size(2) == seq_len, (
+            "shared sparse index state does not match the current forward shape"
+        ))
+        return index_scores, token_support
+
+
 def _block_sparse_attention_bias(T, block_size, local_blocks, global_tokens, random_blocks, seed, device, dtype, is_causal):
     num_blocks = math.ceil(T / block_size)
     allowed_blocks = torch.zeros(num_blocks, num_blocks, device=device, dtype=torch.bool)
@@ -549,6 +579,13 @@ class LearnedBlockSparseGQAAttention(nn.Module):
     A small index branch picks top-k KV blocks per GQA group, local blocks are
     always included, and dense SDPA applies the resulting exact token mask. This
     is for correctness experiments, not memory or kernel speedups.
+
+    IndexShare-style sharing: with index_role="shared" the layer holds no
+    indexer parameters and reuses the index decisions its owner layer published
+    to a bound SharedSparseIndexState. Every layer in a sharing group distills
+    its own attention distribution into the owner's index scores; the caller
+    supplies kl_loss_weight already divided by the group size, which realizes
+    the multi-layer distillation average of the IndexCache training-aware recipe.
     """
 
     def __init__(
@@ -563,6 +600,7 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         index_dim=None,
         kl_loss_weight=0.0,
         attention_backend=DEFAULT_ATTENTION_BACKEND,
+        index_role="owner",
     ):
         super().__init__()
         require(dim > 0, "dim must be > 0")
@@ -575,6 +613,7 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         require(top_k_blocks > 0, "top_k_blocks must be > 0")
         require(local_blocks >= 0, "local_blocks must be >= 0")
         require(kl_loss_weight >= 0, "kl_loss_weight must be >= 0")
+        require(index_role in {"owner", "shared"}, "index_role must be 'owner' or 'shared'")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
@@ -586,6 +625,9 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         self.kl_loss_weight = kl_loss_weight
         self.sparse_index_warmup = False
         self.attention_backend = attention_backend
+        self.index_role = index_role
+        self._index_share_state = None
+        self._index_share_key = None
         self.index_dim = self.head_dim if index_dim is None else index_dim
         require(self.index_dim > 0, "index_dim must be > 0")
 
@@ -593,40 +635,34 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, kv_dim, bias=False)
         self.v_proj = nn.Linear(dim, kv_dim, bias=False)
-        self.q_idx_proj = nn.Linear(dim, num_kv_heads * self.index_dim, bias=False)
-        self.k_idx_proj = nn.Linear(dim, self.index_dim, bias=False)
+        if index_role == "owner":
+            self.q_idx_proj = nn.Linear(dim, num_kv_heads * self.index_dim, bias=False)
+            self.k_idx_proj = nn.Linear(dim, self.index_dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
         self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
 
     def set_sparse_index_warmup(self, active):
         self.sparse_index_warmup = bool(active)
 
+    def bind_index_share(self, state, key):
+        require(isinstance(state, SharedSparseIndexState), (
+            "bind_index_share requires a SharedSparseIndexState"
+        ))
+        self._index_share_state = state
+        self._index_share_key = key
+
     def forward(self, x, freqs_cis=None, attn_bias=None, is_causal=False):
         B, T, C = x.shape
         q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        index_input = x.detach()
-        q_idx = self.q_idx_proj(index_input).reshape(B, T, self.num_kv_heads, self.index_dim).transpose(1, 2)
-        k_idx = self.k_idx_proj(index_input)
 
         if freqs_cis is not None:
             q, k = apply_rotary_emb(q, k, *freqs_cis)
 
         k_attn = k.repeat_interleave(self.kv_group_size, dim=1)
         v_attn = v.repeat_interleave(self.kv_group_size, dim=1)
-        index_scores = _msa_token_scores(q_idx, k_idx, is_causal)
-        block_scores = _msa_block_max_scores_from_token_scores(index_scores, self.block_size)
-        if self.training and self.sparse_index_warmup:
-            token_support = _full_attention_support(B, self.num_kv_heads, T, x.device, is_causal)
-        else:
-            token_support = _learned_block_attention_support_from_scores(
-                block_scores,
-                self.block_size,
-                self.top_k_blocks,
-                self.local_blocks,
-                is_causal,
-            )
+        index_scores, token_support = self._index_decisions(x, B, T, is_causal)
         bias = _bool_to_additive_bias(token_support.repeat_interleave(self.kv_group_size, dim=1), x.dtype)
         self.aux_loss = _learned_block_kl_loss(
             index_scores,
@@ -640,6 +676,31 @@ class LearnedBlockSparseGQAAttention(nn.Module):
         bias = _merge_attention_bias(bias, attn_bias)
         out = attention_sdpa(q, k_attn, v_attn, bias, self.dropout if self.training else 0.0, False, backend=self.attention_backend)
         return self.out(out.transpose(1, 2).reshape(B, T, C))
+
+    def _index_decisions(self, x, B, T, is_causal):
+        if self.index_role == "shared":
+            require(self._index_share_state is not None, (
+                "shared sparse index attention requires bind_index_share before forward"
+            ))
+            return self._index_share_state.read(self._index_share_key, B, T)
+        index_input = x.detach()
+        q_idx = self.q_idx_proj(index_input).reshape(B, T, self.num_kv_heads, self.index_dim).transpose(1, 2)
+        k_idx = self.k_idx_proj(index_input)
+        index_scores = _msa_token_scores(q_idx, k_idx, is_causal)
+        block_scores = _msa_block_max_scores_from_token_scores(index_scores, self.block_size)
+        if self.training and self.sparse_index_warmup:
+            token_support = _full_attention_support(B, self.num_kv_heads, T, x.device, is_causal)
+        else:
+            token_support = _learned_block_attention_support_from_scores(
+                block_scores,
+                self.block_size,
+                self.top_k_blocks,
+                self.local_blocks,
+                is_causal,
+            )
+        if self._index_share_state is not None:
+            self._index_share_state.publish(self._index_share_key, index_scores, token_support)
+        return index_scores, token_support
 
 
 @register_attention("sliding_window")
