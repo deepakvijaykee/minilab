@@ -51,7 +51,7 @@ from minilab.nn.architecture import (
     MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
-from minilab.nn.attention_sparse import SharedSparseIndexState
+from minilab.nn.attention_sparse import SharedSparseIndexState, sparse_index_owner_block_id
 from minilab.nn.connections import AttnResAggregate, expand_residual_stream, reduce_residual_stream
 from minilab.nn.lora import LoRALinear
 from minilab.registry import get_attention, get_connection, get_ffn, get_norm, get_position, register_model
@@ -611,7 +611,7 @@ def _build_transformer_attention(config, block_id):
             )
         elif attention == "learned_block_gqa":
             share_interval = config.sparse_index_share_interval
-            owner_block_id = block_id - (block_id % share_interval)
+            owner_block_id = sparse_index_owner_block_id(block_id, share_interval)
             # MTP blocks (block_id >= num_layers) only exist when sharing is off,
             # so the group size formula only sees real backbone layers.
             index_group_size = (
@@ -920,8 +920,10 @@ class GPT(BaseModel):
         if config.attention == "learned_block_gqa" and config.sparse_index_share_interval > 1:
             self._sparse_index_share = SharedSparseIndexState()
             for block in self.blocks:
-                owner_block_id = block.block_id - (block.block_id % config.sparse_index_share_interval)
-                block.attn.bind_index_share(self._sparse_index_share, owner_block_id)
+                block.attn.bind_index_share(
+                    self._sparse_index_share,
+                    sparse_index_owner_block_id(block.block_id, config.sparse_index_share_interval),
+                )
 
         self.apply(self._init_weights)
         if config.connection in ("hc", "mhc"):
@@ -1095,6 +1097,11 @@ class GPT(BaseModel):
                 )
             if return_layer_hiddens:
                 layer_hiddens.append(x)
+
+        if self._sparse_index_share is not None:
+            # Release the published index tensors before backward and the
+            # optimizer step instead of holding them until the next forward.
+            self._sparse_index_share.clear()
 
         if self.config.connection == "attnres":
             x = self.attnres_out(x)
@@ -1360,6 +1367,8 @@ class GPT(BaseModel):
             block_freqs = self._block_freqs(block, T, freqs_cis)
             per_layer_input = per_layer_inputs[:, :, block.block_id, :] if per_layer_inputs is not None else None
             x = block(x, freqs_cis=block_freqs, attn_bias=attn_bias, is_causal=is_causal, per_layer_input=per_layer_input)
+        if self._sparse_index_share is not None:
+            self._sparse_index_share.clear()
         logits = apply_logit_softcap(self.lm_head(self.ln_f(x)), self.config.final_logit_softcap)
         return logits, x
 

@@ -70,13 +70,16 @@ class GEGLU(nn.Module):
         return self.w3(F.gelu(self.w1(x)) * self.w2(x))
 
 
+def softcap(x, cap):
+    """Smooth cap cap * tanh(x / cap): linear near the origin, bounded by cap."""
+    return cap * torch.tanh(x / cap)
+
+
 def situ_glu_activation(gate_pre, up_pre, gate_cap, up_cap):
     """SiTU-GLU hidden activation from Kimi K3: softcapped Swish gate times a
     softcapped up branch, so the elementwise product is bounded by
     gate_cap * up_cap while staying SwiGLU-like near the origin."""
-    gate = gate_cap * torch.tanh(gate_pre / gate_cap) * torch.sigmoid(gate_pre)
-    up = up_cap * torch.tanh(up_pre / up_cap)
-    return gate * up
+    return softcap(gate_pre, gate_cap) * torch.sigmoid(gate_pre) * softcap(up_pre, up_cap)
 
 
 @register_ffn("situ_glu")

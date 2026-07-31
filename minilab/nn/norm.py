@@ -5,6 +5,11 @@ from minilab.checks import require
 from minilab.registry import register_norm
 
 
+def rms_without_scale(x, eps=1e-6):
+    """RMS-normalize without a learned scale; the norm is computed in float32."""
+    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).to(x.dtype)
+
+
 @register_norm("rmsnorm")
 class RMSNorm(nn.Module):
 

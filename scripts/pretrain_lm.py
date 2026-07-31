@@ -193,9 +193,10 @@ if args.optimizer != "muon":
 if args.optimizer != "soft_muon":
     require(args.soft_muon_power is None, "--soft-muon-power only applies to --optimizer soft_muon")
 if args.optimizer != "kl_shampoo":
-    require(
-        args.kl_shampoo_lr is None and args.kl_shampoo_beta1 is None and args.kl_shampoo_beta2 is None,
-        "--kl-shampoo-lr and --kl-shampoo-beta* only apply to --optimizer kl_shampoo",
+    reject_supplied(
+        args,
+        ("kl_shampoo_lr", "kl_shampoo_beta1", "kl_shampoo_beta2"),
+        "only applies to --optimizer kl_shampoo",
     )
 if args.soft_muon_power is not None:
     require(

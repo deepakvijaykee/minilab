@@ -31,6 +31,27 @@ DEFAULT_SOFT_MUON_P04_COEFFICIENTS = (
 )
 DEFAULT_SOFT_MUON_P04_TAIL_COEFFICIENT = 0.0306539563075
 
+# Single source of truth for the Muon group extension keys: __init__ threads
+# the caller's values, and legacy state_dicts are upgraded from this table.
+_MUON_GROUP_DEFAULTS = dict(
+    per_head_dim=0,
+    soft_muon=False,
+    soft_muon_power=DEFAULT_SOFT_MUON_POWER,
+    soft_muon_mix=1.0,
+    soft_muon_ns_iters=DEFAULT_SOFT_MUON_NS_ITERS,
+    soft_muon_ns_coefficients=DEFAULT_SOFT_MUON_NS_COEFFICIENTS,
+    soft_muon_coefficients=DEFAULT_SOFT_MUON_P04_COEFFICIENTS,
+    soft_muon_tail_coefficient=DEFAULT_SOFT_MUON_P04_TAIL_COEFFICIENT,
+    soft_muon_eps=DEFAULT_SOFT_MUON_EPS,
+)
+
+
+def _evaluate_closure(closure):
+    if closure is None:
+        return None
+    with torch.enable_grad():
+        return closure()
+
 
 class Muon(Optimizer):
 
@@ -53,24 +74,7 @@ class Muon(Optimizer):
         soft_muon_eps=DEFAULT_SOFT_MUON_EPS,
         per_head_dim=0,
     ):
-        _validate_muon_hparams(
-            lr,
-            momentum,
-            ns_iters,
-            weight_decay,
-            betas,
-            eps,
-            soft_muon,
-            soft_muon_power,
-            soft_muon_mix,
-            soft_muon_ns_iters,
-            soft_muon_ns_coefficients,
-            soft_muon_coefficients,
-            soft_muon_tail_coefficient,
-            soft_muon_eps,
-            per_head_dim,
-        )
-        defaults = dict(
+        hparams = dict(
             lr=lr,
             momentum=momentum,
             ns_iters=ns_iters,
@@ -83,21 +87,25 @@ class Muon(Optimizer):
             soft_muon_power=soft_muon_power,
             soft_muon_mix=soft_muon_mix,
             soft_muon_ns_iters=soft_muon_ns_iters,
-            soft_muon_ns_coefficients=tuple(float(v) for v in soft_muon_ns_coefficients),
-            soft_muon_coefficients=tuple(float(v) for v in soft_muon_coefficients),
-            soft_muon_tail_coefficient=float(soft_muon_tail_coefficient),
+            soft_muon_ns_coefficients=soft_muon_ns_coefficients,
+            soft_muon_coefficients=soft_muon_coefficients,
+            soft_muon_tail_coefficient=soft_muon_tail_coefficient,
             soft_muon_eps=soft_muon_eps,
         )
+        _validate_muon_hparams(hparams)
+        defaults = {
+            **hparams,
+            "soft_muon_ns_coefficients": tuple(float(v) for v in soft_muon_ns_coefficients),
+            "soft_muon_coefficients": tuple(float(v) for v in soft_muon_coefficients),
+            "soft_muon_tail_coefficient": float(soft_muon_tail_coefficient),
+        }
         super().__init__(params, defaults)
         for group in self.param_groups:
             _validate_muon_group(group)
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        loss = _evaluate_closure(closure)
         for group in self.param_groups:
             if group["use_muon"]:
                 self._step_muon_group(group)
@@ -165,7 +173,7 @@ class KLShampoo(Optimizer):
     def __init__(
         self,
         params,
-        lr=0.02,
+        lr=DEFAULT_KL_SHAMPOO_LR,
         betas=DEFAULT_KL_SHAMPOO_BETAS,
         eps=DEFAULT_KL_SHAMPOO_EPS,
         weight_decay=0.0,
@@ -178,10 +186,7 @@ class KLShampoo(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        loss = _evaluate_closure(closure)
         for group in self.param_groups:
             if group["use_kl_shampoo"]:
                 self._step_kl_shampoo_group(group)
@@ -193,16 +198,15 @@ class KLShampoo(Optimizer):
         result = super().load_state_dict(state_dict)
         # The base optimizer casts floating-point state to each param's dtype on
         # load; KL-Shampoo keeps momentum and Kronecker factors in float32.
-        for state in self.state.values():
-            for key, value in state.items():
-                if torch.is_tensor(value) and value.is_floating_point():
-                    state[key] = value.float()
+        _recast_floating_state_to_float32(self.state)
         for group in self.param_groups:
             _validate_kl_shampoo_group(group)
         return result
 
     def _step_kl_shampoo_group(self, group):
         lr, (b1, b2), eps, wd = group["lr"], group["betas"], group["eps"], group["weight_decay"]
+        nesterov_variance = ((1 - b1) / (1 + b1)) * (1 + 2 * b1 - 2 * b1 ** 3)
+        momentum_scale = nesterov_variance ** -0.5
         for p in group["params"]:
             if p.grad is None:
                 continue
@@ -239,8 +243,7 @@ class KLShampoo(Optimizer):
             buf.lerp_(g, 1 - b1)
             nesterov = g.lerp(buf, b1)
             update = state["left_preconditioner"] @ nesterov @ state["right_preconditioner"]
-            nesterov_variance = ((1 - b1) / (1 + b1)) * (1 + 2 * b1 - 2 * b1 ** 3)
-            scale = (nesterov_variance ** -0.5) * (math.sqrt(m / n) / (math.sqrt(m) + math.sqrt(n)))
+            scale = momentum_scale * (math.sqrt(m / n) / (math.sqrt(m) + math.sqrt(n)))
             if wd > 0:
                 p.mul_(1 - lr * wd)
             p.add_(update.view_as(p).to(dtype=p.dtype), alpha=-lr * scale)
@@ -256,10 +259,7 @@ class Lion(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        loss = _evaluate_closure(closure)
         for group in self.param_groups:
             lr, (b1, b2), wd = group["lr"], group["betas"], group["weight_decay"]
             for p in group["params"]:
@@ -278,95 +278,38 @@ class Lion(Optimizer):
         return loss
 
 
-def _validate_muon_hparams(
-    lr,
-    momentum,
-    ns_iters,
-    weight_decay,
-    betas,
-    eps,
-    soft_muon=False,
-    soft_muon_power=DEFAULT_SOFT_MUON_POWER,
-    soft_muon_mix=1.0,
-    soft_muon_ns_iters=DEFAULT_SOFT_MUON_NS_ITERS,
-    soft_muon_ns_coefficients=DEFAULT_SOFT_MUON_NS_COEFFICIENTS,
-    soft_muon_coefficients=DEFAULT_SOFT_MUON_P04_COEFFICIENTS,
-    soft_muon_tail_coefficient=DEFAULT_SOFT_MUON_P04_TAIL_COEFFICIENT,
-    soft_muon_eps=DEFAULT_SOFT_MUON_EPS,
-    per_head_dim=0,
-):
-    require_finite_number(momentum, "Muon momentum")
-    require_integer(ns_iters, "Muon ns_iters")
-    require_finite_number(eps, "Muon eps")
-    require_integer(per_head_dim, "Muon per_head_dim")
-    require(0 <= momentum < 1, "Muon momentum must be in [0, 1)")
-    require(ns_iters >= 0, "Muon ns_iters must be >= 0")
-    require(eps > 0, "Muon eps must be > 0")
-    require(per_head_dim >= 0, "Muon per_head_dim must be >= 0")
-    require(per_head_dim == 0 or not soft_muon, "per-head Muon does not support soft_muon")
-    _validate_soft_muon_hparams(
-        soft_muon,
-        soft_muon_power,
-        soft_muon_mix,
-        soft_muon_ns_iters,
-        soft_muon_ns_coefficients,
-        soft_muon_coefficients,
-        soft_muon_tail_coefficient,
-        soft_muon_eps,
-    )
-    _validate_lr_betas_weight_decay(lr, betas, weight_decay)
+def _validate_muon_hparams(hparams):
+    """Validate a mapping carrying the Muon hyperparameter keys (a group dict
+    or the constructor defaults); extra keys are ignored."""
+    require_finite_number(hparams["momentum"], "Muon momentum")
+    require_integer(hparams["ns_iters"], "Muon ns_iters")
+    require_finite_number(hparams["eps"], "Muon eps")
+    require_integer(hparams["per_head_dim"], "Muon per_head_dim")
+    require(0 <= hparams["momentum"] < 1, "Muon momentum must be in [0, 1)")
+    require(hparams["ns_iters"] >= 0, "Muon ns_iters must be >= 0")
+    require(hparams["eps"] > 0, "Muon eps must be > 0")
+    require(hparams["per_head_dim"] >= 0, "Muon per_head_dim must be >= 0")
+    require(hparams["per_head_dim"] == 0 or not hparams["soft_muon"], (
+        "per-head Muon does not support soft_muon"
+    ))
+    _validate_soft_muon_hparams(hparams)
+    _validate_lr_betas_weight_decay(hparams["lr"], hparams["betas"], hparams["weight_decay"])
 
 
 def _upgrade_muon_group_defaults(group, defaults):
-    for key in (
-        "per_head_dim",
-        "soft_muon",
-        "soft_muon_power",
-        "soft_muon_mix",
-        "soft_muon_ns_iters",
-        "soft_muon_ns_coefficients",
-        "soft_muon_coefficients",
-        "soft_muon_tail_coefficient",
-        "soft_muon_eps",
-    ):
+    for key in _MUON_GROUP_DEFAULTS:
         if key not in group:
             group[key] = defaults[key]
 
 
 def _validate_muon_group(group):
-    _upgrade_muon_group_defaults(group, {
-        "per_head_dim": 0,
-        "soft_muon": False,
-        "soft_muon_power": DEFAULT_SOFT_MUON_POWER,
-        "soft_muon_mix": 1.0,
-        "soft_muon_ns_iters": DEFAULT_SOFT_MUON_NS_ITERS,
-        "soft_muon_ns_coefficients": DEFAULT_SOFT_MUON_NS_COEFFICIENTS,
-        "soft_muon_coefficients": DEFAULT_SOFT_MUON_P04_COEFFICIENTS,
-        "soft_muon_tail_coefficient": DEFAULT_SOFT_MUON_P04_TAIL_COEFFICIENT,
-        "soft_muon_eps": DEFAULT_SOFT_MUON_EPS,
-    })
+    _upgrade_muon_group_defaults(group, _MUON_GROUP_DEFAULTS)
     require(
         group["use_muon"] is True or group["use_muon"] is False,
         "Muon param group use_muon must be a bool",
     )
     if group["use_muon"]:
-        _validate_muon_hparams(
-            group["lr"],
-            group["momentum"],
-            group["ns_iters"],
-            group["weight_decay"],
-            group["betas"],
-            group["eps"],
-            group["soft_muon"],
-            group["soft_muon_power"],
-            group["soft_muon_mix"],
-            group["soft_muon_ns_iters"],
-            group["soft_muon_ns_coefficients"],
-            group["soft_muon_coefficients"],
-            group["soft_muon_tail_coefficient"],
-            group["soft_muon_eps"],
-            group["per_head_dim"],
-        )
+        _validate_muon_hparams(group)
         if group["per_head_dim"] > 0:
             for param in group["params"]:
                 require(param.dim() == 2 and param.size(0) % group["per_head_dim"] == 0, (
@@ -407,6 +350,15 @@ def _validate_kl_shampoo_hparams(lr, betas, eps, weight_decay):
     _validate_lr_betas_weight_decay(lr, betas, weight_decay)
 
 
+def _recast_floating_state_to_float32(state_by_param):
+    for state in state_by_param.values():
+        state.update({
+            key: value.float()
+            for key, value in state.items()
+            if torch.is_tensor(value) and value.is_floating_point()
+        })
+
+
 def _validate_kl_shampoo_group(group):
     require(
         group["use_kl_shampoo"] is True or group["use_kl_shampoo"] is False,
@@ -421,22 +373,23 @@ def _validate_kl_shampoo_group(group):
 
 
 def _matrix_inverse_sqrt(moment, eps):
-    symmetric = (moment + moment.T) * 0.5
-    eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
+    # The Kronecker moments are symmetric by construction (outer products plus
+    # diagonal ridges) and eigh reads a single triangle, so no explicit
+    # symmetrization is needed.
+    eigenvalues, eigenvectors = torch.linalg.eigh(moment)
     inverse_sqrt = eigenvalues.clamp_min(eps).rsqrt()
     return (eigenvectors * inverse_sqrt) @ eigenvectors.T
 
 
-def _validate_soft_muon_hparams(
-    soft_muon,
-    power,
-    mix,
-    ns_iters,
-    ns_coefficients,
-    soft_coefficients,
-    tail_coefficient,
-    eps,
-):
+def _validate_soft_muon_hparams(hparams):
+    soft_muon = hparams["soft_muon"]
+    power = hparams["soft_muon_power"]
+    mix = hparams["soft_muon_mix"]
+    ns_iters = hparams["soft_muon_ns_iters"]
+    ns_coefficients = hparams["soft_muon_ns_coefficients"]
+    soft_coefficients = hparams["soft_muon_coefficients"]
+    tail_coefficient = hparams["soft_muon_tail_coefficient"]
+    eps = hparams["soft_muon_eps"]
     require(soft_muon is True or soft_muon is False, "Muon param group soft_muon must be a bool")
     require_integer(ns_iters, "Soft-Muon ns_iters")
     require_finite_number(power, "Soft-Muon power")

@@ -1,5 +1,3 @@
-import torch
-
 from minilab.checks import require, require_finite_fields, require_integer_fields
 from minilab.nn.attention_common import DEFAULT_ATTENTION_BACKEND, attention_backend_choices
 from minilab.nn.architecture import (
@@ -10,7 +8,7 @@ from minilab.nn.architecture import (
     TOP_ONE_MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
-from minilab.nn.ffn import DEFAULT_SITU_GATE_CAP, DEFAULT_SITU_UP_CAP
+from minilab.nn.ffn import DEFAULT_SITU_GATE_CAP, DEFAULT_SITU_UP_CAP, softcap
 
 
 _LOCAL_WINDOW_ATTENTIONS = {"sliding_window", "sliding_window_gqa_qknorm"}
@@ -187,7 +185,7 @@ def commit_transformer_block_updates(blocks, ffn_name, qk_clip_threshold, qk_cli
 
 
 
-def apply_logit_softcap(logits, softcap):
-    if softcap <= 0:
+def apply_logit_softcap(logits, cap):
+    if cap <= 0:
         return logits
-    return torch.tanh(logits / softcap) * softcap
+    return softcap(logits, cap)

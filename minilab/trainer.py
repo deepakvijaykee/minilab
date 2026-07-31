@@ -101,15 +101,12 @@ class TrainConfig(BaseConfig):
         require(self.kl_shampoo_lr >= 0, "kl_shampoo_lr must be >= 0")
         require(0 <= self.kl_shampoo_beta1 < 1, "kl_shampoo_beta1 must be in [0, 1)")
         require(0 <= self.kl_shampoo_beta2 < 1, "kl_shampoo_beta2 must be in [0, 1)")
-        require(
-            self.optimizer == "kl_shampoo"
-            or (
-                self.kl_shampoo_lr == DEFAULT_KL_SHAMPOO_LR
-                and self.kl_shampoo_beta1 == DEFAULT_KL_SHAMPOO_BETAS[0]
-                and self.kl_shampoo_beta2 == DEFAULT_KL_SHAMPOO_BETAS[1]
-            ),
-            "kl_shampoo_lr and kl_shampoo_beta* only apply to optimizer='kl_shampoo'",
-        )
+        for name in ("kl_shampoo_lr", "kl_shampoo_beta1", "kl_shampoo_beta2"):
+            require(
+                self.optimizer == "kl_shampoo"
+                or getattr(self, name) == TrainConfig.__dataclass_fields__[name].default,
+                f"{name} only applies to optimizer='kl_shampoo'",
+            )
         require(self.weight_decay >= 0, "weight_decay must be >= 0")
         require(self.warmup_steps >= 0, "warmup_steps must be >= 0")
         require(self.max_grad_norm > 0, "max_grad_norm must be > 0")
@@ -418,53 +415,49 @@ class Trainer:
             hidden, aux_matrices, biases = self._trainable_muon_groups(model)
             soft_muon = self.config.optimizer == "soft_muon"
             hidden_groups = self._muon_hidden_groups(model, hidden, soft_muon)
-            return Muon(hidden_groups + [
-                {
-                    "params": aux_matrices,
-                    "use_muon": False,
-                    "soft_muon": False,
-                    "lr": self.config.lr,
-                    "weight_decay": self.config.weight_decay,
-                },
-                {
-                    "params": biases,
-                    "use_muon": False,
-                    "soft_muon": False,
-                    "lr": self.config.lr,
-                    "weight_decay": 0.0,
-                },
-            ], lr=self.config.muon_lr, soft_muon=soft_muon, soft_muon_power=self.config.soft_muon_power)
+            fallback_groups = self._adamw_fallback_groups(aux_matrices, biases, use_muon=False, soft_muon=False)
+            return Muon(
+                hidden_groups + fallback_groups,
+                lr=self.config.muon_lr,
+                soft_muon=soft_muon,
+                soft_muon_power=self.config.soft_muon_power,
+            )
         if self.config.optimizer == "kl_shampoo":
             hidden, aux_matrices, biases = self._trainable_muon_groups(model)
-            return KLShampoo([
-                {
-                    "params": hidden,
-                    "use_kl_shampoo": True,
-                    "lr": self.config.kl_shampoo_lr,
-                    "betas": (self.config.kl_shampoo_beta1, self.config.kl_shampoo_beta2),
-                    "weight_decay": self.config.weight_decay,
-                },
-                {
-                    "params": aux_matrices,
-                    "use_kl_shampoo": False,
-                    "betas": (0.9, 0.95),
-                    "lr": self.config.lr,
-                    "weight_decay": self.config.weight_decay,
-                },
-                {
-                    "params": biases,
-                    "use_kl_shampoo": False,
-                    "betas": (0.9, 0.95),
-                    "lr": self.config.lr,
-                    "weight_decay": 0.0,
-                },
-            ], lr=self.config.kl_shampoo_lr)
+            hidden_group = {
+                "params": hidden,
+                "use_kl_shampoo": True,
+                "lr": self.config.kl_shampoo_lr,
+                "betas": (self.config.kl_shampoo_beta1, self.config.kl_shampoo_beta2),
+                "weight_decay": self.config.weight_decay,
+            }
+            fallback_groups = self._adamw_fallback_groups(aux_matrices, biases, use_kl_shampoo=False)
+            return KLShampoo([hidden_group] + fallback_groups, lr=self.config.kl_shampoo_lr)
         groups = optimizer_decay_groups(model, self.model.parameters(), self.config.weight_decay)
         if self.config.optimizer == "adamw":
             return torch.optim.AdamW(groups, lr=self.config.lr, betas=(0.9, 0.95))
         if self.config.optimizer == "lion":
             return Lion(groups, lr=self.config.lr, weight_decay=self.config.weight_decay)
         raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
+
+    def _adamw_fallback_groups(self, aux_matrices, biases, **group_flags):
+        """AdamW-path groups shared by the Muon-family and KL-Shampoo builders."""
+        return [
+            {
+                "params": aux_matrices,
+                "lr": self.config.lr,
+                "weight_decay": self.config.weight_decay,
+                "betas": (0.9, 0.95),
+                **group_flags,
+            },
+            {
+                "params": biases,
+                "lr": self.config.lr,
+                "weight_decay": 0.0,
+                "betas": (0.9, 0.95),
+                **group_flags,
+            },
+        ]
 
     def _trainable_muon_groups(self, model):
         hidden, aux_matrices, biases = (

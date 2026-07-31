@@ -20,14 +20,21 @@ from minilab.registry import register_attention
 MSA_SPARSE_INDEX_PAD = -1
 
 
+def sparse_index_owner_block_id(block_id, share_interval):
+    """Owner of a sharing group: the first layer of each interval-sized run."""
+    return block_id - block_id % share_interval
+
+
 class SharedSparseIndexState:
     """Per-forward exchange of learned sparse index decisions across layers.
 
     IndexShare-style sharing (GLM-5.2 / IndexCache): owner layers publish their
-    index scores and token support each forward, and the shared layers that
-    follow them reuse those decisions instead of running their own indexer. The
-    model clears this state at the start of every forward so a shared layer can
-    never silently consume indices from a previous batch.
+    index scores, token support, and dense attention bias each forward, and the
+    shared layers that follow them reuse those tensors instead of running their
+    own indexer and rebuilding the bias. The model clears this state at the
+    start of every forward so a shared layer can never silently consume indices
+    from a previous batch, and again after the block loop so the published
+    tensors are not retained through backward and the optimizer step.
     """
 
     def __init__(self):
@@ -36,18 +43,18 @@ class SharedSparseIndexState:
     def clear(self):
         self._entries = {}
 
-    def publish(self, key, index_scores, token_support):
-        self._entries[key] = (index_scores, token_support)
+    def publish(self, key, index_scores, token_support, attention_bias):
+        self._entries[key] = (index_scores, token_support, attention_bias)
 
     def read(self, key, batch_size, seq_len):
         require(key in self._entries, (
             "shared sparse index attention requires its owner layer to run earlier in the same forward"
         ))
-        index_scores, token_support = self._entries[key]
+        index_scores, token_support, attention_bias = self._entries[key]
         require(index_scores.size(0) == batch_size and index_scores.size(2) == seq_len, (
             "shared sparse index state does not match the current forward shape"
         ))
-        return index_scores, token_support
+        return index_scores, token_support, attention_bias
 
 
 def _block_sparse_attention_bias(T, block_size, local_blocks, global_tokens, random_blocks, seed, device, dtype, is_causal):
@@ -662,8 +669,7 @@ class LearnedBlockSparseGQAAttention(nn.Module):
 
         k_attn = k.repeat_interleave(self.kv_group_size, dim=1)
         v_attn = v.repeat_interleave(self.kv_group_size, dim=1)
-        index_scores, token_support = self._index_decisions(x, B, T, is_causal)
-        bias = _bool_to_additive_bias(token_support.repeat_interleave(self.kv_group_size, dim=1), x.dtype)
+        index_scores, token_support, bias = self._index_decisions(x, B, T, is_causal)
         self.aux_loss = _learned_block_kl_loss(
             index_scores,
             q,
@@ -698,9 +704,10 @@ class LearnedBlockSparseGQAAttention(nn.Module):
                 self.local_blocks,
                 is_causal,
             )
+        bias = _bool_to_additive_bias(token_support.repeat_interleave(self.kv_group_size, dim=1), x.dtype)
         if self._index_share_state is not None:
-            self._index_share_state.publish(self._index_share_key, index_scores, token_support)
-        return index_scores, token_support
+            self._index_share_state.publish(self._index_share_key, index_scores, token_support, bias)
+        return index_scores, token_support, bias
 
 
 @register_attention("sliding_window")

@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from minilab.checks import require, require_finite_number, require_integer
+from minilab.nn.norm import rms_without_scale
 from minilab.registry import register_ffn
 
 
@@ -22,6 +23,7 @@ from minilab.registry import register_ffn
 # fixed limit; out-of-range values saturate into the edge bins.
 _QB_MARGIN_LIMIT = 2.0
 _QB_HISTOGRAM_BINS = 512
+_QB_BIN_WIDTH = 2 * _QB_MARGIN_LIMIT / _QB_HISTOGRAM_BINS
 
 
 @register_ffn("moe")
@@ -357,8 +359,7 @@ class QuantileBalancedMoEFFN(nn.Module):
             # enter each token's Top-k, so no separate token-side quantile is needed.
             cutoffs = biased.topk(self.top_k + 1, dim=-1).values[:, -1:]
             margins = (scores - cutoffs).clamp_(-_QB_MARGIN_LIMIT, _QB_MARGIN_LIMIT)
-            bins = ((margins + _QB_MARGIN_LIMIT) * (_QB_HISTOGRAM_BINS / (2 * _QB_MARGIN_LIMIT)))
-            bins = bins.long().clamp_(max=_QB_HISTOGRAM_BINS - 1)
+            bins = ((margins + _QB_MARGIN_LIMIT) / _QB_BIN_WIDTH).long().clamp_(max=_QB_HISTOGRAM_BINS - 1)
             offsets = torch.arange(self.num_experts, device=bins.device) * _QB_HISTOGRAM_BINS
             counts = torch.bincount(
                 (bins + offsets).reshape(-1),
@@ -376,8 +377,7 @@ class QuantileBalancedMoEFFN(nn.Module):
         target_rank = (1.0 - self.top_k / self.num_experts) * totals
         cumulative = self._margin_counts.cumsum(dim=-1)
         bin_index = (cumulative < target_rank.unsqueeze(-1)).sum(dim=-1).clamp(max=_QB_HISTOGRAM_BINS - 1)
-        bin_width = 2 * _QB_MARGIN_LIMIT / _QB_HISTOGRAM_BINS
-        bias = _QB_MARGIN_LIMIT - (bin_index.to(self.routing_bias.dtype) + 0.5) * bin_width
+        bias = _QB_MARGIN_LIMIT - (bin_index.to(self.routing_bias.dtype) + 0.5) * _QB_BIN_WIDTH
         self.routing_bias.copy_(bias - bias.mean())
         self._margin_counts.zero_()
 
@@ -447,7 +447,7 @@ class Gemma4MoEFFN(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         x_flat = x.reshape(-1, C)
-        routed_input = _rms_without_scale(x_flat) * self.router_scale.to(x_flat.dtype) * (C ** -0.5)
+        routed_input = rms_without_scale(x_flat) * self.router_scale.to(x_flat.dtype) * (C ** -0.5)
         logits = self.gate(routed_input)
         probs = F.softmax(logits, dim=-1)
         weights, indices = probs.topk(self.top_k, dim=-1)
@@ -510,10 +510,6 @@ def _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, nam
     require(num_experts > 0, "num_experts must be > 0")
     require(1 <= top_k <= num_experts, "top_k must be in [1, num_experts]")
     require(aux_loss_coef >= 0, "aux_loss_coef must be >= 0")
-
-
-def _rms_without_scale(x, eps=1e-6):
-    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).to(x.dtype)
 
 
 def _expert_capacity(num_tokens, num_experts, capacity_factor):

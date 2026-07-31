@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from minilab.checks import require
+from minilab.nn.norm import rms_without_scale
 from minilab.registry import register_connection
 
 
@@ -54,7 +55,7 @@ class AttnResAggregate(nn.Module):
 
 def attnres_mixture(sources, query, eps=1e-6):
     require(sources.dim() == 4, "AttnRes sources must have shape (batch, seq, sources, dim)")
-    keys = sources * torch.rsqrt(sources.float().pow(2).mean(-1, keepdim=True) + eps).to(sources.dtype)
+    keys = rms_without_scale(sources, eps)
     weights = torch.softmax(torch.einsum("btsc,c->bts", keys, query.to(keys.dtype)), dim=-1)
     return torch.einsum("bts,btsc->btc", weights, sources)
 
