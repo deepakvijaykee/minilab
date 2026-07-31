@@ -14,7 +14,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from minilab.checks import require, require_finite_number, require_integer
+from minilab.nn.norm import rms_without_scale
 from minilab.registry import register_ffn
+
+
+# Sigmoid router scores live in (0, 1) and mean-centered quantile biases are
+# bounded by the histogram range itself, so margins s - alpha stay inside the
+# fixed limit; out-of-range values saturate into the edge bins.
+_QB_MARGIN_LIMIT = 2.0
+_QB_HISTOGRAM_BINS = 512
+_QB_BIN_WIDTH = 2 * _QB_MARGIN_LIMIT / _QB_HISTOGRAM_BINS
 
 
 @register_ffn("moe")
@@ -269,10 +278,7 @@ class AuxFreeMoEFFN(nn.Module):
         B, T, C = x.shape
         x_flat = x.reshape(-1, C)
         logits = self.gate(x_flat)
-        scores = torch.sigmoid(logits)
-        _, indices = (scores + self.routing_bias).topk(self.top_k, dim=-1)
-        weights = scores.gather(-1, indices)
-        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=torch.finfo(weights.dtype).tiny)
+        _, weights, indices = _biased_sigmoid_topk(logits, self.routing_bias, self.top_k)
 
         out = _combine_token_choice(x_flat, self.experts, weights, indices)
         self._record_routing_load(indices)
@@ -296,6 +302,84 @@ class AuxFreeMoEFFN(nn.Module):
         self.routing_bias.add_(self.bias_update_rate * torch.sign(target - load).to(self.routing_bias.dtype))
         self._routing_load_sum.zero_()
         self._routing_load_count.zero_()
+
+
+@register_ffn("quantile_moe")
+class QuantileBalancedMoEFFN(nn.Module):
+    """Auxiliary-loss-free routing with Quantile Balancing bias updates (Kimi K3).
+
+    Like DeepSeek-V3 biased routing, an expert bias enters only the Top-k
+    selection, never the mixture weights. Instead of a fixed-step sign update,
+    each commit sets the bias directly from the (1 - k/n) quantile of the batch
+    router margins s_ij - alpha_i, where alpha_i is the Top-(k+1) cutoff of the
+    biased scores, so every expert lands near its target load in one step. The
+    quantile is read from additive per-expert margin histograms — the estimator
+    the K3 report uses in practice — so accumulation state stays bounded,
+    device-resident, and checkpointable; sigmoid scores and mean-centered
+    biases keep margins inside the fixed histogram range.
+    """
+
+    def __init__(
+        self,
+        dim,
+        hidden_dim,
+        num_experts=8,
+        top_k=2,
+        aux_loss_coef=0.0,
+    ):
+        super().__init__()
+        _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, "QuantileBalancedMoEFFN")
+        require(top_k < num_experts, "Quantile Balancing requires top_k < num_experts")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.aux_loss_coef = aux_loss_coef
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.experts = nn.ModuleList([_Expert(dim, hidden_dim) for _ in range(num_experts)])
+        self.register_buffer("routing_bias", torch.zeros(num_experts))
+        self.register_buffer("_margin_counts", torch.zeros(num_experts, _QB_HISTOGRAM_BINS))
+        self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.reshape(-1, C)
+        logits = self.gate(x_flat)
+        scores, weights, indices = _biased_sigmoid_topk(logits, self.routing_bias, self.top_k)
+
+        out = _combine_token_choice(x_flat, self.experts, weights, indices)
+        self._record_routing_margins(scores)
+        self.aux_loss = logits.sum() * 0.0
+        return out.reshape(B, T, C)
+
+    def _record_routing_margins(self, scores):
+        if not torch.is_grad_enabled():
+            return
+        with torch.no_grad():
+            biased = scores + self.routing_bias
+            # The Top-(k+1) cutoff is the biased score an expert must beat to
+            # enter each token's Top-k, so no separate token-side quantile is needed.
+            cutoffs = biased.topk(self.top_k + 1, dim=-1).values[:, -1:]
+            margins = (scores - cutoffs).clamp_(-_QB_MARGIN_LIMIT, _QB_MARGIN_LIMIT)
+            bins = ((margins + _QB_MARGIN_LIMIT) / _QB_BIN_WIDTH).long().clamp_(max=_QB_HISTOGRAM_BINS - 1)
+            offsets = torch.arange(self.num_experts, device=bins.device) * _QB_HISTOGRAM_BINS
+            counts = torch.bincount(
+                (bins + offsets).reshape(-1),
+                minlength=self.num_experts * _QB_HISTOGRAM_BINS,
+            )
+            self._margin_counts.add_(
+                counts.reshape(self.num_experts, _QB_HISTOGRAM_BINS).to(self._margin_counts.dtype)
+            )
+
+    @torch.no_grad()
+    def commit_routing_bias_update(self):
+        totals = self._margin_counts.sum(dim=-1)
+        if totals.sum().item() == 0:
+            return
+        target_rank = (1.0 - self.top_k / self.num_experts) * totals
+        cumulative = self._margin_counts.cumsum(dim=-1)
+        bin_index = (cumulative < target_rank.unsqueeze(-1)).sum(dim=-1).clamp(max=_QB_HISTOGRAM_BINS - 1)
+        bias = _QB_MARGIN_LIMIT - (bin_index.to(self.routing_bias.dtype) + 0.5) * _QB_BIN_WIDTH
+        self.routing_bias.copy_(bias - bias.mean())
+        self._margin_counts.zero_()
 
 
 @register_ffn("base_moe")
@@ -363,7 +447,7 @@ class Gemma4MoEFFN(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         x_flat = x.reshape(-1, C)
-        routed_input = _rms_without_scale(x_flat) * self.router_scale.to(x_flat.dtype) * (C ** -0.5)
+        routed_input = rms_without_scale(x_flat) * self.router_scale.to(x_flat.dtype) * (C ** -0.5)
         logits = self.gate(routed_input)
         probs = F.softmax(logits, dim=-1)
         weights, indices = probs.topk(self.top_k, dim=-1)
@@ -428,12 +512,18 @@ def _validate_moe_config(dim, hidden_dim, num_experts, top_k, aux_loss_coef, nam
     require(aux_loss_coef >= 0, "aux_loss_coef must be >= 0")
 
 
-def _rms_without_scale(x, eps=1e-6):
-    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).to(x.dtype)
-
-
 def _expert_capacity(num_tokens, num_experts, capacity_factor):
     return max(1, math.ceil(capacity_factor * num_tokens / num_experts))
+
+
+def _biased_sigmoid_topk(logits, routing_bias, top_k):
+    """Biased sigmoid routing: the bias steers Top-k selection only, while the
+    mixture weights renormalize the raw sigmoid scores of the selected experts."""
+    scores = torch.sigmoid(logits)
+    _, indices = (scores + routing_bias).topk(top_k, dim=-1)
+    weights = scores.gather(-1, indices)
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=torch.finfo(weights.dtype).tiny)
+    return scores, weights, indices
 
 
 def _combine_token_choice(x_flat, experts, weights, indices):

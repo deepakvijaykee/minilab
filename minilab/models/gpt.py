@@ -20,8 +20,11 @@ from minilab.models.transformer_utils import (
     DEFAULT_ROPE_ORIGINAL_MAX_SEQ_LEN,
     DEFAULT_ROPE_PARTIAL_ROTARY_FACTOR,
     DEFAULT_ROPE_SCALING_FACTOR,
+    DEFAULT_SITU_GATE_CAP,
+    DEFAULT_SITU_UP_CAP,
     DEFAULT_SPARSE_BLOCK_SIZE,
     DEFAULT_SPARSE_INDEX_DIM,
+    DEFAULT_SPARSE_INDEX_SHARE_INTERVAL,
     DEFAULT_SPARSE_INDEX_WARMUP_STEPS,
     DEFAULT_SPARSE_KL_LOSS_WEIGHT,
     DEFAULT_SPARSE_LOCAL_BLOCKS,
@@ -48,7 +51,8 @@ from minilab.nn.architecture import (
     MOE_FFNS,
     resolve_deepseek_v4_attention,
 )
-from minilab.nn.connections import expand_residual_stream, reduce_residual_stream
+from minilab.nn.attention_sparse import SharedSparseIndexState, sparse_index_owner_block_id
+from minilab.nn.connections import AttnResAggregate, expand_residual_stream, reduce_residual_stream
 from minilab.nn.lora import LoRALinear
 from minilab.registry import get_attention, get_connection, get_ffn, get_norm, get_position, register_model
 
@@ -93,6 +97,9 @@ _GPT_COMPAT_DEFAULT_FIELDS = {
     "sparse_index_dim",
     "sparse_kl_loss_weight",
     "sparse_index_warmup_steps",
+    "sparse_index_share_interval",
+    "situ_gate_cap",
+    "situ_up_cap",
     "lighthouse_num_levels",
     "lighthouse_pooling_factor",
     "lighthouse_top_k",
@@ -148,6 +155,9 @@ class GPTConfig(BaseConfig):
     sparse_index_dim: int = DEFAULT_SPARSE_INDEX_DIM
     sparse_kl_loss_weight: float = DEFAULT_SPARSE_KL_LOSS_WEIGHT
     sparse_index_warmup_steps: int = DEFAULT_SPARSE_INDEX_WARMUP_STEPS
+    sparse_index_share_interval: int = DEFAULT_SPARSE_INDEX_SHARE_INTERVAL
+    situ_gate_cap: float = DEFAULT_SITU_GATE_CAP
+    situ_up_cap: float = DEFAULT_SITU_UP_CAP
     lighthouse_num_levels: int = DEFAULT_LIGHTHOUSE_NUM_LEVELS
     lighthouse_pooling_factor: int = DEFAULT_LIGHTHOUSE_POOLING_FACTOR
     lighthouse_top_k: int = DEFAULT_LIGHTHOUSE_TOP_K
@@ -202,7 +212,8 @@ class GPTConfig(BaseConfig):
             "yarn_beta_fast", "yarn_beta_slow", "local_attention_window",
             "qwen3_next_full_attention_interval", "sparse_block_size", "sparse_top_k_blocks",
             "sparse_local_blocks", "sparse_index_dim", "sparse_kl_loss_weight",
-            "sparse_index_warmup_steps", "lighthouse_num_levels", "lighthouse_pooling_factor",
+            "sparse_index_warmup_steps", "sparse_index_share_interval",
+            "situ_gate_cap", "situ_up_cap", "lighthouse_num_levels", "lighthouse_pooling_factor",
             "lighthouse_top_k", "per_layer_embedding_dim", "final_logit_softcap", "mtp_depth",
             "mtp_loss_weight", "layerskip_loss_weight", "layerskip_dropout", "layerskip_min_layer",
             "future_summary_window", "future_summary_loss_weight", "jacobi_loss_weight",
@@ -215,7 +226,8 @@ class GPTConfig(BaseConfig):
             "rope_original_max_seq_len", "local_attention_window",
             "qwen3_next_full_attention_interval", "sparse_block_size",
             "sparse_top_k_blocks", "sparse_local_blocks", "sparse_index_dim",
-            "sparse_index_warmup_steps", "lighthouse_num_levels", "lighthouse_pooling_factor",
+            "sparse_index_warmup_steps", "sparse_index_share_interval",
+            "lighthouse_num_levels", "lighthouse_pooling_factor",
             "lighthouse_top_k", "per_layer_embedding_dim", "mtp_depth", "layerskip_min_layer",
             "future_summary_window", "jacobi_iterations", "lora_rank",
         ))
@@ -252,6 +264,22 @@ class GPTConfig(BaseConfig):
         require(self.sparse_index_warmup_steps == 0 or self.sparse_kl_loss_weight > 0, (
             "sparse_index_warmup_steps requires sparse_kl_loss_weight > 0"
         ))
+        require(self.sparse_index_share_interval >= 1, "sparse_index_share_interval must be >= 1")
+        require(
+            self.sparse_index_share_interval == 1
+            or self.sparse_index_share_interval <= self.num_layers,
+            "sparse_index_share_interval must not exceed num_layers",
+        )
+        require(self.sparse_index_share_interval == 1 or self.mtp_depth == 0, (
+            "sparse_index_share_interval does not support MTP modules"
+        ))
+        # LayerSkip dropout can skip an owner layer, leaving its shared layers
+        # without published indices mid-forward.
+        require(self.sparse_index_share_interval == 1 or self.layerskip_dropout == 0, (
+            "sparse_index_share_interval does not support LayerSkip dropout"
+        ))
+        require(self.situ_gate_cap > 0, "situ_gate_cap must be > 0")
+        require(self.situ_up_cap > 0, "situ_up_cap must be > 0")
         require(self.lighthouse_num_levels > 0, "lighthouse_num_levels must be > 0")
         require(self.lighthouse_pooling_factor > 1, "lighthouse_pooling_factor must be > 1")
         require(self.lighthouse_top_k > 0, "lighthouse_top_k must be > 0")
@@ -345,9 +373,12 @@ class GPTConfig(BaseConfig):
         require_default_unless(
             self.connection_expansion,
             4,
-            self.connection != "residual",
+            self.connection in {"hc", "mhc"},
             "connection_expansion only applies to HC/mHC connections",
         )
+        require(self.connection != "attnres" or self.mtp_depth == 0, (
+            "attnres connection does not support MTP modules"
+        ))
         if self.per_layer_embedding_dim > 0:
             require(self.connection == "residual", "per-layer embeddings require residual connections")
         if self.layerskip_loss_weight > 0 or self.layerskip_dropout > 0:
@@ -477,6 +508,24 @@ class GPTConfig(BaseConfig):
             "sparse_index_warmup_steps only applies to attention='learned_block_gqa'",
         )
         require_default_unless(
+            self.sparse_index_share_interval,
+            DEFAULT_SPARSE_INDEX_SHARE_INTERVAL,
+            uses_learned_block,
+            "sparse_index_share_interval only applies to attention='learned_block_gqa'",
+        )
+        require_default_unless(
+            self.situ_gate_cap,
+            DEFAULT_SITU_GATE_CAP,
+            self.ffn == "situ_glu",
+            "situ_gate_cap only applies to ffn='situ_glu'",
+        )
+        require_default_unless(
+            self.situ_up_cap,
+            DEFAULT_SITU_UP_CAP,
+            self.ffn == "situ_glu",
+            "situ_up_cap only applies to ffn='situ_glu'",
+        )
+        require_default_unless(
             self.lighthouse_num_levels,
             DEFAULT_LIGHTHOUSE_NUM_LEVELS,
             uses_lighthouse,
@@ -533,6 +582,13 @@ def _build_transformer_ffn(config):
             num_experts=config.num_experts,
             top_k=config.top_k_experts,
         )
+    if config.ffn == "situ_glu":
+        return get_ffn(config.ffn)(
+            config.dim,
+            ffn_hidden,
+            gate_cap=config.situ_gate_cap,
+            up_cap=config.situ_up_cap,
+        )
     return get_ffn(config.ffn)(config.dim, ffn_hidden)
 
 
@@ -554,6 +610,14 @@ def _build_transformer_attention(config, block_id):
                 attention_backend=config.attention_backend,
             )
         elif attention == "learned_block_gqa":
+            share_interval = config.sparse_index_share_interval
+            owner_block_id = sparse_index_owner_block_id(block_id, share_interval)
+            # MTP blocks (block_id >= num_layers) only exist when sharing is off,
+            # so the group size formula only sees real backbone layers.
+            index_group_size = (
+                1 if share_interval == 1
+                else min(share_interval, config.num_layers - owner_block_id)
+            )
             attn = attn_cls(
                 config.dim,
                 config.num_heads,
@@ -563,8 +627,9 @@ def _build_transformer_attention(config, block_id):
                 top_k_blocks=config.sparse_top_k_blocks,
                 local_blocks=config.sparse_local_blocks,
                 index_dim=None if config.sparse_index_dim == 0 else config.sparse_index_dim,
-                kl_loss_weight=config.sparse_kl_loss_weight,
+                kl_loss_weight=config.sparse_kl_loss_weight / index_group_size,
                 attention_backend=config.attention_backend,
+                index_role="owner" if block_id == owner_block_id else "shared",
             )
         elif attention == "gqa_qknorm":
             attn = attn_cls(
@@ -717,7 +782,7 @@ class TransformerBlock(nn.Module):
         self.uses_residual_connection = config.connection == "residual"
 
         conn_cls = get_connection(config.connection)
-        if config.connection == "residual":
+        if config.connection in {"residual", "attnres"}:
             self.attn_conn = conn_cls(config.dim)
             self.ffn_conn = conn_cls(config.dim)
         else:
@@ -849,6 +914,16 @@ class GPT(BaseModel):
         )
 
         self.pos_enc, self.local_pos_enc, self.global_pos_enc = _build_gpt_position_modules(config)
+        self.attnres_out = AttnResAggregate(config.dim) if config.connection == "attnres" else None
+
+        self._sparse_index_share = None
+        if config.attention == "learned_block_gqa" and config.sparse_index_share_interval > 1:
+            self._sparse_index_share = SharedSparseIndexState()
+            for block in self.blocks:
+                block.attn.bind_index_share(
+                    self._sparse_index_share,
+                    sparse_index_owner_block_id(block.block_id, config.sparse_index_share_interval),
+                )
 
         self.apply(self._init_weights)
         if config.connection in ("hc", "mhc"):
@@ -909,7 +984,29 @@ class GPT(BaseModel):
         if self.config.connection != "residual":
             for block in self._optimizer_transformer_blocks():
                 modules.extend((block.attn_conn, block.ffn_conn))
+        if self.attnres_out is not None:
+            modules.append(self.attnres_out)
         return tuple(modules)
+
+    def per_head_muon_parameters(self):
+        """(param, head_dim) pairs for attention Q/K/V projections whose rows
+        are head-major, the targets of Per-Head Muon orthogonalization."""
+        pairs = []
+        for block in self._optimizer_transformer_blocks():
+            head_dim = getattr(block.attn, "head_dim", None)
+            if head_dim is None:
+                continue
+            for name in ("q_proj", "k_proj", "v_proj"):
+                linear = getattr(block.attn, name, None)
+                if isinstance(linear, nn.Linear) and linear.weight.size(0) % head_dim == 0:
+                    pairs.append((linear.weight, head_dim))
+        return tuple(pairs)
+
+    def gradient_checkpointing_enable(self):
+        require(self._sparse_index_share is None, (
+            "gradient checkpointing does not support shared sparse index groups"
+        ))
+        super().gradient_checkpointing_enable()
 
     def set_qk_clip_recording(self, enabled):
         set_transformer_qk_clip_recording(self._optimizer_transformer_blocks(), enabled)
@@ -980,7 +1077,10 @@ class GPT(BaseModel):
         x = self.drop(x)
 
         if self.config.connection != "residual":
-            x = expand_residual_stream(x, self.config.connection_expansion)
+            x = expand_residual_stream(x, self.blocks[0].attn_conn.expansion)
+
+        if self._sparse_index_share is not None:
+            self._sparse_index_share.clear()
 
         layer_hiddens = []
         for block in self.blocks:
@@ -998,7 +1098,14 @@ class GPT(BaseModel):
             if return_layer_hiddens:
                 layer_hiddens.append(x)
 
-        if self.config.connection != "residual":
+        if self._sparse_index_share is not None:
+            # Release the published index tensors before backward and the
+            # optimizer step instead of holding them until the next forward.
+            self._sparse_index_share.clear()
+
+        if self.config.connection == "attnres":
+            x = self.attnres_out(x)
+        elif self.config.connection != "residual":
             x = reduce_residual_stream(x)
 
         main_hidden = x
@@ -1254,10 +1361,14 @@ class GPT(BaseModel):
         if self.pos_enc is not None and self.pos_enc.kind == "additive":
             x = x + self._cast_hidden(self.pos_enc(T))
         x = self.drop(x)
+        if self._sparse_index_share is not None:
+            self._sparse_index_share.clear()
         for block in self.blocks[:exit_layer]:
             block_freqs = self._block_freqs(block, T, freqs_cis)
             per_layer_input = per_layer_inputs[:, :, block.block_id, :] if per_layer_inputs is not None else None
             x = block(x, freqs_cis=block_freqs, attn_bias=attn_bias, is_causal=is_causal, per_layer_input=per_layer_input)
+        if self._sparse_index_share is not None:
+            self._sparse_index_share.clear()
         logits = apply_logit_softcap(self.lm_head(self.ln_f(x)), self.config.final_logit_softcap)
         return logits, x
 
@@ -1271,6 +1382,9 @@ class GPT(BaseModel):
         require(self.config.connection == "residual", "continue_from_hidden requires residual GPT blocks")
         require(self.config.per_layer_embedding_dim == 0, (
             "continue_from_hidden does not support per-layer embeddings"
+        ))
+        require(self._sparse_index_share is None, (
+            "continue_from_hidden does not support shared sparse index groups"
         ))
         require(0 < start_layer < self.config.num_layers, "start_layer must be in [1, num_layers)")
         require(hidden.dim() == 3 and hidden.size(1) > 0, (
@@ -1325,7 +1439,11 @@ class GPT(BaseModel):
         return self.config.connection == "residual"
 
     def supports_hidden_continuation(self):
-        return self.config.connection == "residual" and self.config.per_layer_embedding_dim == 0
+        return (
+            self.config.connection == "residual"
+            and self.config.per_layer_embedding_dim == 0
+            and self._sparse_index_share is None
+        )
 
     def _optimizer_transformer_blocks(self):
         return [*self.blocks, *(module.block for module in self.mtp_modules)]

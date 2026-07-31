@@ -15,12 +15,19 @@ from tqdm import tqdm
 from minilab.base import BaseModel, unwrap_model
 from minilab.checks import require, require_finite_number, require_integer, require_integer_fields
 from minilab.config import BaseConfig
-from minilab.nn.optimizers import DEFAULT_SOFT_MUON_POWER, Lion, Muon
+from minilab.nn.optimizers import (
+    DEFAULT_KL_SHAMPOO_BETAS,
+    DEFAULT_KL_SHAMPOO_LR,
+    DEFAULT_SOFT_MUON_POWER,
+    KLShampoo,
+    Lion,
+    Muon,
+)
 from minilab.registry import register_trainer
 
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-_OPTIMIZERS = {"adamw", "lion", "muon", "soft_muon"}
+_OPTIMIZERS = {"adamw", "lion", "muon", "soft_muon", "kl_shampoo"}
 _LR_SCHEDULES = {"cosine", "linear", "constant", "wsd"}
 _DECAYING_LR_SCHEDULES = {"cosine", "linear", "wsd"}
 
@@ -39,7 +46,11 @@ class TrainConfig(BaseConfig):
     batch_size: int = 32
     lr: float = 3e-4
     muon_lr: float = 0.02
+    muon_per_head: bool = False
     soft_muon_power: float = DEFAULT_SOFT_MUON_POWER
+    kl_shampoo_lr: float = DEFAULT_KL_SHAMPOO_LR
+    kl_shampoo_beta1: float = DEFAULT_KL_SHAMPOO_BETAS[0]
+    kl_shampoo_beta2: float = DEFAULT_KL_SHAMPOO_BETAS[1]
     weight_decay: float = 0.1
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
@@ -74,15 +85,28 @@ class TrainConfig(BaseConfig):
         for name in (
             "lr", "muon_lr", "soft_muon_power", "weight_decay", "max_grad_norm",
             "qk_clip_threshold", "qk_clip_balance",
+            "kl_shampoo_lr", "kl_shampoo_beta1", "kl_shampoo_beta2",
         ):
             require_finite_number(getattr(self, name), name)
         require(self.max_steps > 0, "max_steps must be > 0")
         require(self.batch_size > 0, "batch_size must be > 0")
         require(self.lr >= 0, "lr must be >= 0")
         require(self.muon_lr >= 0, "muon_lr must be >= 0")
+        require(self.muon_per_head is False or self.optimizer == "muon", (
+            "muon_per_head only applies to optimizer='muon'"
+        ))
         require(self.soft_muon_power == DEFAULT_SOFT_MUON_POWER, (
             "soft_muon_power currently supports the fixed p=0.4 coefficient profile"
         ))
+        require(self.kl_shampoo_lr >= 0, "kl_shampoo_lr must be >= 0")
+        require(0 <= self.kl_shampoo_beta1 < 1, "kl_shampoo_beta1 must be in [0, 1)")
+        require(0 <= self.kl_shampoo_beta2 < 1, "kl_shampoo_beta2 must be in [0, 1)")
+        for name in ("kl_shampoo_lr", "kl_shampoo_beta1", "kl_shampoo_beta2"):
+            require(
+                self.optimizer == "kl_shampoo"
+                or getattr(self, name) == TrainConfig.__dataclass_fields__[name].default,
+                f"{name} only applies to optimizer='kl_shampoo'",
+            )
         require(self.weight_decay >= 0, "weight_decay must be >= 0")
         require(self.warmup_steps >= 0, "warmup_steps must be >= 0")
         require(self.max_grad_norm > 0, "max_grad_norm must be > 0")
@@ -163,9 +187,16 @@ def optimizer_decay_groups(model, params, weight_decay):
 _RESUME_CRITICAL_CONFIG_FIELDS = (
     "batch_size", "lr", "weight_decay", "warmup_steps",
     "max_grad_norm", "grad_accum_steps", "dtype", "optimizer", "lr_schedule", "seed",
-    "muon_lr", "soft_muon_power", "qk_clip_threshold", "qk_clip_balance",
+    "muon_lr", "muon_per_head", "soft_muon_power",
+    "kl_shampoo_lr", "kl_shampoo_beta1", "kl_shampoo_beta2",
+    "qk_clip_threshold", "qk_clip_balance",
     "token_superposition_size", "token_superposition_steps",
 )
+
+# Fields added after checkpoints already existed: fill the saved config with the
+# dataclass default only when the current run also uses that default, so a
+# resume that actually changes behavior still fails the critical-field check.
+_LEGACY_RESUME_FIELDS = ("muon_per_head", "kl_shampoo_lr", "kl_shampoo_beta1", "kl_shampoo_beta2")
 
 def tokenizer_signature(tokenizer):
     payload = json.dumps(tokenizer._get_state(), sort_keys=True).encode()
@@ -187,13 +218,16 @@ def run_signature(tokenizer, dataset_desc, seq_len):
 
 
 def _fill_legacy_resume_defaults(saved_cfg, current_values):
-    if "soft_muon_power" in saved_cfg:
-        return
-    if current_values["soft_muon_power"] != DEFAULT_SOFT_MUON_POWER:
-        return
-    if "optimizer" in saved_cfg and saved_cfg["optimizer"] == "soft_muon":
-        return
-    saved_cfg["soft_muon_power"] = DEFAULT_SOFT_MUON_POWER
+    if (
+        "soft_muon_power" not in saved_cfg
+        and current_values["soft_muon_power"] == DEFAULT_SOFT_MUON_POWER
+        and saved_cfg.get("optimizer") != "soft_muon"
+    ):
+        saved_cfg["soft_muon_power"] = DEFAULT_SOFT_MUON_POWER
+    for name in _LEGACY_RESUME_FIELDS:
+        default = TrainConfig.__dataclass_fields__[name].default
+        if name not in saved_cfg and current_values[name] == default:
+            saved_cfg[name] = default
 
 
 def validate_checkpoint_tokenizer(checkpoint, tokenizer):
@@ -378,44 +412,98 @@ class Trainer:
     def _build_optimizer(self):
         model = unwrap_model(self.model)
         if self.config.optimizer in {"muon", "soft_muon"}:
-            hidden, aux_matrices, biases = model.muon_parameter_groups()
-            hidden = [param for param in hidden if param.requires_grad]
-            aux_matrices = [param for param in aux_matrices if param.requires_grad]
-            biases = [param for param in biases if param.requires_grad]
-            require(hidden or aux_matrices or biases, (
-                "optimizer requires at least one trainable parameter"
-            ))
+            hidden, aux_matrices, biases = self._trainable_muon_groups(model)
             soft_muon = self.config.optimizer == "soft_muon"
-            return Muon([
-                {
-                    "params": hidden,
-                    "use_muon": True,
-                    "soft_muon": soft_muon,
-                    "soft_muon_power": self.config.soft_muon_power,
-                    "lr": self.config.muon_lr,
-                    "weight_decay": self.config.weight_decay,
-                },
-                {
-                    "params": aux_matrices,
-                    "use_muon": False,
-                    "soft_muon": False,
-                    "lr": self.config.lr,
-                    "weight_decay": self.config.weight_decay,
-                },
-                {
-                    "params": biases,
-                    "use_muon": False,
-                    "soft_muon": False,
-                    "lr": self.config.lr,
-                    "weight_decay": 0.0,
-                },
-            ], lr=self.config.muon_lr, soft_muon=soft_muon, soft_muon_power=self.config.soft_muon_power)
+            hidden_groups = self._muon_hidden_groups(model, hidden, soft_muon)
+            fallback_groups = self._adamw_fallback_groups(aux_matrices, biases, use_muon=False, soft_muon=False)
+            return Muon(
+                hidden_groups + fallback_groups,
+                lr=self.config.muon_lr,
+                soft_muon=soft_muon,
+                soft_muon_power=self.config.soft_muon_power,
+            )
+        if self.config.optimizer == "kl_shampoo":
+            hidden, aux_matrices, biases = self._trainable_muon_groups(model)
+            hidden_group = {
+                "params": hidden,
+                "use_kl_shampoo": True,
+                "lr": self.config.kl_shampoo_lr,
+                "betas": (self.config.kl_shampoo_beta1, self.config.kl_shampoo_beta2),
+                "weight_decay": self.config.weight_decay,
+            }
+            fallback_groups = self._adamw_fallback_groups(aux_matrices, biases, use_kl_shampoo=False)
+            return KLShampoo([hidden_group] + fallback_groups, lr=self.config.kl_shampoo_lr)
         groups = optimizer_decay_groups(model, self.model.parameters(), self.config.weight_decay)
         if self.config.optimizer == "adamw":
             return torch.optim.AdamW(groups, lr=self.config.lr, betas=(0.9, 0.95))
         if self.config.optimizer == "lion":
             return Lion(groups, lr=self.config.lr, weight_decay=self.config.weight_decay)
         raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
+
+    def _adamw_fallback_groups(self, aux_matrices, biases, **group_flags):
+        """AdamW-path groups shared by the Muon-family and KL-Shampoo builders."""
+        return [
+            {
+                "params": aux_matrices,
+                "lr": self.config.lr,
+                "weight_decay": self.config.weight_decay,
+                "betas": (0.9, 0.95),
+                **group_flags,
+            },
+            {
+                "params": biases,
+                "lr": self.config.lr,
+                "weight_decay": 0.0,
+                "betas": (0.9, 0.95),
+                **group_flags,
+            },
+        ]
+
+    def _trainable_muon_groups(self, model):
+        hidden, aux_matrices, biases = (
+            [param for param in group if param.requires_grad]
+            for group in model.muon_parameter_groups()
+        )
+        require(hidden or aux_matrices or biases, (
+            "optimizer requires at least one trainable parameter"
+        ))
+        return hidden, aux_matrices, biases
+
+    def _muon_hidden_groups(self, model, hidden, soft_muon):
+        base_group = {
+            "params": hidden,
+            "use_muon": True,
+            "soft_muon": soft_muon,
+            "soft_muon_power": self.config.soft_muon_power,
+            "lr": self.config.muon_lr,
+            "weight_decay": self.config.weight_decay,
+        }
+        if not self.config.muon_per_head:
+            return [base_group]
+        head_dim_of = {id(param): head_dim for param, head_dim in model.per_head_muon_parameters()}
+        params_by_head_dim = {}
+        rest = []
+        for param in hidden:
+            head_dim = head_dim_of.get(id(param))
+            if head_dim:
+                params_by_head_dim.setdefault(head_dim, []).append(param)
+            else:
+                rest.append(param)
+        require(params_by_head_dim, (
+            "muon_per_head requires attention projections on the Muon hidden path"
+        ))
+        base_group["params"] = rest
+        return [base_group] + [
+            {
+                "params": params,
+                "use_muon": True,
+                "soft_muon": False,
+                "per_head_dim": head_dim,
+                "lr": self.config.muon_lr,
+                "weight_decay": self.config.weight_decay,
+            }
+            for head_dim, params in params_by_head_dim.items()
+        ]
 
     def _build_scheduler(self):
         warmup = self.config.warmup_steps

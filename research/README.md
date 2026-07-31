@@ -684,8 +684,8 @@ shows why this becomes step-dependent in tool use: an early wrong action changes
 later states and can make teacher guidance increasingly misaligned.
 [Self-Supervised On-Policy Distillation](https://arxiv.org/abs/2605.17497) goes
 one step further by converting correct-wrong contrast inside a mixed group into
-dense process supervision. Together, these works suggest using the mixed group
-not only as a scalar RL signal, but as a source of state-local corrective
+dense process supervision. Together, these works suggest using the mixed group as more
+than a scalar RL signal: as a source of state-local corrective
 information.
 
 Finally, [REINFORCE leave-one-out](https://arxiv.org/abs/2402.14740) and the

@@ -1,12 +1,12 @@
 # Minilab
 
-Minilab is a small language-model lab built to run the entire
-pretraining-through-RLVR loop on a single laptop GPU, where each stage
-finishes in minutes. It is built for inspectability rather than
-throughput: one GPT family, with research variation exposed through
-interchangeable Transformer components instead of separate architecture
-stacks, so post-training behavior can be watched at a scale small enough
-to reason about directly.
+Minilab is a small language-model lab that runs the entire
+pretraining-through-RLVR loop on a single laptop GPU, with each stage
+finishing in minutes. It optimizes for inspectability over throughput:
+one GPT family, with research variation exposed through interchangeable
+Transformer components instead of separate architecture stacks, so
+post-training behavior can be watched at a scale small enough to reason
+about.
 
 ## What the experiments found
 
@@ -91,9 +91,9 @@ bash recipes/local_training/04_grpo_tiny_math/run.sh
 bash recipes/local_training/05_eval_all/run.sh
 ```
 
-The defaults are intentionally small. Override recipe environment
+The defaults favor quick iteration. Override recipe environment
 variables such as `MAX_STEPS`, `MAX_EXAMPLES`, `BATCH_SIZE`, `SEQ_LEN`,
-and `PRESET` when you want a longer run.
+and `PRESET` for a longer run.
 
 Three GPT presets cover the useful laptop range, differing only in width,
 depth, and context length:
@@ -113,9 +113,9 @@ almost entirely through the token embeddings.
 ## What the tiny runs can and cannot show
 
 The defaults are sized so the whole loop runs in minutes, and that sizing
-decides what the runs can teach. The object worth studying here is
-the loss curve and the qualitative shift from one checkpoint to the next,
-not absolute task scores. Three regularities show up cleanly at this
+decides what the runs can teach. What is worth studying at this scale is
+the loss curve and the shift from one checkpoint to the next, not
+absolute task scores. Three regularities show up cleanly at this
 scale, and they are most of the reason the lab exists.
 
 Story-level coherence on TinyStories arrives around `gpt-25m` trained for
@@ -154,7 +154,7 @@ and `max_memory_reserved_gb` from PyTorch's peak-memory statistics, which
 are the numbers to trust when sizing a longer experiment. Wall time is
 dominated by the rollout loop in recipe 04: sampling a group of
 completions for every prompt costs far more per step than the supervised
-stages, which is why its defaults are the most conservative in the workflow.
+stages, which is why its defaults are the most conservative in the pipeline.
 
 ```bash
 python scripts/estimate_vram.py --model gpt-25m --method grpo --seq-len 512 --batch-size 1 --num-generations 4
@@ -350,4 +350,4 @@ makes swapping one component for a comparison run a one-line change.
 python -m compileall -q minilab scripts
 ```
 
-Checkpoints and local caches are intentionally excluded from version control.
+Checkpoints and local caches are excluded from version control.
